@@ -1,0 +1,38 @@
+# IDE & OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Gradle & Android build outputs
+.gradle/
+**/.gradle/
+**/.kotlin/
+**/build/
+local.properties
+**/local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Python / ML pipeline environments & caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Raw field captures, archives & large model binaries
+*.zip
+*.mp4
+*.mov
+*.avi
+field_logs/
+sessions/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+*.tflite
