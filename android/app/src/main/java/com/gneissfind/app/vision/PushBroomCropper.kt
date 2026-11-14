@@ -4,13 +4,14 @@ import androidx.camera.core.ImageProxy
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.StripRoiGeometry
+import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.model.TileDetection
 import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * Abstraction over a YUV_420_888 camera frame so [PushBroomCropper] can operate zero-copy on
+ * Abstraction over a `YUV_420_888` camera frame so [PushBroomCropper] can operate zero-copy on
  * CameraX [ImageProxy] planes in production and deterministic fake buffers in unit tests.
  */
 interface Yuv420Frame {
@@ -56,83 +57,112 @@ class ImageProxyYuv420Frame(private val imageProxy: ImageProxy) : Yuv420Frame {
 }
 
 /**
- * Holds the three overlapping 384x384 RGB normalized float tiles extracted from a single sweep,
- * plus an optional 1088x384 packed ARGB pixel buffer when Field Data Logger mode is active.
+ * Pre-allocated reusable sweep buffers sized for up to 5 overlapping `384x384` RGB float tiles
+ * (`1792x384` max swath) plus an optional packed ARGB pixel buffer for `LOG DATA` strip capture.
  */
 class PushBroomSweepBuffers(
-    val tileRgbFloats: Array<FloatArray> = Array(StripRoiGeometry.NUM_TILES) {
+    val tileRgbFloats: Array<FloatArray> = Array(StripRoiGeometry.MAX_TILES) {
         FloatArray(StripRoiGeometry.TILE_SIZE_PX * StripRoiGeometry.TILE_SIZE_PX * 3)
     },
-    val stripArgbPixels: IntArray = IntArray(StripRoiGeometry.STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
-) {
-    var geometry: StripRoiGeometry = StripRoiGeometry(
-        uprightFrameWidth = 3840,
-        uprightFrameHeight = 2160,
-        stripLeftPx = (3840 - StripRoiGeometry.STRIP_WIDTH_PX) / 2,
-        stripTopPx = 280
+    val stripArgbPixels: IntArray = IntArray(
+        StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX
     )
+) {
+    var activeTileMode: SwathTileMode = SwathTileMode.FIVE_TILE
+    val activeTileCount: Int get() = activeTileMode.tileCount
+    val activeStripWidthPx: Int get() = activeTileMode.stripWidthPx
+
+    var geometry: StripRoiGeometry = StripRoiGeometry()
     var hasArgbPixels: Boolean = false
     var timestampNs: Long = 0L
 }
 
 /**
- * Extracts ONLY the 1088x384 push-broom strip ROI from a `YUV_420_888` frame directly into
- * three horizontally overlapping 384x384 float tiles (x in [0,384), [352,736), [704,1088))
- * without ever allocating or converting a full 4K Bitmap.
+ * Extracts ONLY the stabilized `1792x384` (5-tile default) or `1088x384` (3-tile fast mode)
+ * push-broom strip ROI from a `1920x1080` landscape `YUV_420_888` frame directly into horizontally
+ * overlapping `384x384` float tiles (`32 px` overlap, `352 px` stride) without full-frame Bitmap
+ * allocation.
  *
- * Also maps tile-local detections back into unified 1088x384 strip coordinates, runs cross-tile
- * Non-Maximum Suppression (IoU = 0.50), and filters out `classId == 4` (`hard_confuser`) and
- * sub-20 mm targets.
+ * Maps tile-local `[0..384]` detections into unified strip space, runs class-aware cross-tile NMS
+ * (`IoU >= 0.45`), mutes `classId == 4` (`hard_confuser`), and enforces `>= 20 mm` target diameter.
  */
 class PushBroomCropper(
-    private val verticalAnchorFraction: Float = StripRoiGeometry.DEFAULT_VERTICAL_ANCHOR,
     private val applyImageNetNormalization: Boolean = true
 ) {
-    // Reusable intermediate strip RGB cache (1088 * 384 * 3 floats = ~4.8 MB allocated once)
-    // so the two 32px overlap seams are decoded from YUV only once per sweep.
-    private val stripNormalizedR = FloatArray(StripRoiGeometry.STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
-    private val stripNormalizedG = FloatArray(StripRoiGeometry.STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
-    private val stripNormalizedB = FloatArray(StripRoiGeometry.STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
+    // Reusable intermediate strip RGB cache allocated once for max 1792x384 swath (~8.2 MB total)
+    // so the four 32px overlap seams are decoded from YUV_420_888 only once per sweep.
+    private val stripNormalizedR = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
+    private val stripNormalizedG = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
+    private val stripNormalizedB = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
 
     fun computeStripGeometry(
         rawWidth: Int,
         rawHeight: Int,
-        rotationDegrees: Int
+        rotationDegrees: Int,
+        cropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+        tileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
+        isPitchClamped: Boolean = false
     ): StripRoiGeometry {
         val normalizedRotation = ((rotationDegrees % 360) + 360) % 360
         val uprightW = if (normalizedRotation == 90 || normalizedRotation == 270) rawHeight else rawWidth
         val uprightH = if (normalizedRotation == 90 || normalizedRotation == 270) rawWidth else rawHeight
 
-        val stripLeft = ((uprightW - StripRoiGeometry.STRIP_WIDTH_PX) / 2).coerceAtLeast(0)
-        val desiredCenterY = (uprightH * verticalAnchorFraction).roundToInt()
+        val clampedCanonicalCropY = cropY.coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX)
+        val stripWidth = tileMode.stripWidthPx
+
+        val stripLeft = when {
+            uprightW == StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX -> tileMode.canonicalStripLeftPx
+            uprightW > stripWidth -> ((uprightW - stripWidth) / 2)
+            else -> 0
+        }
+
         val maxTop = (uprightH - StripRoiGeometry.STRIP_HEIGHT_PX).coerceAtLeast(0)
-        val stripTop = (desiredCenterY - StripRoiGeometry.STRIP_HEIGHT_PX / 2).coerceIn(0, maxTop)
+        val stripTop = when {
+            uprightH == StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX -> clampedCanonicalCropY
+            maxTop > 0 -> {
+                val frac = clampedCanonicalCropY.toFloat() / StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+                (frac * maxTop).roundToInt().coerceIn(0, maxTop)
+            }
+            else -> 0
+        }
 
         return StripRoiGeometry(
             uprightFrameWidth = uprightW,
             uprightFrameHeight = uprightH,
             stripLeftPx = stripLeft,
-            stripTopPx = stripTop
+            stripTopPx = stripTop,
+            stripWidthPx = stripWidth,
+            stripHeightPx = StripRoiGeometry.STRIP_HEIGHT_PX,
+            tileMode = tileMode,
+            isPitchClamped = isPitchClamped
         )
     }
 
     /**
-     * Extracts the 1088x384 push-broom strip from [frame] and slices it into 3 overlapping
-     * 384x384 tiles in NHWC RGB float order inside [outBuffers].
-     *
-     * @param populateArgbStrip If true (used in `LOG DATA` mode), also populates [PushBroomSweepBuffers.stripArgbPixels]
-     *   for lossless PNG / high-bitrate JPEG strip logging without full-frame Bitmap allocation.
+     * Extracts the active `1792x384` (5-tile) or `1088x384` (3-tile) strip at stabilized [cropY]
+     * from [frame] and slices it into overlapping `384x384` NHWC RGB float tiles inside [outBuffers].
      */
     fun extractTiles(
         frame: Yuv420Frame,
         outBuffers: PushBroomSweepBuffers,
+        cropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+        tileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
+        isPitchClamped: Boolean = false,
         populateArgbStrip: Boolean = false
     ): StripRoiGeometry {
         val rawW = frame.width
         val rawH = frame.height
         val rot = ((frame.rotationDegrees % 360) + 360) % 360
-        val geometry = computeStripGeometry(rawW, rawH, rot)
+        val geometry = computeStripGeometry(
+            rawWidth = rawW,
+            rawHeight = rawH,
+            rotationDegrees = rot,
+            cropY = cropY,
+            tileMode = tileMode,
+            isPitchClamped = isPitchClamped
+        )
 
+        outBuffers.activeTileMode = tileMode
         outBuffers.geometry = geometry
         outBuffers.timestampNs = frame.timestampNs
         outBuffers.hasArgbPixels = populateArgbStrip
@@ -153,9 +183,11 @@ class PushBroomCropper(
 
         val uprightW = geometry.uprightFrameWidth
         val uprightH = geometry.uprightFrameHeight
-        // If a test or fallback camera stream has dimensions smaller than 1088x384, scale sample coordinates safely.
-        val scaleX = if (uprightW < StripRoiGeometry.STRIP_WIDTH_PX) {
-            uprightW.toFloat() / StripRoiGeometry.STRIP_WIDTH_PX
+        val activeStripW = tileMode.stripWidthPx
+
+        // Safe coordinate fallback if an emulator webcam provides < 1792px width
+        val scaleX = if (uprightW < activeStripW) {
+            uprightW.toFloat() / activeStripW
         } else {
             1.0f
         }
@@ -173,16 +205,16 @@ class PushBroomCropper(
             } else {
                 (sy * scaleY).toInt().coerceIn(0, uprightH - 1)
             }
-            val stripRowOffset = sy * StripRoiGeometry.STRIP_WIDTH_PX
+            val stripRowOffset = sy * activeStripW
 
-            for (sx in 0 until StripRoiGeometry.STRIP_WIDTH_PX) {
+            for (sx in 0 until activeStripW) {
                 val ux = if (scaleX == 1.0f) {
                     (geometry.stripLeftPx + sx).coerceIn(0, uprightW - 1)
                 } else {
                     (sx * scaleX).toInt().coerceIn(0, uprightW - 1)
                 }
 
-                // Map upright viewfinder coordinates (ux, uy) back to raw sensor buffer (bx, by)
+                // Map upright landscape coordinates (ux, uy) back to raw sensor buffer (bx, by)
                 val bx: Int
                 val by: Int
                 when (rot) {
@@ -236,14 +268,14 @@ class PushBroomCropper(
             }
         }
 
-        // Slice the 1088x384 strip into the 3 overlapping 384x384 tiles:
-        // Tile 0: x in [0, 384), Tile 1: x in [352, 736), Tile 2: x in [704, 1088)
-        for (tileIdx in 0 until StripRoiGeometry.NUM_TILES) {
-            val xOffset = StripRoiGeometry.TILE_OFFSETS_X[tileIdx]
+        // Slice the decoded strip into 5 (or 3) overlapping 384x384 tiles with 32px seam overlap
+        val stripOffsets = tileMode.stripTileOffsets
+        for (tileIdx in 0 until tileMode.tileCount) {
+            val xOffset = stripOffsets[tileIdx]
             val tileDst = outBuffers.tileRgbFloats[tileIdx]
             var dstIdx = 0
             for (ty in 0 until StripRoiGeometry.TILE_SIZE_PX) {
-                val stripRowStart = ty * StripRoiGeometry.STRIP_WIDTH_PX + xOffset
+                val stripRowStart = ty * activeStripW + xOffset
                 for (tx in 0 until StripRoiGeometry.TILE_SIZE_PX) {
                     val srcIdx = stripRowStart + tx
                     tileDst[dstIdx++] = stripNormalizedR[srcIdx]
@@ -257,14 +289,17 @@ class PushBroomCropper(
     }
 
     /**
-     * Maps tile-local bounding boxes back to 1088x384 strip coordinates, applies cross-tile
-     * Non-Maximum Suppression (`IoU = 0.50`), and discards:
+     * Maps tile-local `[0..384]` bounding boxes into unified strip coordinates (`1792x384` in
+     * 5-tile mode or `1088x384` in 3-tile mode) and `1920x1080` frame X coordinates
+     * (`xOffsets = [64, 416, 768, 1120, 1472]` or `[416, 768, 1120]`), applies class-aware
+     * Cross-Tile Non-Maximum Suppression (`IoU >= 0.45`), and discards:
      *  - `classId == 4` ([StoneClass.HARD_CONFUSER])
-     *  - Any class disabled in [enabledClasses]
-     *  - Any box whose physical diameter at [gsdMmPerPx] is `< 20.0 mm`
+     *  - Classes disabled in [enabledClasses]
+     *  - Stones smaller than [minDiameterMm] (`20.0 mm`)
      */
     fun mergeAndFilterTileDetections(
         tileDetections: List<TileDetection>,
+        tileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
         gsdMmPerPx: Float = DEFAULT_GSD_MM_PER_PX,
         nmsIouThreshold: Float = DEFAULT_NMS_IOU_THRESHOLD,
         minConfidence: Float = DEFAULT_MIN_CONFIDENCE,
@@ -273,21 +308,32 @@ class PushBroomCropper(
     ): List<StripDetection> {
         if (tileDetections.isEmpty()) return emptyList()
 
+        val stripWidthF = tileMode.stripWidthPx.toFloat()
+        val stripOffsets = tileMode.stripTileOffsets
+        val frameOffsets = tileMode.frameXOffsets
+
         val mappedCandidates = ArrayList<StripDetection>(tileDetections.size)
         for (det in tileDetections) {
             if (det.confidence < minConfidence) continue
-            if (det.tileIndex !in 0 until StripRoiGeometry.NUM_TILES) continue
+            if (det.tileIndex !in 0 until tileMode.tileCount) continue
             val stoneClass = StoneClass.fromId(det.classId) ?: continue
 
-            val xOffset = StripRoiGeometry.TILE_OFFSETS_X[det.tileIndex].toFloat()
-            val stripLeft = (det.leftPx + xOffset).coerceIn(0f, StripRoiGeometry.STRIP_WIDTH_PX.toFloat())
-            val stripRight = (det.rightPx + xOffset).coerceIn(0f, StripRoiGeometry.STRIP_WIDTH_PX.toFloat())
+            val stripOffsetX = stripOffsets[det.tileIndex].toFloat()
+            val frameOffsetX = frameOffsets[det.tileIndex].toFloat()
+
+            val stripLeft = (det.leftPx + stripOffsetX).coerceIn(0f, stripWidthF)
+            val stripRight = (det.rightPx + stripOffsetX).coerceIn(0f, stripWidthF)
             val stripTop = det.topPx.coerceIn(0f, StripRoiGeometry.STRIP_HEIGHT_PX.toFloat())
             val stripBottom = det.bottomPx.coerceIn(0f, StripRoiGeometry.STRIP_HEIGHT_PX.toFloat())
 
             val widthPx = stripRight - stripLeft
             val heightPx = stripBottom - stripTop
             if (widthPx <= 1f || heightPx <= 1f) continue
+
+            val frameLeft = (det.leftPx + frameOffsetX)
+                .coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat())
+            val frameRight = (det.rightPx + frameOffsetX)
+                .coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat())
 
             val diameterMm = max(widthPx, heightPx) * gsdMmPerPx
             mappedCandidates.add(
@@ -299,7 +345,9 @@ class PushBroomCropper(
                     rightPx = stripRight,
                     bottomPx = stripBottom,
                     estimatedDiameterMm = diameterMm,
-                    sourceTileIndex = det.tileIndex
+                    sourceTileIndex = det.tileIndex,
+                    frameLeftPx = frameLeft,
+                    frameRightPx = frameRight
                 )
             )
         }
@@ -325,10 +373,6 @@ class PushBroomCropper(
             }
         }
 
-        // Strict v1 post-NMS filtering:
-        // 1. Mute/discard classId == 4 (hard_confuser)
-        // 2. Respect user per-class HUD toggles
-        // 3. Enforce >= 20 mm minimum target stone physical diameter
         return nmsKept.filter { det ->
             det.stoneClass.isUserAlertable &&
                 det.stoneClass in enabledClasses &&
@@ -337,11 +381,12 @@ class PushBroomCropper(
     }
 
     companion object {
-        const val DEFAULT_NMS_IOU_THRESHOLD = 0.50f
+        const val DEFAULT_NMS_IOU_THRESHOLD = 0.45f
         const val DEFAULT_MIN_CONFIDENCE = 0.35f
         const val MIN_STONE_DIAMETER_MM = 20.0f
         const val DEFAULT_SLANT_RANGE_METERS = 1.50f
-        const val DEFAULT_GSD_MM_PER_PX = 0.85f
+        const val DEFAULT_ZOOM_RATIO = 2.0f
+        const val DEFAULT_GSD_MM_PER_PX = 0.59f // 2.0x crop on 1920x1080 at R = 1.50 m (~1.05 m swath)
 
         private const val INV_255 = 1.0f / 255.0f
         private const val IMAGENET_MEAN_R = 0.485f
@@ -352,12 +397,18 @@ class PushBroomCropper(
         private const val IMAGENET_INV_STD_B = 1.0f / 0.225f
 
         /**
-         * Scales cross-track Ground Sample Distance linearly with slant range R around the
-         * locked v1 baseline (0.85 mm/px at R = 1.50 m).
+         * Computes cross-track Ground Sample Distance (`mm/px`) from slant range [slantRangeMeters]
+         * and active zoom (`2.0x` -> `0.59 mm/px` at `R = 1.50 m`; `1.0x` -> `1.18 mm/px`).
          */
-        fun computeGsdMmPerPx(slantRangeMeters: Float): Float {
+        fun computeGsdMmPerPx(
+            slantRangeMeters: Float,
+            zoomRatio: Float = DEFAULT_ZOOM_RATIO
+        ): Float {
             val clampedRange = slantRangeMeters.coerceIn(0.40f, 4.00f)
-            return DEFAULT_GSD_MM_PER_PX * (clampedRange / DEFAULT_SLANT_RANGE_METERS)
+            val safeZoom = zoomRatio.coerceAtLeast(1.0f)
+            return DEFAULT_GSD_MM_PER_PX *
+                (clampedRange / DEFAULT_SLANT_RANGE_METERS) *
+                (DEFAULT_ZOOM_RATIO / safeZoom)
         }
     }
 }

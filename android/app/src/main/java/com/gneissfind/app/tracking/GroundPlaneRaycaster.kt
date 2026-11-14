@@ -5,16 +5,20 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.view.Surface
+import com.gneissfind.app.camera.PushBroomCameraController
 import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.WorldPoint3D
 import com.gneissfind.app.vision.PushBroomCropper
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
+import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
@@ -30,11 +34,29 @@ data class RaycastResult(
 )
 
 /**
- * Snapshot of current sensor/VIO pose, pitch angle, slant range, and ground speed.
+ * Computed IMU-stabilized vertical strip position inside the `1920x1080` landscape frame.
+ */
+data class PitchStabilizationState(
+    val rawCropY: Int,
+    val clampedCropY: Int,
+    val isPitchClamped: Boolean,
+    val matchedPitchDeg: Float,
+    val referencePitchDeg: Float,
+    val verticalFocalLengthPx: Float
+)
+
+/**
+ * Snapshot of current sensor/VIO pose, remapped landscape pitch/roll, stabilized `cropY`,
+ * slant range `R`, and ground speed.
  */
 data class MotionPoseSnapshot(
     val cameraWorldPosition: WorldPoint3D,
     val forwardPitchDeg: Float,
+    val rawPitchDeg: Float,
+    val rollDeg: Float,
+    val referencePitchDeg: Float,
+    val cropY: Int,
+    val isPitchClamped: Boolean,
     val centerSlantRangeMeters: Float,
     val horizontalSpeedMps: Float,
     val arPlaneLocked: Boolean,
@@ -42,14 +64,16 @@ data class MotionPoseSnapshot(
 )
 
 /**
- * Projects 2D detections inside the 1088x384 push-broom strip onto 3D ground coordinates `(X, Y, Z)`
- * and computes slant range `R`:
- *  1. Primary path (when an active ARCore [Frame] has horizontal plane lock): performs
- *     `Frame.hitTest(screenX, screenY)` against `Plane.Type.HORIZONTAL_UPWARD_FACING` and reads
- *     exact `Camera.pose` 6-DoF translation.
- *  2. Continuous fallback path (when ARCore plane lock is initializing or CameraX holds exclusive
- *     4K shutter-clamped camera control): uses fused IMU rotation-vector pitch + linear acceleration
- *     damped velocity integration from nominal waist height `h = 1.06 m` (`~45 deg` -> `R ~ 1.50 m`).
+ * Reversible-landscape IMU pitch stabilizer (`Sensor.TYPE_GAME_ROTATION_VECTOR`), ARCore display
+ * geometry synchronizer, and ground-plane raycaster:
+ *  - Uses magnetometer-free `Sensor.TYPE_GAME_ROTATION_VECTOR` (`SENSOR_DELAY_GAME`) so magnetite
+ *    in Pacific Northwest basalt cobbles never causes yaw/pitch drift.
+ *  - Remaps IMU axes for `Surface.ROTATION_90` (`AXIS_Y, AXIS_MINUS_X`) and `Surface.ROTATION_270`
+ *    (`AXIS_MINUS_Y, AXIS_X`) so downward pitch (`0 deg` = horizon, `45 deg` = forward slant,
+ *    `90 deg` = straight down nadir) and roll stay identical across 180-degree landscape flips.
+ *  - Stabilizes `cropY` in `[0..696]` around `referencePitchDeg` (`default 45.0 deg`, updatable
+ *    via `SYNC PITCH`) matched to `imageProxy.imageInfo.timestamp`, illuminating `isPitchClamped`
+ *    when clamped at `0` or `696`.
  */
 class GroundPlaneRaycaster(
     context: Context? = null,
@@ -58,16 +82,46 @@ class GroundPlaneRaycaster(
 
     private val sensorManager: SensorManager? =
         context?.applicationContext?.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
-    private val rotationSensor: Sensor? =
-        sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+
+    // Strictly prefer magnetometer-free TYPE_GAME_ROTATION_VECTOR per android-camera-ar.md
+    private val gameRotationSensor: Sensor? =
+        sensorManager?.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
     private val linearAccelSensor: Sensor? =
         sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
 
-    private val rotationMatrix = FloatArray(9)
+    private val rawRotationMatrix = FloatArray(9)
+    private val remappedRotationMatrix = FloatArray(9)
+
+    // Timestamp-indexed IMU ring buffer for matching frame capture timestamps
+    private val imuRingLock = Any()
+    private val ringTimestampsNs = LongArray(IMU_RING_CAPACITY)
+    private val ringPitchDeg = FloatArray(IMU_RING_CAPACITY)
+    private val ringRollDeg = FloatArray(IMU_RING_CAPACITY)
+    private var ringWriteIndex = 0
+    private var ringCount = 0
+
+    @Volatile
+    var displaySurfaceRotation: Int = Surface.ROTATION_90
+        private set
 
     @Volatile
     var currentForwardPitchDeg: Float = DEFAULT_PITCH_DEGREES
         private set
+
+    @Volatile
+    var latestRawPitchDeg: Float = DEFAULT_PITCH_DEGREES
+        private set
+
+    @Volatile
+    var currentRollDeg: Float = 0.0f
+        private set
+
+    @Volatile
+    var referencePitchDeg: Float = DEFAULT_PITCH_DEGREES
+        private set
+
+    @Volatile
+    var eisPitchLockEnabled: Boolean = true
 
     @Volatile
     var imuHorizontalSpeedMps: Float = 0.0f
@@ -76,6 +130,10 @@ class GroundPlaneRaycaster(
     @Volatile
     var simulatedWalkSpeedOverrideMps: Float? = null
 
+    @Volatile
+    var simulatedPitchOverrideDeg: Float? = null
+
+    private var hasInitializedDisplayPitch = false
     private var integratedX = 0f
     private var integratedZ = 0f
     private var vx = 0f
@@ -89,7 +147,7 @@ class GroundPlaneRaycaster(
 
     fun startImuListening() {
         val sm = sensorManager ?: return
-        rotationSensor?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        gameRotationSensor?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         linearAccelSensor?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     }
 
@@ -101,20 +159,70 @@ class GroundPlaneRaycaster(
         stopImuListening()
     }
 
+    /**
+     * Synchronizes reversible-landscape display rotation (`ROTATION_90` vs `ROTATION_270`) for both
+     * IMU coordinate remapping and any active ARCore [Session].
+     */
+    fun updateDisplayGeometry(
+        surfaceRotation: Int,
+        viewportWidthPx: Int = 0,
+        viewportHeightPx: Int = 0,
+        arSession: Session? = null
+    ) {
+        val normalized = if (surfaceRotation == Surface.ROTATION_270) {
+            Surface.ROTATION_270
+        } else {
+            Surface.ROTATION_90
+        }
+        displaySurfaceRotation = normalized
+        if (arSession != null && viewportWidthPx > 0 && viewportHeightPx > 0) {
+            runCatching {
+                arSession.setDisplayGeometry(normalized, viewportWidthPx, viewportHeightPx)
+            }
+        }
+    }
+
+    /**
+     * Captures the user's current handheld downward tilt as the active EIS `thetaRef` setpoint
+     * (`SYNC PITCH` actuator).
+     */
+    fun syncReferencePitch(): Float {
+        val synced = (simulatedPitchOverrideDeg ?: latestRawPitchDeg).coerceIn(12.0f, 85.0f)
+        referencePitchDeg = synced
+        return synced
+    }
+
+    fun setReferencePitchDegrees(pitchDeg: Float) {
+        referencePitchDeg = pitchDeg.coerceIn(12.0f, 85.0f)
+    }
+
     override fun onSensorChanged(event: SensorEvent) {
         when (event.sensor.type) {
-            Sensor.TYPE_ROTATION_VECTOR -> {
-                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-                // Device optical axis (-Z in sensor coords) dot world gravity/up axis (row 2 of R):
-                // R[6], R[7], R[8] represent device Z axis in world ENU coordinates (where +Z_world is Up).
-                // Camera optical look vector is -Z_device => world Z component of look vector is -R[8].
-                // Depression angle below horizon: sin(pitchDown) = +R[8] when back of phone faces sky/downward.
-                val lookDownSin = rotationMatrix[8].coerceIn(-1f, 1f)
-                val horizMag = sqrt((1f - lookDownSin * lookDownSin).coerceAtLeast(1e-6f))
-                val depressionDeg = Math.toDegrees(atan2(lookDownSin.toDouble(), horizMag.toDouble())).toFloat()
-                // Clamp to practical scanning depression range [18 deg .. 82 deg] for stable raycasting
-                if (depressionDeg > 10f) {
-                    currentForwardPitchDeg = currentForwardPitchDeg * 0.80f + depressionDeg.coerceIn(18f, 82f) * 0.20f
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> {
+                SensorManager.getRotationMatrixFromVector(rawRotationMatrix, event.values)
+                remapLandscapeRotationMatrix(
+                    rawR = rawRotationMatrix,
+                    surfaceRotation = displaySurfaceRotation,
+                    outRemappedR = remappedRotationMatrix
+                )
+                val (rawPitch, rawRoll) = computePitchAndRollDegrees(remappedRotationMatrix)
+                latestRawPitchDeg = rawPitch
+                currentRollDeg = currentRollDeg * (1f - UI_PITCH_LOWPASS_ALPHA) + rawRoll * UI_PITCH_LOWPASS_ALPHA
+
+                if (!hasInitializedDisplayPitch) {
+                    currentForwardPitchDeg = rawPitch
+                    hasInitializedDisplayPitch = true
+                } else {
+                    currentForwardPitchDeg =
+                        currentForwardPitchDeg * (1f - UI_PITCH_LOWPASS_ALPHA) + rawPitch * UI_PITCH_LOWPASS_ALPHA
+                }
+
+                synchronized(imuRingLock) {
+                    ringTimestampsNs[ringWriteIndex] = event.timestamp
+                    ringPitchDeg[ringWriteIndex] = rawPitch
+                    ringRollDeg[ringWriteIndex] = rawRoll
+                    ringWriteIndex = (ringWriteIndex + 1) % IMU_RING_CAPACITY
+                    if (ringCount < IMU_RING_CAPACITY) ringCount++
                 }
             }
 
@@ -124,7 +232,6 @@ class GroundPlaneRaycaster(
                     val dt = ((nowNs - lastLinearAccelNs) * 1e-9f).coerceIn(0f, 0.1f)
                     val ax = event.values[0]
                     val ay = event.values[1]
-                    // Apply deadband and leaky integrator damping for handheld walking cadence estimation
                     val deadbandAx = if (abs(ax) < 0.18f) 0f else ax
                     val deadbandAy = if (abs(ay) < 0.18f) 0f else ay
                     vx = (vx + deadbandAx * dt) * 0.92f
@@ -142,10 +249,54 @@ class GroundPlaneRaycaster(
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     /**
-     * Updates pose and ground speed from an ARCore [Frame] when available, or returns the live
-     * IMU-assisted pose snapshot.
+     * Looks up the raw IMU pitch sample closest in timestamp to [targetTimestampNs] for zero-lag
+     * software EIS `cropY` computation.
      */
-    fun capturePoseSnapshot(arFrame: Frame? = null, fallbackTimestampNs: Long = System.nanoTime()): MotionPoseSnapshot {
+    fun lookupPitchAtTimestampNs(targetTimestampNs: Long): Float {
+        simulatedPitchOverrideDeg?.let { return it }
+        synchronized(imuRingLock) {
+            if (ringCount == 0) return latestRawPitchDeg
+            var bestPitch = latestRawPitchDeg
+            var bestDelta = Long.MAX_VALUE
+            for (i in 0 until ringCount) {
+                val delta = abs(ringTimestampsNs[i] - targetTimestampNs)
+                if (delta < bestDelta) {
+                    bestDelta = delta
+                    bestPitch = ringPitchDeg[i]
+                }
+            }
+            return bestPitch
+        }
+    }
+
+    /**
+     * Captures the synchronized pose, timestamp-matched `cropY` stabilization state, slant range `R`,
+     * and horizontal ground velocity `v_xy`.
+     */
+    fun capturePoseSnapshot(
+        arFrame: Frame? = null,
+        fallbackTimestampNs: Long = System.nanoTime(),
+        verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+    ): MotionPoseSnapshot {
+        val frameTs = arFrame?.timestamp ?: fallbackTimestampNs
+        val matchedRawPitch = lookupPitchAtTimestampNs(frameTs)
+        val displayPitch = simulatedPitchOverrideDeg ?: currentForwardPitchDeg
+        val refPitch = referencePitchDeg
+
+        val stabilization = computeStabilizedCropY(
+            currentPitchDeg = matchedRawPitch,
+            referencePitchDeg = refPitch,
+            verticalFocalLengthPx = verticalFocalLengthPx,
+            eisEnabled = eisPitchLockEnabled
+        )
+
+        // When EIS locks cropY onto thetaRef (unclamped), the strip looks along thetaRef; if EIS is
+        // off or clamped, compute effective look depression angle of the strip center.
+        val stripCenterOffsetPx = stabilization.clampedCropY - StripRoiGeometry.NOMINAL_CROP_Y_PX
+        val stripCenterLookPitchDeg =
+            matchedRawPitch + Math.toDegrees(atan2(stripCenterOffsetPx.toDouble(), verticalFocalLengthPx.toDouble())).toFloat()
+        val slantR = computeSlantRangeForPitch(waistHeightMeters, stripCenterLookPitchDeg)
+
         val overrideSpeed = simulatedWalkSpeedOverrideMps
         if (arFrame != null && arFrame.camera.trackingState == TrackingState.TRACKING) {
             val pose = arFrame.camera.pose
@@ -171,12 +322,14 @@ class GroundPlaneRaycaster(
                 it.type == Plane.Type.HORIZONTAL_UPWARD_FACING && it.trackingState == TrackingState.TRACKING
             }
 
-            val pitchDeg = currentForwardPitchDeg
-            val slantR = computeSlantRangeForPitch(waistHeightMeters, pitchDeg)
-
             return MotionPoseSnapshot(
                 cameraWorldPosition = WorldPoint3D(px, py, pz),
-                forwardPitchDeg = pitchDeg,
+                forwardPitchDeg = displayPitch,
+                rawPitchDeg = matchedRawPitch,
+                rollDeg = currentRollDeg,
+                referencePitchDeg = refPitch,
+                cropY = stabilization.clampedCropY,
+                isPitchClamped = stabilization.isPitchClamped,
                 centerSlantRangeMeters = slantR,
                 horizontalSpeedMps = overrideSpeed ?: smoothedArSpeedMps,
                 arPlaneLocked = hasHorizontalPlane,
@@ -186,19 +339,21 @@ class GroundPlaneRaycaster(
 
         val activeSpeed = overrideSpeed ?: imuHorizontalSpeedMps
         if (overrideSpeed != null && lastLinearAccelNs == 0L) {
-            // Advance virtual walk Z position when desk-testing simulated walk speed
             integratedZ += overrideSpeed * (1f / 15f)
         }
-        val pitchDeg = currentForwardPitchDeg
-        val slantR = computeSlantRangeForPitch(waistHeightMeters, pitchDeg)
 
         return MotionPoseSnapshot(
             cameraWorldPosition = WorldPoint3D(integratedX, waistHeightMeters, integratedZ),
-            forwardPitchDeg = pitchDeg,
+            forwardPitchDeg = displayPitch,
+            rawPitchDeg = matchedRawPitch,
+            rollDeg = currentRollDeg,
+            referencePitchDeg = refPitch,
+            cropY = stabilization.clampedCropY,
+            isPitchClamped = stabilization.isPitchClamped,
             centerSlantRangeMeters = slantR,
             horizontalSpeedMps = activeSpeed,
             arPlaneLocked = false,
-            timestampNs = fallbackTimestampNs
+            timestampNs = frameTs
         )
     }
 
@@ -210,6 +365,7 @@ class GroundPlaneRaycaster(
         detection: StripDetection,
         geometry: StripRoiGeometry,
         poseSnapshot: MotionPoseSnapshot,
+        zoomRatio: Float = PushBroomCropper.DEFAULT_ZOOM_RATIO,
         arFrame: Frame? = null
     ): RaycastResult {
         val screenX = geometry.stripLeftPx + detection.centerXPx
@@ -226,7 +382,7 @@ class GroundPlaneRaycaster(
                     val hp = hit.hitPose
                     val worldPt = WorldPoint3D(hp.tx(), hp.ty(), hp.tz())
                     val slantR = hit.distance.coerceIn(0.40f, 4.0f)
-                    val gsd = PushBroomCropper.computeGsdMmPerPx(slantR)
+                    val gsd = PushBroomCropper.computeGsdMmPerPx(slantR, zoomRatio)
                     return RaycastResult(
                         worldPoint = worldPt,
                         slantRangeMeters = slantR,
@@ -237,53 +393,161 @@ class GroundPlaneRaycaster(
             }
         }
 
+        val effectivePitch = if (eisPitchLockEnabled && !poseSnapshot.isPitchClamped) {
+            poseSnapshot.referencePitchDeg
+        } else {
+            poseSnapshot.forwardPitchDeg
+        }
+
         return raycastTrigonometric(
             stripCenterXPx = detection.centerXPx,
             stripCenterYPx = detection.centerYPx,
+            stripWidthPx = geometry.stripWidthPx,
             cameraWorldPos = poseSnapshot.cameraWorldPosition,
-            forwardPitchDeg = poseSnapshot.forwardPitchDeg,
-            waistHeightMeters = waistHeightMeters
+            forwardPitchDeg = effectivePitch,
+            waistHeightMeters = waistHeightMeters,
+            zoomRatio = zoomRatio
         )
     }
 
     companion object {
         const val DEFAULT_WAIST_HEIGHT_METERS = 1.06f
         const val DEFAULT_PITCH_DEGREES = 45.0f
-        // Vertical angular span of the 384 px tall 2x-cropped push-broom strip (~11.8 deg)
-        private const val STRIP_VERTICAL_FOV_DEG = 11.8f
+        private const val UI_PITCH_LOWPASS_ALPHA = 0.25f
+        private const val IMU_RING_CAPACITY = 32
+        // Vertical angular span of the 384 px tall 2x-cropped push-broom strip (~7.4 deg on 1080p)
+        private const val STRIP_VERTICAL_FOV_2X_DEG = 7.36f
+
+        /**
+         * Remaps raw Android device rotation matrix [rawR] into landscape screen coordinates:
+         *  - `Surface.ROTATION_90`: `(AXIS_Y, AXIS_MINUS_X)`
+         *  - `Surface.ROTATION_270`: `(AXIS_MINUS_Y, AXIS_X)`
+         * Includes exact orthogonal column-permutation fallback when `SensorManager.remapCoordinateSystem`
+         * is stubbed in host-side JVM unit tests.
+         */
+        fun remapLandscapeRotationMatrix(
+            rawR: FloatArray,
+            surfaceRotation: Int,
+            outRemappedR: FloatArray
+        ) {
+            val isRot270 = surfaceRotation == Surface.ROTATION_270
+            val axisX = if (isRot270) SensorManager.AXIS_MINUS_Y else SensorManager.AXIS_Y
+            val axisY = if (isRot270) SensorManager.AXIS_X else SensorManager.AXIS_MINUS_X
+
+            val remappedByFramework = SensorManager.remapCoordinateSystem(rawR, axisX, axisY, outRemappedR)
+            val nonZero = outRemappedR.any { it != 0f }
+            if (remappedByFramework && nonZero) return
+
+            // Exact analytic 3x3 column permutation matching SensorManager.remapCoordinateSystem
+            for (row in 0..2) {
+                val base = row * 3
+                val devX = rawR[base + 0]
+                val devY = rawR[base + 1]
+                val devZ = rawR[base + 2]
+                if (isRot270) {
+                    outRemappedR[base + 0] = -devY
+                    outRemappedR[base + 1] = devX
+                    outRemappedR[base + 2] = devZ
+                } else {
+                    outRemappedR[base + 0] = devY
+                    outRemappedR[base + 1] = -devX
+                    outRemappedR[base + 2] = devZ
+                }
+            }
+        }
+
+        /**
+         * Extracts downward optical pitch (`0 deg` = horizon, `45 deg` = forward rockhounding slant,
+         * `90 deg` = straight down nadir) and screen roll (`deg`) from [remappedR].
+         */
+        fun computePitchAndRollDegrees(remappedR: FloatArray): Pair<Float, Float> {
+            // World ENU Up vector is Row 2 of remappedR: (R[6], R[7], R[8]) = (Up·X_scr, Up·Y_scr, Up·Z_scr)
+            val upDotScreenRight = remappedR[6].toDouble()
+            val upDotScreenUp = remappedR[7].toDouble()
+            val upDotScreenOut = remappedR[8].toDouble()
+
+            val pitchDeg = Math.toDegrees(atan2(upDotScreenOut, upDotScreenUp)).toFloat()
+            val rollDeg = Math.toDegrees(
+                atan2(upDotScreenRight, hypot(upDotScreenUp, upDotScreenOut).coerceAtLeast(1e-6))
+            ).toFloat()
+            return pitchDeg to rollDeg
+        }
+
+        /**
+         * Computes stabilized `cropY` inside `[0..696]` on the `1920x1080` stream:
+         *  - When user pitches DOWN (`currentPitchDeg > referencePitchDeg`), the ground patch moves
+         *    UP toward the top of the sensor frame (`cropY` decreases toward `0`).
+         *  - When user pitches UP (`currentPitchDeg < referencePitchDeg`), the ground patch moves
+         *    DOWN toward the bottom of the sensor frame (`cropY` increases toward `696`).
+         */
+        fun computeStabilizedCropY(
+            currentPitchDeg: Float,
+            referencePitchDeg: Float = DEFAULT_PITCH_DEGREES,
+            verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
+            eisEnabled: Boolean = true
+        ): PitchStabilizationState {
+            if (!eisEnabled) {
+                return PitchStabilizationState(
+                    rawCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                    clampedCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                    isPitchClamped = false,
+                    matchedPitchDeg = currentPitchDeg,
+                    referencePitchDeg = referencePitchDeg,
+                    verticalFocalLengthPx = verticalFocalLengthPx
+                )
+            }
+
+            val deltaPitchRad = Math.toRadians(
+                (currentPitchDeg - referencePitchDeg).coerceIn(-60f, 60f).toDouble()
+            )
+            val deltaYPx = (verticalFocalLengthPx * tan(deltaPitchRad)).roundToInt()
+            val rawCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX - deltaYPx
+            val clampedCropY = rawCropY.coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX)
+            val isClamped = rawCropY < 0 || rawCropY > StripRoiGeometry.MAX_CROP_Y_PX
+
+            return PitchStabilizationState(
+                rawCropY = rawCropY,
+                clampedCropY = clampedCropY,
+                isPitchClamped = isClamped,
+                matchedPitchDeg = currentPitchDeg,
+                referencePitchDeg = referencePitchDeg,
+                verticalFocalLengthPx = verticalFocalLengthPx
+            )
+        }
 
         fun computeSlantRangeForPitch(
             waistHeightMeters: Float = DEFAULT_WAIST_HEIGHT_METERS,
             forwardPitchDeg: Float = DEFAULT_PITCH_DEGREES
         ): Float {
-            val clampedPitchRad = Math.toRadians(forwardPitchDeg.coerceIn(18.0f, 85.0f).toDouble())
-            return (waistHeightMeters / sin(clampedPitchRad)).toFloat().coerceIn(0.40f, 4.00f)
+            val clampedPitchRad = Math.toRadians(forwardPitchDeg.coerceIn(10.0f, 88.0f).toDouble())
+            return (waistHeightMeters / sin(clampedPitchRad)).toFloat().coerceIn(0.40f, 6.50f)
         }
 
         /**
          * Pure trigonometric ground-plane projection from waist height `h` at depression angle
-         * `forwardPitchDeg` (`45 deg` -> `R = 1.50 m`, `Z_ahead = 1.06 m`).
+         * `forwardPitchDeg` (`45 deg` -> `R = 1.50 m`, `Z_ahead = 1.06 m`, `GSD = 0.59 mm/px` @ `2.0x`).
          */
         fun raycastTrigonometric(
             stripCenterXPx: Float,
             stripCenterYPx: Float,
+            stripWidthPx: Int = StripRoiGeometry.STRIP_WIDTH_5_TILE_PX,
             cameraWorldPos: WorldPoint3D = WorldPoint3D(0f, DEFAULT_WAIST_HEIGHT_METERS, 0f),
             forwardPitchDeg: Float = DEFAULT_PITCH_DEGREES,
-            waistHeightMeters: Float = DEFAULT_WAIST_HEIGHT_METERS
+            waistHeightMeters: Float = DEFAULT_WAIST_HEIGHT_METERS,
+            zoomRatio: Float = PushBroomCropper.DEFAULT_ZOOM_RATIO
         ): RaycastResult {
-            // Top of strip (y = 0) looks slightly shallower (further ahead); bottom (y = 384) looks steeper (closer)
+            val stripVFov = STRIP_VERTICAL_FOV_2X_DEG * (2.0f / zoomRatio.coerceAtLeast(1.0f))
             val normYFromCenter = (stripCenterYPx - StripRoiGeometry.STRIP_HEIGHT_PX * 0.5f) /
                 StripRoiGeometry.STRIP_HEIGHT_PX.toFloat()
-            val rayPitchDeg = (forwardPitchDeg + normYFromCenter * STRIP_VERTICAL_FOV_DEG).coerceIn(18.0f, 85.0f)
+            val rayPitchDeg = (forwardPitchDeg + normYFromCenter * stripVFov).coerceIn(10.0f, 88.0f)
             val rayPitchRad = Math.toRadians(rayPitchDeg.toDouble())
 
-            val slantRangeM = (waistHeightMeters / sin(rayPitchRad)).toFloat().coerceIn(0.40f, 4.00f)
+            val slantRangeM = (waistHeightMeters / sin(rayPitchRad)).toFloat().coerceIn(0.40f, 6.50f)
             val forwardGroundDistM = (waistHeightMeters / tan(rayPitchRad)).toFloat()
 
-            val gsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(slantRangeM)
+            val gsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(slantRangeM, zoomRatio)
             val gsdMetersPerPx = gsdMmPerPx * 0.001f
-            val crossTrackOffsetM =
-                (stripCenterXPx - StripRoiGeometry.STRIP_WIDTH_PX * 0.5f) * gsdMetersPerPx
+            val crossTrackOffsetM = (stripCenterXPx - stripWidthPx * 0.5f) * gsdMetersPerPx
 
             return RaycastResult(
                 worldPoint = WorldPoint3D(

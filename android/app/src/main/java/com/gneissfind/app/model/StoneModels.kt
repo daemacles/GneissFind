@@ -4,55 +4,71 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Locked v1 5-Class Target Taxonomy with Auxiliary Confuser Supervision.
- * Class 4 ([HARD_CONFUSER]) MUST BE MUTED in UI and audio; it exists strictly to absorb false-positive logits.
+ * Locked 5-Class Target Taxonomy with Auxiliary Confuser Supervision and Anti-Camouflage Video Reticle Palette:
+ *  - `0`: `chalcedony_agate` -> `#00FFFF` Electric Cyan
+ *  - `1`: `jasper_red_yellow` -> `#FFFF00` High-Vis Solar Yellow
+ *  - `2`: `green_gem_rock` -> `#00FF88` Spring Mint
+ *  - `3`: `petrified_wood` -> `#FFAA00` Bright Amber-Gold
+ *  - `4`: `hard_confuser` -> Strictly muted in normal `SCAN` UI & audio
  */
 enum class StoneClass(
     val id: Int,
+    val codePrefix: String,
     val wireName: String,
     val displayName: String,
+    val lcarsShortName: String,
     val primaryHexColor: Long,
     val accentHexColor: Long,
     val isUserAlertable: Boolean
 ) {
     CHALCEDONY_AGATE(
         id = 0,
+        codePrefix = "01",
         wireName = "chalcedony_agate",
         displayName = "Agate / Carnelian",
-        primaryHexColor = 0xFFFFB300L, // Amber
-        accentHexColor = 0xFF00E5FFL,  // Cyan
+        lcarsShortName = "AGATE / CARNELIAN",
+        primaryHexColor = 0xFF00FFFFL, // Electric Cyan
+        accentHexColor = 0xFFFFFFFFL,
         isUserAlertable = true
     ),
     JASPER_RED_YELLOW(
         id = 1,
+        codePrefix = "02",
         wireName = "jasper_red_yellow",
         displayName = "Red / Yellow Jasper",
-        primaryHexColor = 0xFFFF3D57L, // Crimson
-        accentHexColor = 0xFFFFD54FL,  // Gold
+        lcarsShortName = "RED / YEL JASPER",
+        primaryHexColor = 0xFFFFFF00L, // High-Vis Solar Yellow
+        accentHexColor = 0xFFFFFFFFL,
         isUserAlertable = true
     ),
     GREEN_GEM_ROCK(
         id = 2,
+        codePrefix = "03",
         wireName = "green_gem_rock",
         displayName = "Dallasite / Nephrite",
-        primaryHexColor = 0xFF00E676L, // Emerald
-        accentHexColor = 0xFF69F0AEL,
+        lcarsShortName = "DALLASITE / JADE",
+        primaryHexColor = 0xFF00FF88L, // Spring Mint
+        accentHexColor = 0xFFFFFFFFL,
         isUserAlertable = true
     ),
     PETRIFIED_WOOD(
         id = 3,
+        codePrefix = "04",
         wireName = "petrified_wood",
         displayName = "Petrified Wood",
-        primaryHexColor = 0xFFD99B52L, // Bronze
-        accentHexColor = 0xFFFFCC80L,
+        lcarsShortName = "PETRIFIED WOOD",
+        primaryHexColor = 0xFFFFAA00L, // Bright Amber-Gold
+        accentHexColor = 0xFFFFFFFFL,
         isUserAlertable = true
     ),
     HARD_CONFUSER(
         id = 4,
+        codePrefix = "05",
         wireName = "hard_confuser",
         displayName = "Hard Confuser (Muted)",
-        primaryHexColor = 0xFF78909CL,
-        accentHexColor = 0xFF546E7AL,
+        lcarsShortName = "CONFUSER (MUTED)",
+        primaryHexColor = 0xFF777777L,
+        accentHexColor = 0xFF555555L,
         isUserAlertable = false
     );
 
@@ -64,15 +80,51 @@ enum class StoneClass(
 }
 
 /**
- * Geometry of the 1088x384 push-broom strip inside the upright viewfinder frame.
+ * Cross-track swath tile packing configuration on the `1920 x 1080` landscape stream.
+ *  - [FIVE_TILE] (Default): `xOffsets = [64, 416, 768, 1120, 1472]` -> `1792 x 384 px` (`93.3%` width)
+ *  - [THREE_TILE] (Fast Mode): `xOffsets = [416, 768, 1120]` -> `1088 x 384 px` (`56.7%` width)
+ */
+enum class SwathTileMode(
+    val tileCount: Int,
+    val stripWidthPx: Int,
+    val canonicalStripLeftPx: Int,
+    val frameXOffsets: IntArray,
+    val stripTileOffsets: IntArray,
+    val lcarsLabel: String
+) {
+    FIVE_TILE(
+        tileCount = 5,
+        stripWidthPx = 1792,
+        canonicalStripLeftPx = 64,
+        frameXOffsets = intArrayOf(64, 416, 768, 1120, 1472),
+        stripTileOffsets = intArrayOf(0, 352, 704, 1056, 1408),
+        lcarsLabel = "5-TILE 1792PX"
+    ),
+    THREE_TILE(
+        tileCount = 3,
+        stripWidthPx = 1088,
+        canonicalStripLeftPx = 416,
+        frameXOffsets = intArrayOf(416, 768, 1120),
+        stripTileOffsets = intArrayOf(0, 352, 704),
+        lcarsLabel = "3-TILE 1088PX"
+    );
+
+    fun toggled(): SwathTileMode = if (this == FIVE_TILE) THREE_TILE else FIVE_TILE
+}
+
+/**
+ * Geometry of the active stabilized push-broom strip (`1792x384` or `1088x384`) inside the
+ * landscape `1920x1080` camera frame.
  */
 data class StripRoiGeometry(
-    val uprightFrameWidth: Int,
-    val uprightFrameHeight: Int,
-    val stripLeftPx: Int,
-    val stripTopPx: Int,
-    val stripWidthPx: Int = STRIP_WIDTH_PX,
-    val stripHeightPx: Int = STRIP_HEIGHT_PX
+    val uprightFrameWidth: Int = LANDSCAPE_FRAME_WIDTH_PX,
+    val uprightFrameHeight: Int = LANDSCAPE_FRAME_HEIGHT_PX,
+    val stripLeftPx: Int = SwathTileMode.FIVE_TILE.canonicalStripLeftPx,
+    val stripTopPx: Int = NOMINAL_CROP_Y_PX,
+    val stripWidthPx: Int = SwathTileMode.FIVE_TILE.stripWidthPx,
+    val stripHeightPx: Int = STRIP_HEIGHT_PX,
+    val tileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
+    val isPitchClamped: Boolean = false
 ) {
     val normalizedLeft: Float
         get() = stripLeftPx.toFloat() / uprightFrameWidth.coerceAtLeast(1)
@@ -87,19 +139,23 @@ data class StripRoiGeometry(
         get() = stripHeightPx.toFloat() / uprightFrameHeight.coerceAtLeast(1)
 
     companion object {
-        const val STRIP_WIDTH_PX = 1088
+        const val LANDSCAPE_FRAME_WIDTH_PX = 1920
+        const val LANDSCAPE_FRAME_HEIGHT_PX = 1080
+        const val MAX_STRIP_WIDTH_PX = 1792
+        const val STRIP_WIDTH_5_TILE_PX = 1792
+        const val STRIP_WIDTH_3_TILE_PX = 1088
         const val STRIP_HEIGHT_PX = 384
         const val TILE_SIZE_PX = 384
+        const val TILE_STRIDE_PX = 352
         const val TILE_OVERLAP_PX = 32
-        const val NUM_TILES = 3
-        val TILE_OFFSETS_X = intArrayOf(0, 352, 704)
-        const val DEFAULT_VERTICAL_ANCHOR = 0.36f
+        const val MAX_TILES = 5
+        const val NOMINAL_CROP_Y_PX = 348
+        const val MAX_CROP_Y_PX = LANDSCAPE_FRAME_HEIGHT_PX - STRIP_HEIGHT_PX // 696
     }
 }
 
 /**
- * Raw bounding box detection inside one of the three 384x384 tiles.
- * Coordinates are in [0, 384] tile-local pixels.
+ * Raw bounding box detection inside one of the `384x384` tiles (`[0, 384]` tile-local pixels).
  */
 data class TileDetection(
     val tileIndex: Int,
@@ -112,7 +168,8 @@ data class TileDetection(
 )
 
 /**
- * Bounding box mapped into the unified 1088x384 push-broom strip coordinate system.
+ * Bounding box mapped into unified push-broom strip coordinates (`[0..stripWidthPx] x [0..384]`),
+ * plus full-frame X coordinates (`frameLeftPx`, `frameRightPx` in `[0..1920]`).
  */
 data class StripDetection(
     val stoneClass: StoneClass,
@@ -122,13 +179,16 @@ data class StripDetection(
     val rightPx: Float,
     val bottomPx: Float,
     val estimatedDiameterMm: Float,
-    val sourceTileIndex: Int
+    val sourceTileIndex: Int,
+    val frameLeftPx: Float = leftPx + SwathTileMode.FIVE_TILE.canonicalStripLeftPx,
+    val frameRightPx: Float = rightPx + SwathTileMode.FIVE_TILE.canonicalStripLeftPx
 ) {
     val widthPx: Float get() = (rightPx - leftPx).coerceAtLeast(0f)
     val heightPx: Float get() = (bottomPx - topPx).coerceAtLeast(0f)
     val maxSpanPx: Float get() = max(widthPx, heightPx)
     val centerXPx: Float get() = (leftPx + rightPx) * 0.5f
     val centerYPx: Float get() = (topPx + bottomPx) * 0.5f
+    val frameCenterXPx: Float get() = (frameLeftPx + frameRightPx) * 0.5f
 
     fun iouWith(other: StripDetection): Float {
         val interLeft = max(leftPx, other.leftPx)
@@ -163,7 +223,7 @@ data class WorldPoint3D(
 }
 
 /**
- * Confirmed or candidate target tracked across sweeps in 3D ground coordinates.
+ * Confirmed target tracked across sweeps in 3D ground coordinates.
  */
 data class ConfirmedTarget(
     val trackId: Long,
@@ -189,9 +249,9 @@ enum class OperatingMode {
     LOG_DATA
 }
 
-enum class DetectorBackend(val label: String) {
-    SYNTHETIC_DEMO("Synthetic Demo"),
-    RF_DETR_NANO_GPU("RF-DETR-Nano GPU FP16")
+enum class DetectorBackend(val label: String, val shortCode: String) {
+    SYNTHETIC_DEMO("SYNTHETIC SIM", "SIM"),
+    RF_DETR_NANO_GPU("RF-DETR GPU FP16", "GPU")
 }
 
 sealed interface ScanSpeedState {

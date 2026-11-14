@@ -19,26 +19,33 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Metadata record persisted per captured 1088x384 strip frame in `metadata.jsonl`.
+ * Metadata record persisted per captured stabilized `1792x384` (or `1088x384`) strip frame in `metadata.jsonl`.
  */
 data class FieldStripMetadata(
     val timestampNs: Long,
     val wallTimeMs: Long,
-    val imuPitchDeg: Float,
-    val slantRangeMeters: Float,
-    val gsdMmPerPx: Float,
-    val horizontalSpeedMps: Float,
+    val stripWidthPx: Int = StripRoiGeometry.STRIP_WIDTH_5_TILE_PX,
+    val stripHeightPx: Int = StripRoiGeometry.STRIP_HEIGHT_PX,
+    val tileCount: Int = StripRoiGeometry.MAX_TILES,
+    val zoomRatio: Float = 2.0f,
     val exposureTimeNs: Long,
     val sensorIso: Int,
     val shutterClamped: Boolean,
-    val exposureBiasEv: Float
+    val exposureBiasEv: Float,
+    val imuPitchDeg: Float,
+    val referencePitchDeg: Float = 45.0f,
+    val cropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+    val isPitchClamped: Boolean = false,
+    val slantRangeMeters: Float,
+    val gsdMmPerPx: Float,
+    val horizontalSpeedMps: Float
 )
 
 /**
  * Asynchronous field dataset recorder for `LOG DATA` Mode.
- * Saves shutter-clamped `1088x384` lossless PNG strip frames at `5–10 Hz` (default `6 Hz`)
- * alongside a companion `metadata.jsonl` inside:
- * `Android/media/com.gneissfind.app/field_logs/<session_id>/`
+ * Saves shutter-clamped, IMU-pitch-stabilized `1792x384` (or `1088x384`) lossless PNG strip frames
+ * at `4 Hz` (`2–5 Hz` spec cadence) alongside `metadata.jsonl` inside:
+ * `Android/media/com.gneissfind.app/sessions/<timestamp>/`
  * for zero-permission `adb pull` ingestion by `/ml-pipeline` on the Dell T7920.
  */
 class FieldDataLogger(
@@ -67,23 +74,25 @@ class FieldDataLogger(
 
     private var lastQueuedTimestampNs: Long = 0L
 
-    // Single reusable 1088x384 mutable Bitmap owned exclusively by ioExecutor (zero full-frame 4K allocation)
+    // Single reusable mutable strip Bitmap owned exclusively by ioExecutor (zero full-frame allocation)
     private var reusableStripBitmap: Bitmap? = null
-    private val workerPixelCopy = IntArray(StripRoiGeometry.STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
+    private val workerPixelCopy = IntArray(
+        StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX
+    )
 
     val savedFrameCount: Int
         get() = savedFramesCounter.get()
 
     val currentSessionPath: String
-        get() = activeSessionDir?.absolutePath ?: resolveBaseFieldLogsDir(appContext).absolutePath
+        get() = activeSessionDir?.absolutePath ?: resolveBaseSessionsDir(appContext).absolutePath
 
     @Synchronized
     fun startSession(): File {
         activeSessionDir?.let { return it }
 
         val formatter = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-        val sessionId = "session_${formatter.format(Date())}"
-        val baseDir = resolveBaseFieldLogsDir(appContext)
+        val sessionId = formatter.format(Date())
+        val baseDir = resolveBaseSessionsDir(appContext)
         val sessionDir = File(baseDir, sessionId).apply { mkdirs() }
 
         val metaFile = File(sessionDir, "metadata.jsonl")
@@ -110,8 +119,8 @@ class FieldDataLogger(
     }
 
     /**
-     * Submits a shutter-clamped 1088x384 ARGB strip for non-blocking disk write if the 5–10 Hz
-     * cadence interval has elapsed and the background writer is idle.
+     * Submits a shutter-clamped, pitch-stabilized ARGB strip for non-blocking disk write if the
+     * `4 Hz` cadence interval has elapsed and the background writer is idle.
      */
     fun maybeRecordStripFrame(
         stripArgbPixels: IntArray,
@@ -127,8 +136,12 @@ class FieldDataLogger(
             return false
         }
 
+        val stripW = metadata.stripWidthPx.coerceIn(1, StripRoiGeometry.MAX_STRIP_WIDTH_PX)
+        val stripH = metadata.stripHeightPx.coerceIn(1, StripRoiGeometry.STRIP_HEIGHT_PX)
+        val pixelCount = (stripW * stripH).coerceAtMost(workerPixelCopy.size)
+
         lastQueuedTimestampNs = metadata.timestampNs
-        System.arraycopy(stripArgbPixels, 0, workerPixelCopy, 0, workerPixelCopy.size)
+        System.arraycopy(stripArgbPixels, 0, workerPixelCopy, 0, pixelCount)
         val sessionIdSnapshot = activeSessionId
 
         ioExecutor.execute {
@@ -137,21 +150,17 @@ class FieldDataLogger(
                 val fileName = String.format(Locale.US, "strip_%06d.png", frameNumber)
                 val pngFile = File(sessionDir, fileName)
 
-                val bmp = reusableStripBitmap ?: Bitmap.createBitmap(
-                    StripRoiGeometry.STRIP_WIDTH_PX,
-                    StripRoiGeometry.STRIP_HEIGHT_PX,
-                    Bitmap.Config.ARGB_8888
-                ).also { reusableStripBitmap = it }
+                val existingBmp = reusableStripBitmap
+                val bmp = if (existingBmp != null && existingBmp.width == stripW && existingBmp.height == stripH) {
+                    existingBmp
+                } else {
+                    existingBmp?.recycle()
+                    Bitmap.createBitmap(stripW, stripH, Bitmap.Config.ARGB_8888).also {
+                        reusableStripBitmap = it
+                    }
+                }
 
-                bmp.setPixels(
-                    workerPixelCopy,
-                    0,
-                    StripRoiGeometry.STRIP_WIDTH_PX,
-                    0,
-                    0,
-                    StripRoiGeometry.STRIP_WIDTH_PX,
-                    StripRoiGeometry.STRIP_HEIGHT_PX
-                )
+                bmp.setPixels(workerPixelCopy, 0, stripW, 0, 0, stripW, stripH)
 
                 BufferedOutputStream(FileOutputStream(pngFile), 64 * 1024).use { out ->
                     bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
@@ -185,15 +194,15 @@ class FieldDataLogger(
 
     companion object {
         private const val TAG = "FieldDataLogger"
-        const val DEFAULT_CAPTURE_HZ = 6.0f // Inside locked 5–10 Hz target cadence
+        const val DEFAULT_CAPTURE_HZ = 4.0f // Inside locked 2–5 Hz v2 strip logger cadence
 
         @Suppress("DEPRECATION")
-        fun resolveBaseFieldLogsDir(context: Context): File {
-            // Maps directly to /storage/emulated/0/Android/media/com.gneissfind.app/field_logs/
+        fun resolveBaseSessionsDir(context: Context): File {
+            // Maps directly to /storage/emulated/0/Android/media/com.gneissfind.app/sessions/
             val mediaRoot = context.externalMediaDirs?.firstOrNull()
                 ?: context.getExternalFilesDir(null)
                 ?: context.filesDir
-            return File(mediaRoot, "field_logs").apply { mkdirs() }
+            return File(mediaRoot, "sessions").apply { mkdirs() }
         }
 
         fun buildMetadataJsonLine(
@@ -203,21 +212,31 @@ class FieldDataLogger(
             metadata: FieldStripMetadata
         ): String {
             return JSONObject().apply {
+                put("frame_id", frameIndex)
                 put("session_id", sessionId)
-                put("frame_index", frameIndex)
                 put("file_name", fileName)
                 put("timestamp_ns", metadata.timestampNs)
                 put("wall_time_ms", metadata.wallTimeMs)
-                put("strip_width", StripRoiGeometry.STRIP_WIDTH_PX)
-                put("strip_height", StripRoiGeometry.STRIP_HEIGHT_PX)
-                put("imu_pitch_deg", round3(metadata.imuPitchDeg))
-                put("slant_range_m", round3(metadata.slantRangeMeters))
-                put("gsd_mm_per_px", round3(metadata.gsdMmPerPx))
-                put("walk_speed_mps", round3(metadata.horizontalSpeedMps))
+                put("strip_width", metadata.stripWidthPx)
+                put("strip_height", metadata.stripHeightPx)
+                put("tile_count", metadata.tileCount)
+                put("zoom_ratio", round3(metadata.zoomRatio))
+                put("exposure_ns", metadata.exposureTimeNs)
                 put("exposure_time_ns", metadata.exposureTimeNs)
+                put("iso", metadata.sensorIso)
                 put("sensor_iso", metadata.sensorIso)
                 put("shutter_clamped", metadata.shutterClamped)
                 put("exposure_bias_ev", round3(metadata.exposureBiasEv))
+                put("pitch_deg", round3(metadata.imuPitchDeg))
+                put("imu_pitch_deg", round3(metadata.imuPitchDeg))
+                put("ref_pitch_deg", round3(metadata.referencePitchDeg))
+                put("crop_y", metadata.cropY)
+                put("is_pitch_clamped", metadata.isPitchClamped)
+                put("slant_range_m", round3(metadata.slantRangeMeters))
+                put("gsd_mm_px", round3(metadata.gsdMmPerPx))
+                put("gsd_mm_per_px", round3(metadata.gsdMmPerPx))
+                put("ground_speed_mps", round3(metadata.horizontalSpeedMps))
+                put("walk_speed_mps", round3(metadata.horizontalSpeedMps))
             }.toString()
         }
 

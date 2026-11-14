@@ -1,6 +1,7 @@
 package com.gneissfind.app.ui
 
 import android.app.Application
+import android.view.Surface
 import androidx.camera.core.ImageProxy
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
@@ -20,6 +21,7 @@ import com.gneissfind.app.model.ScanSpeedState
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.StripRoiGeometry
+import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
 import com.gneissfind.app.tracking.ProjectedCandidate
 import com.gneissfind.app.tracking.TemporalTargetTracker
@@ -35,27 +37,31 @@ data class ScannerUiState(
     val operatingMode: OperatingMode = OperatingMode.SCAN,
     val detectorBackend: DetectorBackend = DetectorBackend.SYNTHETIC_DEMO,
     val syntheticProfile: SyntheticTargetProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK,
-    val detectorStatus: String = "Synthetic Demo (Mixed Gravel Walk)",
+    val detectorStatus: String = "SYNTHETIC (MIXED GRAVEL SIM)",
     val enabledClasses: Set<StoneClass> = StoneClass.alertableClasses.toSet(),
+    val swathTileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
     val shutterClampEnabled: Boolean = true,
     val twoXCropEnabled: Boolean = true,
-    val exposureBiasEv: Float = -0.5f,
+    val eisPitchLockEnabled: Boolean = true,
+    val exposureBiasEv: Float = 0.0f,
     val isAudioMuted: Boolean = false,
     val simulatedSpeedOverrideMps: Float? = null,
-    val stripGeometry: StripRoiGeometry = StripRoiGeometry(
-        uprightFrameWidth = 2160,
-        uprightFrameHeight = 3840,
-        stripLeftPx = (2160 - StripRoiGeometry.STRIP_WIDTH_PX) / 2,
-        stripTopPx = 1190
-    ),
+    val displaySurfaceRotation: Int = Surface.ROTATION_90,
+    val stripGeometry: StripRoiGeometry = StripRoiGeometry(),
     val rawStripDetections: List<StripDetection> = emptyList(),
     val confirmedTargets: List<ConfirmedTarget> = emptyList(),
     val speedState: ScanSpeedState = ScanSpeedState.Normal(0f),
     val imuPitchDeg: Float = GroundPlaneRaycaster.DEFAULT_PITCH_DEGREES,
+    val rollDeg: Float = 0f,
+    val referencePitchDeg: Float = GroundPlaneRaycaster.DEFAULT_PITCH_DEGREES,
+    val cropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+    val isPitchClamped: Boolean = false,
+    val verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
     val slantRangeMeters: Float = PushBroomCropper.DEFAULT_SLANT_RANGE_METERS,
     val gsdMmPerPx: Float = PushBroomCropper.DEFAULT_GSD_MM_PER_PX,
     val sweepLatencyMs: Float = 0f,
     val rollingLatencyMs: Float = 0f,
+    val sweepHz: Float = 0f,
     val part1LatencyMs: Float = 0f,
     val bridgeLatencyMs: Float = 0f,
     val part2LatencyMs: Float = 0f,
@@ -88,15 +94,41 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         onFrameAvailable = ::processCameraFrameOnAnalyzerThread
     )
 
+    private var lastFrameTimestampNs: Long = 0L
+    private var smoothedSweepHz: Float = 0f
+
     private val _uiState = MutableStateFlow(
         ScannerUiState(
-            fieldLogDirectory = FieldDataLogger.resolveBaseFieldLogsDir(appContext).absolutePath
+            fieldLogDirectory = FieldDataLogger.resolveBaseSessionsDir(appContext).absolutePath
         )
     )
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
 
-    fun bindCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
-        cameraController.bindToLifecycle(lifecycleOwner, previewView)
+    fun bindCamera(
+        lifecycleOwner: LifecycleOwner,
+        previewView: PreviewView,
+        initialSurfaceRotation: Int = _uiState.value.displaySurfaceRotation
+    ) {
+        cameraController.bindToLifecycle(lifecycleOwner, previewView, initialSurfaceRotation)
+    }
+
+    /**
+     * Synchronizes CameraX `targetRotation`, ARCore `setDisplayGeometry`, and IMU `remapCoordinateSystem`
+     * whenever reversible `sensorLandscape` flips between `Surface.ROTATION_90` and `Surface.ROTATION_270`.
+     */
+    fun onDisplayGeometryChanged(
+        surfaceRotation: Int,
+        viewportWidthPx: Int = 0,
+        viewportHeightPx: Int = 0
+    ) {
+        val normalized = PushBroomCameraController.normalizeLandscapeRotation(surfaceRotation)
+        cameraController.updateTargetRotation(normalized)
+        raycaster.updateDisplayGeometry(
+            surfaceRotation = normalized,
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx
+        )
+        _uiState.update { it.copy(displaySurfaceRotation = normalized) }
     }
 
     fun onResumeSensorsAndAudio() {
@@ -112,7 +144,6 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun setOperatingMode(mode: OperatingMode) {
         if (mode == OperatingMode.LOG_DATA) {
-            // Mandatory <= 1/500s shutter clamp when Field Logger mode activates
             cameraController.setShutterClamp(true)
             val dir = fieldLogger.startSession()
             _uiState.update {
@@ -142,7 +173,78 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun setSyntheticProfile(profile: SyntheticTargetProfile) {
         syntheticDetector.profile = profile
         tracker.reset()
-        _uiState.update { it.copy(syntheticProfile = profile) }
+        _uiState.update {
+            it.copy(
+                detectorBackend = DetectorBackend.SYNTHETIC_DEMO,
+                syntheticProfile = profile
+            )
+        }
+    }
+
+    /**
+     * Inline LCARS scenario cycler (`LIVE CAM (GPU)` -> `MIXED GRAVEL SIM` -> `21MM AGATE` ->
+     * `56MM JASPER` -> `CONFUSERS MUTED`) so testing never requires a modal sheet.
+     */
+    fun cycleScenarioPreset() {
+        val cur = _uiState.value
+        tracker.reset()
+        if (cur.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
+            syntheticDetector.profile = SyntheticTargetProfile.MIXED_GRAVEL_WALK
+            _uiState.update {
+                it.copy(
+                    detectorBackend = DetectorBackend.SYNTHETIC_DEMO,
+                    syntheticProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK
+                )
+            }
+            return
+        }
+
+        val profiles = SyntheticTargetProfile.entries
+        val nextIdx = profiles.indexOf(cur.syntheticProfile) + 1
+        if (nextIdx < profiles.size) {
+            val nextProfile = profiles[nextIdx]
+            syntheticDetector.profile = nextProfile
+            _uiState.update { it.copy(syntheticProfile = nextProfile) }
+        } else {
+            _uiState.update { it.copy(detectorBackend = DetectorBackend.RF_DETR_NANO_GPU) }
+        }
+    }
+
+    fun toggleSwathTileMode() {
+        val next = _uiState.value.swathTileMode.toggled()
+        tracker.reset()
+        _uiState.update { state ->
+            state.copy(
+                swathTileMode = next,
+                stripGeometry = state.stripGeometry.copy(
+                    stripLeftPx = next.canonicalStripLeftPx,
+                    stripWidthPx = next.stripWidthPx,
+                    tileMode = next
+                )
+            )
+        }
+    }
+
+    fun setEisPitchLockEnabled(enabled: Boolean) {
+        raycaster.eisPitchLockEnabled = enabled
+        _uiState.update {
+            it.copy(
+                eisPitchLockEnabled = enabled,
+                cropY = if (enabled) it.cropY else StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = if (enabled) it.isPitchClamped else false
+            )
+        }
+    }
+
+    fun syncReferencePitch() {
+        val synced = raycaster.syncReferencePitch()
+        _uiState.update {
+            it.copy(
+                referencePitchDeg = synced,
+                cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = false
+            )
+        }
     }
 
     fun toggleStoneClass(stoneClass: StoneClass) {
@@ -163,11 +265,21 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun setTwoXCropEnabled(enabled: Boolean) {
         cameraController.setTwoXSensorCrop(enabled)
-        _uiState.update { it.copy(twoXCropEnabled = enabled) }
+        val zoom = if (enabled) 2.0f else 1.0f
+        _uiState.update {
+            it.copy(
+                twoXCropEnabled = enabled,
+                activeZoomRatio = zoom,
+                gsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(it.slantRangeMeters, zoom)
+            )
+        }
     }
 
     fun setExposureBiasEv(ev: Float) {
-        val clamped = ev.coerceIn(-2.0f, 2.0f)
+        val clamped = ev.coerceIn(
+            PushBroomCameraController.MIN_CANOPY_EV_BIAS,
+            PushBroomCameraController.MAX_CANOPY_EV_BIAS
+        )
         cameraController.setExposureBiasEv(clamped)
         _uiState.update { it.copy(exposureBiasEv = clamped) }
     }
@@ -182,6 +294,11 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(simulatedSpeedOverrideMps = speedMps) }
     }
 
+    fun toggleOverspeedTest() {
+        val next = if (_uiState.value.simulatedSpeedOverrideMps != null) null else 1.38f
+        setSimulatedWalkSpeedOverride(next)
+    }
+
     private fun processCameraFrameOnAnalyzerThread(
         imageProxy: ImageProxy,
         exposureTelemetry: CameraExposureTelemetry
@@ -189,62 +306,94 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         try {
             val stateSnapshot = _uiState.value
             val isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
+            val tileMode = stateSnapshot.swathTileMode
+            val frameTs = imageProxy.imageInfo.timestamp
 
-            // 1. Zero-copy YUV_420_888 strip extraction (1088x384 -> 3 overlapping 384x384 tiles)
+            if (lastFrameTimestampNs != 0L && frameTs > lastFrameTimestampNs) {
+                val dtSec = (frameTs - lastFrameTimestampNs) * 1e-9f
+                if (dtSec in 0.005f..1.0f) {
+                    val instHz = 1.0f / dtSec
+                    smoothedSweepHz = if (smoothedSweepHz <= 0.1f) {
+                        instHz
+                    } else {
+                        smoothedSweepHz * 0.80f + instHz * 0.20f
+                    }
+                }
+            }
+            lastFrameTimestampNs = frameTs
+
+            // 1. Capture timestamp-matched IMU pose, stabilized cropY in [0..696], slant range R, & speed
+            val poseSnapshot = raycaster.capturePoseSnapshot(
+                arFrame = null,
+                fallbackTimestampNs = frameTs,
+                verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
+            )
+            val activeZoom = exposureTelemetry.activeZoomRatio
+            val centerGsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(
+                slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
+                zoomRatio = activeZoom
+            )
+
+            // 2. Zero-copy YUV_420_888 stabilized strip extraction (1792x384 5-tile or 1088x384 3-tile)
             val yuvFrame = ImageProxyYuv420Frame(imageProxy)
             val geometry = cropper.extractTiles(
                 frame = yuvFrame,
                 outBuffers = sweepBuffers,
+                cropY = poseSnapshot.cropY,
+                tileMode = tileMode,
+                isPitchClamped = poseSnapshot.isPitchClamped,
                 populateArgbStrip = isLoggingMode
             )
 
-            // 2. Capture IMU / ARCore pose, slant range R, and ground velocity v_xy
-            val poseSnapshot = raycaster.capturePoseSnapshot(
-                arFrame = null,
-                fallbackTimestampNs = yuvFrame.timestampNs
-            )
-            val centerGsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(poseSnapshot.centerSlantRangeMeters)
-
-            // 3. Optional LOG DATA lossless 1088x384 strip + metadata.jsonl persistence (5–10 Hz)
+            // 3. Optional LOG DATA lossless strip + metadata.jsonl persistence (4 Hz)
             if (isLoggingMode && sweepBuffers.hasArgbPixels) {
                 fieldLogger.maybeRecordStripFrame(
                     stripArgbPixels = sweepBuffers.stripArgbPixels,
                     metadata = FieldStripMetadata(
                         timestampNs = yuvFrame.timestampNs,
                         wallTimeMs = System.currentTimeMillis(),
-                        imuPitchDeg = poseSnapshot.forwardPitchDeg,
-                        slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
-                        gsdMmPerPx = centerGsdMmPerPx,
-                        horizontalSpeedMps = poseSnapshot.horizontalSpeedMps,
+                        stripWidthPx = tileMode.stripWidthPx,
+                        stripHeightPx = StripRoiGeometry.STRIP_HEIGHT_PX,
+                        tileCount = tileMode.tileCount,
+                        zoomRatio = activeZoom,
                         exposureTimeNs = exposureTelemetry.exposureTimeNs,
                         sensorIso = exposureTelemetry.sensorIso,
                         shutterClamped = stateSnapshot.shutterClampEnabled,
-                        exposureBiasEv = stateSnapshot.exposureBiasEv
+                        exposureBiasEv = stateSnapshot.exposureBiasEv,
+                        imuPitchDeg = poseSnapshot.forwardPitchDeg,
+                        referencePitchDeg = poseSnapshot.referencePitchDeg,
+                        cropY = poseSnapshot.cropY,
+                        isPitchClamped = poseSnapshot.isPitchClamped,
+                        slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
+                        gsdMmPerPx = centerGsdMmPerPx,
+                        horizontalSpeedMps = poseSnapshot.horizontalSpeedMps
                     )
                 )
             }
 
-            // 4. Run active StoneDetector across the 3 tiles
+            // 4. Run active StoneDetector across the 5 (or 3) tiles
             val activeDetector = when (stateSnapshot.detectorBackend) {
                 DetectorBackend.SYNTHETIC_DEMO -> syntheticDetector
                 DetectorBackend.RF_DETR_NANO_GPU -> rfDetrGpuDetector
             }
             val inferenceResult = activeDetector.detectSweep(sweepBuffers)
 
-            // 5. Map tile boxes to 1088x384 strip, run Cross-Tile NMS (IoU = 0.50),
+            // 5. Map tile boxes to unified strip, run Cross-Tile NMS (IoU >= 0.45),
             //    mute Class 4 (hard_confuser), and enforce >= 20 mm physical diameter
             val filteredDetections = cropper.mergeAndFilterTileDetections(
                 tileDetections = inferenceResult.tileDetections,
+                tileMode = tileMode,
                 gsdMmPerPx = centerGsdMmPerPx,
                 enabledClasses = stateSnapshot.enabledClasses
             )
 
-            // 6. Raycast detections onto ground plane and update 3-of-6 spatial voting + 1.1 m/s speed gate
+            // 6. Raycast detections onto ground plane & update 3-of-6 spatial voting + 1.10 m/s speed gate
             val projectedCandidates = filteredDetections.map { det ->
                 val raycast = raycaster.raycastStripDetection(
                     detection = det,
                     geometry = geometry,
-                    poseSnapshot = poseSnapshot
+                    poseSnapshot = poseSnapshot,
+                    zoomRatio = activeZoom
                 )
                 ProjectedCandidate(
                     stripDetection = det,
@@ -261,7 +410,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 currentSpeedMps = poseSnapshot.horizontalSpeedMps
             )
 
-            // 7. Drive AudioTrack sonifier (780..320 Hz pitch, 2..14 Hz cadence, or SLOW SWEEP buzz)
+            // 7. Drive AudioTrack sonifier (strictly reserved for stone pings & overspeed warning)
             sonifier.updateTargets(
                 confirmedTargets = trackerOutput.confirmedTargets,
                 speedState = trackerOutput.speedState
@@ -276,16 +425,22 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     confirmedTargets = trackerOutput.confirmedTargets,
                     speedState = trackerOutput.speedState,
                     imuPitchDeg = poseSnapshot.forwardPitchDeg,
+                    rollDeg = poseSnapshot.rollDeg,
+                    referencePitchDeg = poseSnapshot.referencePitchDeg,
+                    cropY = poseSnapshot.cropY,
+                    isPitchClamped = poseSnapshot.isPitchClamped,
+                    verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx,
                     slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
                     gsdMmPerPx = centerGsdMmPerPx,
                     sweepLatencyMs = inferenceResult.totalSweepLatencyMs,
                     rollingLatencyMs = inferenceResult.rollingAvgLatencyMs,
+                    sweepHz = smoothedSweepHz,
                     part1LatencyMs = inferenceResult.part1LatencyMs,
                     bridgeLatencyMs = inferenceResult.hostTopKBridgeLatencyMs,
                     part2LatencyMs = inferenceResult.part2LatencyMs,
                     exposureTimeNs = exposureTelemetry.exposureTimeNs,
                     sensorIso = exposureTelemetry.sensorIso,
-                    activeZoomRatio = exposureTelemetry.activeZoomRatio,
+                    activeZoomRatio = activeZoom,
                     audioPitchHz = audioTel.currentPitchHz,
                     audioCadenceHz = audioTel.currentPingCadenceHz,
                     loggedFrameCount = fieldLogger.savedFrameCount,

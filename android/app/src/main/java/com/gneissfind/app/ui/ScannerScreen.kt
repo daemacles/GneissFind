@@ -749,7 +749,7 @@ private fun PushBroomTripwireOverlay(
 
         val boxLeft = (offsetX + stripGeometry.normalizedLeft * renderedW).coerceIn(16f, canvasW - 32f)
         val boxWidth = (stripGeometry.normalizedWidth * renderedW).coerceAtMost(canvasW - boxLeft - 16f)
-        val boxHeight = (boxWidth * (StripRoiGeometry.STRIP_HEIGHT_PX.toFloat() / StripRoiGeometry.STRIP_WIDTH_PX))
+        val boxHeight = (boxWidth * (StripRoiGeometry.STRIP_HEIGHT_PX.toFloat() / stripGeometry.stripWidthPx.coerceAtLeast(1)))
             .coerceAtLeast(76f)
 
         // Ensure tripwire header & box never collide with the measured Top HUD bottom edge
@@ -793,7 +793,7 @@ private fun PushBroomTripwireOverlay(
         val seamDash = PathEffect.dashPathEffect(floatArrayOf(8f, 8f), 0f)
         val seamPositionsPx = floatArrayOf(352f, 384f, 704f, 736f)
         for (seamPx in seamPositionsPx) {
-            val sx = boxLeft + (seamPx / StripRoiGeometry.STRIP_WIDTH_PX) * boxWidth
+            val sx = boxLeft + (seamPx / stripGeometry.stripWidthPx.coerceAtLeast(1)) * boxWidth
             drawLine(
                 color = borderColor.copy(alpha = 0.38f),
                 start = Offset(sx, boxTop),
@@ -838,7 +838,7 @@ private fun PushBroomTripwireOverlay(
         )
 
         // Render world-locked ConfirmedTarget reticles (strictly excluding Class 4 hard_confuser)
-        val scaleX = boxWidth / StripRoiGeometry.STRIP_WIDTH_PX.toFloat()
+        val scaleX = boxWidth / stripGeometry.stripWidthPx.coerceAtLeast(1).toFloat()
         val scaleY = boxHeight / StripRoiGeometry.STRIP_HEIGHT_PX.toFloat()
 
         for (target in confirmedTargets) {

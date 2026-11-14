@@ -1,10 +1,14 @@
 package com.gneissfind.app
 
 import android.Manifest
+import android.content.Context
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.hardware.display.DisplayManager
 import android.media.AudioManager
 import android.os.Bundle
+import android.view.Surface
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -19,6 +23,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -34,14 +39,40 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.BLACK),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.BLACK)
         )
         volumeControlStream = AudioManager.STREAM_MUSIC
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.decorView.isSoundEffectsEnabled = false
+
+        syncCurrentDisplayGeometry()
 
         setContent {
+            val hostView = LocalView.current
+            LaunchedEffect(hostView) {
+                hostView.isSoundEffectsEnabled = false
+            }
+
+            // Track 180-degree sensorLandscape flips (ROTATION_90 <-> ROTATION_270) even when
+            // Android skips configuration recreation between opposite landscape orientations.
+            DisposableEffect(Unit) {
+                val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+                val listener = object : DisplayManager.DisplayListener {
+                    override fun onDisplayAdded(displayId: Int) = Unit
+                    override fun onDisplayRemoved(displayId: Int) = Unit
+                    override fun onDisplayChanged(displayId: Int) {
+                        syncCurrentDisplayGeometry()
+                    }
+                }
+                displayManager?.registerDisplayListener(listener, null)
+                onDispose {
+                    displayManager?.unregisterDisplayListener(listener)
+                }
+            }
+
             GneissFindTheme {
                 var hasCameraPermission by remember {
                     mutableStateOf(
@@ -68,7 +99,10 @@ class MainActivity : ComponentActivity() {
                 DisposableEffect(lifecycleOwner) {
                     val observer = LifecycleEventObserver { _, event ->
                         when (event) {
-                            Lifecycle.Event.ON_RESUME -> viewModel.onResumeSensorsAndAudio()
+                            Lifecycle.Event.ON_RESUME -> {
+                                syncCurrentDisplayGeometry()
+                                viewModel.onResumeSensorsAndAudio()
+                            }
                             Lifecycle.Event.ON_PAUSE -> viewModel.onPauseSensorsAndAudio()
                             else -> Unit
                         }
@@ -87,7 +121,9 @@ class MainActivity : ComponentActivity() {
                     onRequestCameraPermission = {
                         permissionLauncher.launch(Manifest.permission.CAMERA)
                     },
-                    onBindPreview = viewModel::bindCamera,
+                    onBindPreview = { owner, previewView ->
+                        viewModel.bindCamera(owner, previewView, currentSurfaceRotation())
+                    },
                     onSelectMode = viewModel::setOperatingMode,
                     onSelectBackend = viewModel::setDetectorBackend,
                     onSelectSyntheticProfile = viewModel::setSyntheticProfile,
@@ -100,5 +136,18 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private fun currentSurfaceRotation(): Int {
+        return display?.rotation ?: Surface.ROTATION_90
+    }
+
+    private fun syncCurrentDisplayGeometry() {
+        val bounds = windowManager.currentWindowMetrics.bounds
+        viewModel.onDisplayGeometryChanged(
+            surfaceRotation = currentSurfaceRotation(),
+            viewportWidthPx = bounds.width(),
+            viewportHeightPx = bounds.height()
+        )
     }
 }

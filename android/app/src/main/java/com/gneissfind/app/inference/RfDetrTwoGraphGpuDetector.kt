@@ -121,7 +121,8 @@ class RfDetrTwoGraphGpuDetector(
         val m1 = part1Model
         val m2 = part2Model
 
-        for (tileIdx in 0 until StripRoiGeometry.NUM_TILES) {
+        val activeTiles = sweepBuffers.activeTileCount.coerceIn(1, StripRoiGeometry.MAX_TILES)
+        for (tileIdx in 0 until activeTiles) {
             val tileFloats = sweepBuffers.tileRgbFloats[tileIdx]
 
             if (hardwareGraphsLoaded && m1 != null && m2 != null) {
