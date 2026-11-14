@@ -1,7 +1,6 @@
 package com.gneissfind.app
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
@@ -59,7 +58,7 @@ class MainActivity : ComponentActivity() {
             // Track 180-degree sensorLandscape flips (ROTATION_90 <-> ROTATION_270) even when
             // Android skips configuration recreation between opposite landscape orientations.
             DisposableEffect(Unit) {
-                val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+                val displayManager = getSystemService(DISPLAY_SERVICE) as? DisplayManager
                 val listener = object : DisplayManager.DisplayListener {
                     override fun onDisplayAdded(displayId: Int) = Unit
                     override fun onDisplayRemoved(displayId: Int) = Unit
@@ -126,13 +125,16 @@ class MainActivity : ComponentActivity() {
                     },
                     onSelectMode = viewModel::setOperatingMode,
                     onSelectBackend = viewModel::setDetectorBackend,
-                    onSelectSyntheticProfile = viewModel::setSyntheticProfile,
+                    onCycleScenario = viewModel::cycleScenarioPreset,
+                    onToggleSwathTileMode = viewModel::toggleSwathTileMode,
+                    onToggleEisLock = viewModel::setEisPitchLockEnabled,
+                    onSyncPitch = viewModel::syncReferencePitch,
                     onToggleStoneClass = viewModel::toggleStoneClass,
                     onToggleShutterClamp = viewModel::setShutterClampEnabled,
                     onToggleTwoXCrop = viewModel::setTwoXCropEnabled,
                     onChangeExposureBias = viewModel::setExposureBiasEv,
                     onToggleAudioMute = viewModel::setAudioMuted,
-                    onChangeSimSpeed = viewModel::setSimulatedWalkSpeedOverride
+                    onToggleOverspeedTest = viewModel::toggleOverspeedTest
                 )
             }
         }

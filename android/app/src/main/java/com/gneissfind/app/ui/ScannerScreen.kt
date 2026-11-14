@@ -1,91 +1,51 @@
 package com.gneissfind.app.ui
 
+import android.content.Context
+import android.graphics.Outline as AndroidOutline
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.view.Surface
+import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
+import android.widget.FrameLayout
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.toggleable
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.VolumeOff
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.FiberManualRecord
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.Button
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalInspectionMode
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.drawText
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.rememberTextMeasurer
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.tooling.preview.Devices
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.gneissfind.app.inference.SyntheticTargetProfile
 import com.gneissfind.app.model.ConfirmedTarget
@@ -94,26 +54,172 @@ import com.gneissfind.app.model.OperatingMode
 import com.gneissfind.app.model.ScanSpeedState
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripRoiGeometry
+import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.model.WorldPoint3D
-import com.gneissfind.app.ui.theme.AlertRedBanner
-import com.gneissfind.app.ui.theme.CarnelianAmber
-import com.gneissfind.app.ui.theme.CyanTripwire
+import com.gneissfind.app.ui.lcars.LcarsBarHeight
+import com.gneissfind.app.ui.lcars.LcarsElbow
+import com.gneissfind.app.ui.lcars.LcarsElbowOrientation
+import com.gneissfind.app.ui.lcars.LcarsGutter
+import com.gneissfind.app.ui.lcars.LcarsHeaderSegment
+import com.gneissfind.app.ui.lcars.LcarsPillButton
+import com.gneissfind.app.ui.lcars.LcarsPillEndStyle
+import com.gneissfind.app.ui.lcars.LcarsSegmentedEvBar
+import com.gneissfind.app.ui.lcars.LcarsStemWidth
 import com.gneissfind.app.ui.theme.GneissFindTheme
-import com.gneissfind.app.ui.theme.HudBorderSubtle
-import com.gneissfind.app.ui.theme.HudTextPrimary
-import com.gneissfind.app.ui.theme.HudTextSecondary
-import com.gneissfind.app.ui.theme.JasperCrimson
-import com.gneissfind.app.ui.theme.NephriteEmerald
-import com.gneissfind.app.ui.theme.ObsidianSurface
-import com.gneissfind.app.ui.theme.SlateCard
-import com.gneissfind.app.ui.theme.SlateCardElevated
-import java.io.File
+import com.gneissfind.app.ui.theme.LcarsColors
+import com.gneissfind.app.ui.theme.LcarsTypography
 import java.util.Locale
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
-enum class ControlsSheetTab(val title: String) {
-    OPTICS_AND_SPEED("Optics & Speed"),
-    MODEL_AND_SIM("Model & Sim")
+private val TopElbowArmWidth = 144.dp
+private val TopElbowStemHeight = 50.dp
+private val BottomElbowArmWidth = 144.dp
+private val BottomElbowStemHeight = 48.dp
+private val PitchGaugeWidth = 40.dp
+
+private val ScanSpeedState.isOverspeed: Boolean
+    get() = this is ScanSpeedState.SpeedWarning
+
+private val ScanSpeedState.speedMps: Float
+    get() = when (this) {
+        is ScanSpeedState.Normal -> currentSpeedMps
+        is ScanSpeedState.SpeedWarning -> currentSpeedMps
+    }
+
+/**
+ * Exact optical mapping from `1920x1080` landscape sensor coordinates into the panoramic
+ * LCARS viewport slot so `cropY in [0..696]` moves smoothly while keeping the entire `384 px`
+ * push-broom strip visible and 1:1 pixel-registered with [PreviewView].
+ */
+@Immutable
+data class PanoramicViewportTransform(
+    val scale: Float,
+    val frameLeftPx: Float,
+    val frameTopPx: Float,
+    val renderedFrameWidthPx: Float,
+    val renderedFrameHeightPx: Float,
+    val stripLeftPx: Float,
+    val stripTopPx: Float,
+    val stripWidthPx: Float,
+    val stripHeightPx: Float
+)
+
+fun computePanoramicViewportTransform(
+    viewportWidthPx: Float,
+    viewportHeightPx: Float,
+    cropY: Int,
+    swathTileMode: SwathTileMode
+): PanoramicViewportTransform {
+    val vw = max(1f, viewportWidthPx)
+    val vh = max(1f, viewportHeightPx)
+    val clampedCropY = cropY.coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX)
+
+    // Always fill 100% of the panoramic horizontal viewport width (zero side letterbox bars)
+    // unless the container is taller than 16:9 (e.g. square desktop window), in which case fit height.
+    val scale = if ((vw * StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX / StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX) >= vh) {
+        vw / StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat()
+    } else {
+        min(
+            vw / StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat(),
+            vh / StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat()
+        )
+    }
+    val renderedW = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX * scale
+    val renderedH = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX * scale
+    val stripH = StripRoiGeometry.STRIP_HEIGHT_PX * scale
+    val frameLeft = (vw - renderedW) * 0.5f
+
+    val frameTop = if (renderedH <= vh) {
+        (vh - renderedH) * 0.5f
+    } else {
+        val travelFraction = clampedCropY.toFloat() / StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+        val desiredStripTop = if (stripH <= vh) {
+            travelFraction * (vh - stripH)
+        } else {
+            // Center the 384 px strip inside compact viewports while panning camera rows smoothly
+            (vh - stripH) * 0.5f
+        }
+        (desiredStripTop - clampedCropY * scale).coerceIn(vh - renderedH, 0f)
+    }
+
+    val stripLeft = frameLeft + swathTileMode.canonicalStripLeftPx * scale
+    val stripTop = frameTop + clampedCropY * scale
+    val stripWidth = swathTileMode.stripWidthPx * scale
+
+    return PanoramicViewportTransform(
+        scale = scale,
+        frameLeftPx = frameLeft,
+        frameTopPx = frameTop,
+        renderedFrameWidthPx = renderedW,
+        renderedFrameHeightPx = renderedH,
+        stripLeftPx = stripLeft,
+        stripTopPx = stripTop,
+        stripWidthPx = stripWidth,
+        stripHeightPx = stripH
+    )
+}
+
+/**
+ * Hardware-clipped Android [FrameLayout] wrapper that confines CameraX [PreviewView]'s underlying
+ * [android.view.TextureView] strictly inside the panoramic LCARS viewport bounds (`[0..vw] x [0..vh]`),
+ * preventing camera pixels from ever bleeding behind the `4.dp` black gutters of the lower deck.
+ */
+private class ClippingCameraViewportContainer(context: Context) : FrameLayout(context) {
+    val previewView: PreviewView = PreviewView(context).apply {
+        scaleType = PreviewView.ScaleType.FILL_CENTER
+        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        isSoundEffectsEnabled = false
+    }
+
+    private var currentCropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX
+    private var currentSwathMode: SwathTileMode = SwathTileMode.FIVE_TILE
+
+    init {
+        clipChildren = true
+        clipToPadding = true
+        clipToOutline = true
+        isSoundEffectsEnabled = false
+        val radiusPx = 8f * resources.displayMetrics.density
+        outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: AndroidOutline) {
+                outline.setRoundRect(0, 0, view.width, view.height, radiusPx)
+            }
+        }
+        addView(
+            previewView,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+        )
+    }
+
+    fun updateStabilizationState(cropY: Int, swathTileMode: SwathTileMode) {
+        if (currentCropY != cropY || currentSwathMode != swathTileMode) {
+            currentCropY = cropY
+            currentSwathMode = swathTileMode
+            requestLayout()
+        }
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        val vw = (right - left).toFloat().coerceAtLeast(1f)
+        val vh = (bottom - top).toFloat().coerceAtLeast(1f)
+        val t = computePanoramicViewportTransform(
+            viewportWidthPx = vw,
+            viewportHeightPx = vh,
+            cropY = currentCropY,
+            swathTileMode = currentSwathMode
+        )
+        val childLeft = t.frameLeftPx.roundToInt()
+        val childTop = t.frameTopPx.roundToInt()
+        val childRight = childLeft + t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
+        val childBottom = childTop + t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
+        previewView.measure(
+            MeasureSpec.makeMeasureSpec(childRight - childLeft, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(childBottom - childTop, MeasureSpec.EXACTLY)
+        )
+        previewView.layout(childLeft, childTop, childRight, childBottom)
+    }
 }
 
 @Composable
@@ -121,1447 +227,1349 @@ fun ScannerScreen(
     uiState: ScannerUiState,
     hasCameraPermission: Boolean,
     onRequestCameraPermission: () -> Unit,
-    onBindPreview: (androidx.lifecycle.LifecycleOwner, PreviewView) -> Unit,
+    onBindPreview: (LifecycleOwner, PreviewView) -> Unit,
     onSelectMode: (OperatingMode) -> Unit,
     onSelectBackend: (DetectorBackend) -> Unit,
-    onSelectSyntheticProfile: (SyntheticTargetProfile) -> Unit,
+    onCycleScenario: () -> Unit,
+    onToggleSwathTileMode: () -> Unit,
+    onToggleEisLock: (Boolean) -> Unit,
+    onSyncPitch: () -> Unit,
     onToggleStoneClass: (StoneClass) -> Unit,
     onToggleShutterClamp: (Boolean) -> Unit,
     onToggleTwoXCrop: (Boolean) -> Unit,
     onChangeExposureBias: (Float) -> Unit,
     onToggleAudioMute: (Boolean) -> Unit,
-    onChangeSimSpeed: (Float?) -> Unit,
-    modifier: Modifier = Modifier,
-    initialActiveSheetTab: ControlsSheetTab? = null
+    onToggleOverspeedTest: () -> Unit
 ) {
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val isInspection = LocalInspectionMode.current
-    var activeSheetTab by remember { mutableStateOf(initialActiveSheetTab) }
-    var topHudBottomPx by remember { mutableFloatStateOf(0f) }
-
-    Surface(
-        modifier = modifier.fillMaxSize(),
-        color = ObsidianSurface,
-        contentColor = HudTextPrimary
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LcarsColors.CanvasBlack)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(LcarsGutter)
     ) {
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (hasCameraPermission) {
-                if (isInspection) {
-                    // Simulated gravel-bar camera feed for Compose Previews
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.verticalGradient(
-                                    colors = listOf(
-                                        Color(0xFF3A352F),
-                                        Color(0xFF4E473E),
-                                        Color(0xFF2B2927)
-                                    )
-                                )
-                            )
-                    )
-                } else {
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { ctx ->
-                            PreviewView(ctx).apply {
-                                layoutParams = ViewGroup.LayoutParams(
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                    ViewGroup.LayoutParams.MATCH_PARENT
-                                )
-                                scaleType = PreviewView.ScaleType.FILL_CENTER
-                                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                                onBindPreview(lifecycleOwner, this)
-                            }
-                        }
-                    )
-                }
-            } else {
-                PermissionFallbackCard(
-                    onRequestCameraPermission = onRequestCameraPermission,
-                    modifier = Modifier.align(Alignment.Center)
-                )
-            }
-
-            // Push-Broom 1088x384 Strip Tripwire & Confirmed Target Reticle Canvas Overlay
-            PushBroomTripwireOverlay(
-                stripGeometry = uiState.stripGeometry,
-                confirmedTargets = uiState.confirmedTargets,
-                operatingMode = uiState.operatingMode,
-                topHudBottomPx = topHudBottomPx,
-                modifier = Modifier.fillMaxSize()
-            )
-
-            // Foreground HUD chrome respecting Android 16 edge-to-edge safe drawing insets
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .windowInsetsPadding(WindowInsets.safeDrawing)
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-                // COMPACT TOP HUD SECTION (kept tight so the upper-middle 1088x384 tripwire stays unobstructed)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onGloballyPositioned { coords ->
-                            topHudBottomPx = coords.positionInRoot().y + coords.size.height
-                        },
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    TopModeAndActionsBar(
-                        operatingMode = uiState.operatingMode,
-                        isControlsOpen = activeSheetTab != null,
-                        isAudioMuted = uiState.isAudioMuted,
-                        onSelectMode = onSelectMode,
-                        onToggleControls = {
-                            activeSheetTab = if (activeSheetTab != null) {
-                                null
-                            } else {
-                                ControlsSheetTab.OPTICS_AND_SPEED
-                            }
-                        },
-                        onToggleAudioMute = { onToggleAudioMute(!uiState.isAudioMuted) }
-                    )
-
-                    CompactTelemetryStrip(
-                        uiState = uiState,
-                        isModelSheetOpen = activeSheetTab == ControlsSheetTab.MODEL_AND_SIM,
-                        onOpenModelSheet = {
-                            activeSheetTab = if (activeSheetTab == ControlsSheetTab.MODEL_AND_SIM) {
-                                null
-                            } else {
-                                ControlsSheetTab.MODEL_AND_SIM
-                            }
-                        }
-                    )
-
-                    // High-contrast SLOW SWEEP warning banner (> 1.1 m/s)
-                    val speedWarning = uiState.speedState as? ScanSpeedState.SpeedWarning
-                    AnimatedVisibility(
-                        visible = speedWarning != null,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically()
-                    ) {
-                        SlowSweepBanner(
-                            speedMps = speedWarning?.currentSpeedMps ?: 0f
-                        )
-                    }
-
-                    AnimatedVisibility(
-                        visible = uiState.operatingMode == OperatingMode.LOG_DATA,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically()
-                    ) {
-                        FieldLoggerBanner(
-                            savedFrames = uiState.loggedFrameCount,
-                            sessionDir = uiState.fieldLogDirectory
-                        )
-                    }
-                }
-
-                // BOTTOM HUD SECTION: Collapsible Tabbed Controls Sheet + 2x2 Target Class Grid
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    AnimatedVisibility(
-                        visible = activeSheetTab != null,
-                        enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
-                        exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom)
-                    ) {
-                        val currentTab = activeSheetTab ?: ControlsSheetTab.OPTICS_AND_SPEED
-                        ScannerControlsSheet(
-                            selectedTab = currentTab,
-                            uiState = uiState,
-                            onSelectTab = { activeSheetTab = it },
-                            onDismiss = { activeSheetTab = null },
-                            onToggleShutterClamp = onToggleShutterClamp,
-                            onToggleTwoXCrop = onToggleTwoXCrop,
-                            onChangeExposureBias = onChangeExposureBias,
-                            onChangeSimSpeed = onChangeSimSpeed,
-                            onSelectBackend = onSelectBackend,
-                            onSelectSyntheticProfile = onSelectSyntheticProfile
-                        )
-                    }
-
-                    TargetClassGridCard(
-                        enabledClasses = uiState.enabledClasses,
-                        onToggleStoneClass = onToggleStoneClass
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun HudPanel(
-    modifier: Modifier = Modifier,
-    backgroundColor: Color = SlateCard,
-    borderColor: Color = HudBorderSubtle,
-    cornerRadius: Dp = 14.dp,
-    content: @Composable () -> Unit
-) {
-    Surface(
-        modifier = modifier,
-        color = backgroundColor,
-        contentColor = HudTextPrimary,
-        shape = RoundedCornerShape(cornerRadius),
-        border = BorderStroke(1.dp, borderColor),
-        content = content
-    )
-}
-
-@Composable
-private fun TopModeAndActionsBar(
-    operatingMode: OperatingMode,
-    isControlsOpen: Boolean,
-    isAudioMuted: Boolean,
-    onSelectMode: (OperatingMode) -> Unit,
-    onToggleControls: () -> Unit,
-    onToggleAudioMute: () -> Unit
-) {
-    HudPanel(
-        modifier = Modifier.fillMaxWidth(),
-        cornerRadius = 14.dp
-    ) {
-        Row(
+        // Upper ~48% Height: Geological Viewport (TopLeft GoldenAmber LcarsElbow + Panoramic Camera)
+        GeologicalViewportZone(
+            uiState = uiState,
+            hasCameraPermission = hasCameraPermission,
+            onRequestCameraPermission = onRequestCameraPermission,
+            onBindPreview = onBindPreview,
+            onSelectMode = onSelectMode,
+            onSyncPitch = onSyncPitch,
+            onToggleAudioMute = onToggleAudioMute,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            // High-affordance SCAN / LOG DATA pill toggle
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(42.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Color(0xFF070D14))
-                    .border(1.dp, HudBorderSubtle, RoundedCornerShape(10.dp))
-                    .padding(3.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                val scanSelected = operatingMode == OperatingMode.SCAN
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxSize()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(
-                            if (scanSelected) CyanTripwire.copy(alpha = 0.24f) else Color.Transparent
-                        )
-                        .then(
-                            if (scanSelected) {
-                                Modifier.border(1.dp, CyanTripwire, RoundedCornerShape(8.dp))
-                            } else {
-                                Modifier
-                            }
-                        )
-                        .clickable(role = Role.Tab) { onSelectMode(OperatingMode.SCAN) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (scanSelected) {
-                            Icon(
-                                imageVector = Icons.Default.Check,
-                                contentDescription = null,
-                                tint = CyanTripwire,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                        }
-                        Text(
-                            text = "SCAN",
-                            color = if (scanSelected) HudTextPrimary else HudTextSecondary,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            maxLines = 1
-                        )
-                    }
-                }
+                .weight(0.50f)
+        )
 
-                val logSelected = operatingMode == OperatingMode.LOG_DATA
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxSize()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(
-                            if (logSelected) NephriteEmerald.copy(alpha = 0.22f) else Color.Transparent
-                        )
-                        .then(
-                            if (logSelected) {
-                                Modifier.border(1.dp, NephriteEmerald, RoundedCornerShape(8.dp))
-                            } else {
-                                Modifier
-                            }
-                        )
-                        .clickable(role = Role.Tab) { onSelectMode(OperatingMode.LOG_DATA) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.FiberManualRecord,
-                            contentDescription = null,
-                            tint = if (logSelected) AlertRedBanner else HudTextSecondary,
-                            modifier = Modifier.size(12.dp)
-                        )
-                        Spacer(Modifier.width(5.dp))
-                        Text(
-                            text = "LOG DATA",
-                            color = if (logSelected) HudTextPrimary else HudTextSecondary,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-
-            // Afforded Controls Drawer button (Optics, Speed Gate, Backend & Sim Presets)
-            Surface(
-                onClick = onToggleControls,
-                color = if (isControlsOpen) CyanTripwire.copy(alpha = 0.24f) else Color(0xFF14212E),
-                contentColor = if (isControlsOpen) CyanTripwire else HudTextPrimary,
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(
-                    width = 1.dp,
-                    color = if (isControlsOpen) CyanTripwire else HudBorderSubtle
-                ),
-                modifier = Modifier.height(42.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Tune,
-                        contentDescription = "Toggle scanner controls",
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Text(
-                        text = "Setup",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1
-                    )
-                }
-            }
-
-            // Afforded Audio Mute / Unmute button
-            Surface(
-                onClick = onToggleAudioMute,
-                color = if (isAudioMuted) JasperCrimson.copy(alpha = 0.18f) else CarnelianAmber.copy(alpha = 0.16f),
-                contentColor = if (isAudioMuted) JasperCrimson else CarnelianAmber,
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(
-                    width = 1.dp,
-                    color = if (isAudioMuted) JasperCrimson.copy(alpha = 0.7f) else CarnelianAmber.copy(alpha = 0.65f)
-                ),
-                modifier = Modifier.size(42.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = if (isAudioMuted) {
-                            Icons.AutoMirrored.Filled.VolumeOff
-                        } else {
-                            Icons.AutoMirrored.Filled.VolumeUp
-                        },
-                        contentDescription = if (isAudioMuted) "Unmute sonifier" else "Mute sonifier",
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CompactTelemetryStrip(
-    uiState: ScannerUiState,
-    isModelSheetOpen: Boolean,
-    onOpenModelSheet: () -> Unit
-) {
-    val speedMps = when (val s = uiState.speedState) {
-        is ScanSpeedState.Normal -> s.currentSpeedMps
-        is ScanSpeedState.SpeedWarning -> s.currentSpeedMps
-    }
-    val shutterFraction = if (uiState.exposureTimeNs > 0L) {
-        "1/${(1_000_000_000L / uiState.exposureTimeNs).coerceAtLeast(1)}s"
-    } else {
-        "≤1/500s"
-    }
-
-    val modelBadgeLabel = when (uiState.detectorBackend) {
-        DetectorBackend.SYNTHETIC_DEMO -> "SIM: ${uiState.syntheticProfile.label}"
-        DetectorBackend.RF_DETR_NANO_GPU -> String.format(
-            Locale.US,
-            "GPU FP16 • %.1f ms",
-            uiState.rollingLatencyMs
+        // Lower ~50% Height: Tactical Control Deck (BottomLeft Lavender LcarsElbow + 2-Column Matrix)
+        TacticalControlDeckZone(
+            uiState = uiState,
+            onSelectMode = onSelectMode,
+            onSelectBackend = onSelectBackend,
+            onCycleScenario = onCycleScenario,
+            onToggleSwathTileMode = onToggleSwathTileMode,
+            onToggleEisLock = onToggleEisLock,
+            onSyncPitch = onSyncPitch,
+            onToggleStoneClass = onToggleStoneClass,
+            onToggleShutterClamp = onToggleShutterClamp,
+            onToggleTwoXCrop = onToggleTwoXCrop,
+            onChangeExposureBias = onChangeExposureBias,
+            onToggleOverspeedTest = onToggleOverspeedTest,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(0.50f)
         )
     }
+}
 
-    HudPanel(
-        modifier = Modifier.fillMaxWidth(),
-        cornerRadius = 12.dp
-    ) {
+@Composable
+private fun GeologicalViewportZone(
+    uiState: ScannerUiState,
+    hasCameraPermission: Boolean,
+    onRequestCameraPermission: () -> Unit,
+    onBindPreview: (LifecycleOwner, PreviewView) -> Unit,
+    onSelectMode: (OperatingMode) -> Unit,
+    onSyncPitch: () -> Unit,
+    onToggleAudioMute: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isLogging = uiState.operatingMode == OperatingMode.LOG_DATA
+    val rotCode = if (uiState.displaySurfaceRotation == Surface.ROTATION_270) "R-270" else "R-090"
+    val crookStart = LcarsStemWidth + LcarsGutter
+    val crookTop = LcarsBarHeight + LcarsGutter
+
+    Box(modifier = modifier.background(LcarsColors.CanvasBlack)) {
+        // Top-Left Swept LCARS Elbow ("GEO-47")
+        LcarsElbow(
+            orientation = LcarsElbowOrientation.TopLeft,
+            color = if (isLogging) LcarsColors.MarsRed else LcarsColors.GoldenAmber,
+            armLabel = "GEO-47",
+            stemCode = rotCode,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .width(TopElbowArmWidth)
+                .height(TopElbowStemHeight)
+        )
+
+        // Top 22.dp Segmented Telemetry Header Rail (Tabular Numerals)
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .fillMaxWidth()
+                .padding(start = TopElbowArmWidth + LcarsGutter)
+                .height(LcarsBarHeight),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            val pitchColor = when {
+                !uiState.eisPitchLockEnabled -> LcarsColors.MutedSlate
+                uiState.isPitchClamped -> LcarsColors.MarsRed
+                else -> LcarsColors.Periwinkle
+            }
+            val pitchText = if (!uiState.eisPitchLockEnabled) {
+                String.format(Locale.US, "PITCH %02.0f° [EIS OFF]", uiState.imuPitchDeg)
+            } else if (uiState.isPitchClamped) {
+                String.format(Locale.US, "PITCH LIMIT %02.0f°", uiState.imuPitchDeg)
+            } else {
+                String.format(
+                    Locale.US,
+                    "PITCH %02.0f° [%02.0f°]",
+                    uiState.imuPitchDeg,
+                    uiState.referencePitchDeg
+                )
+            }
+            LcarsHeaderSegment(
+                text = pitchText,
+                color = pitchColor,
+                textColor = when {
+                    pitchColor == LcarsColors.MutedSlate -> LcarsColors.ApricotPeach
+                    uiState.isPitchClamped -> LcarsColors.AlertWhite
+                    else -> LcarsColors.CanvasBlack
+                },
+                onClick = onSyncPitch
+            )
+
+            LcarsHeaderSegment(
+                text = String.format(
+                    Locale.US,
+                    "R %.2fM • %.2f MM/PX",
+                    uiState.slantRangeMeters,
+                    uiState.gsdMmPerPx
+                ),
+                color = LcarsColors.ApricotPeach,
+                modifier = Modifier.weight(1f)
+            )
+
+            val isOverspeed = uiState.speedState.isOverspeed
+            val velText = if (isOverspeed) {
+                String.format(Locale.US, "SLOW SWEEP %.2f M/S", uiState.speedState.speedMps)
+            } else {
+                String.format(Locale.US, "VEL %.2f M/S", uiState.speedState.speedMps)
+            }
+            LcarsHeaderSegment(
+                text = velText,
+                color = if (isOverspeed) LcarsColors.MarsRed else LcarsColors.IceBlue,
+                textColor = if (isOverspeed) LcarsColors.AlertWhite else LcarsColors.CanvasBlack
+            )
+
+            val shutterLabel = formatShutterFraction(uiState.exposureTimeNs)
+            LcarsHeaderSegment(
+                text = String.format(
+                    Locale.US,
+                    "%.1fX • %s • ISO %d",
+                    uiState.activeZoomRatio,
+                    shutterLabel,
+                    uiState.sensorIso
+                ),
+                color = LcarsColors.Lavender,
+                endStyle = LcarsPillEndStyle.FlatLeftRoundRight,
+                alignEnd = true
+            )
+        }
+
+        // Left 68.dp Stacked Structural Status Stem
         Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+                .align(Alignment.TopStart)
+                .padding(top = TopElbowStemHeight + LcarsGutter)
+                .width(LcarsStemWidth)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.spacedBy(LcarsGutter)
         ) {
-            // Row 1: Tappable Active Backend/Preset pill (left) + Non-wrapping Optics readout (right)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Surface(
-                        onClick = onOpenModelSheet,
-                        color = if (isModelSheetOpen) {
-                            CyanTripwire.copy(alpha = 0.24f)
-                        } else {
-                            CyanTripwire.copy(alpha = 0.12f)
-                        },
-                        contentColor = CyanTripwire,
-                        shape = RoundedCornerShape(6.dp),
-                        border = BorderStroke(1.dp, CyanTripwire.copy(alpha = 0.45f))
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Memory,
-                                contentDescription = null,
-                                modifier = Modifier.size(12.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                text = modelBadgeLabel,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            Icon(
-                                imageVector = Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Change model or simulation preset",
-                                modifier = Modifier.size(14.dp)
-                            )
-                        }
-                    }
-                }
+            LcarsPillButton(
+                label = if (isLogging) "REC" else "SCAN",
+                subLabel = if (isLogging) {
+                    String.format(Locale.US, "%04d", uiState.loggedFrameCount)
+                } else {
+                    "${uiState.swathTileMode.tileCount}-TILE"
+                },
+                prefixCode = "01",
+                active = true,
+                activeColor = if (isLogging) LcarsColors.MarsRed else LcarsColors.IceBlue,
+                endStyle = LcarsPillEndStyle.FlatBlock,
+                compactStemMode = true,
+                onClick = {
+                    onSelectMode(if (isLogging) OperatingMode.SCAN else OperatingMode.LOG_DATA)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
 
-                Text(
-                    text = "${uiState.activeZoomRatio.roundToInt()}× • $shutterFraction • ISO ${uiState.sensorIso}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = HudTextPrimary,
-                    maxLines = 1,
-                    softWrap = false
-                )
-            }
+            LcarsPillButton(
+                label = String.format(Locale.US, "%.1fHZ", uiState.sweepHz),
+                subLabel = String.format(Locale.US, "%.1fMS", uiState.rollingLatencyMs),
+                prefixCode = "FPS",
+                active = true,
+                activeColor = LcarsColors.ApricotPeach,
+                endStyle = LcarsPillEndStyle.FlatBlock,
+                compactStemMode = true,
+                onClick = onSyncPitch,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
 
-            // Row 2: Pose/Geometry metrics (left) + Live Sonifier Pitch/Cadence badge (right)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = String.format(
-                        Locale.US,
-                        "Pitch %.0f° • R %.2fm • %.2fmm/px • %.2fm/s",
-                        uiState.imuPitchDeg,
-                        uiState.slantRangeMeters,
-                        uiState.gsdMmPerPx,
-                        speedMps
-                    ),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    color = HudTextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
+            LcarsPillButton(
+                label = if (uiState.isAudioMuted) "MUTE" else "AUDIO",
+                subLabel = if (!uiState.isAudioMuted && uiState.audioPitchHz > 0f) {
+                    String.format(Locale.US, "%.0fHZ", uiState.audioPitchHz)
+                } else if (uiState.isAudioMuted) {
+                    "OFF"
+                } else {
+                    "ARMED"
+                },
+                prefixCode = "SND",
+                active = !uiState.isAudioMuted,
+                activeColor = LcarsColors.WarmSand,
+                endStyle = LcarsPillEndStyle.FlatBlock,
+                compactStemMode = true,
+                onClick = { onToggleAudioMute(!uiState.isAudioMuted) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+        }
 
-                val audioStatusText = when {
-                    uiState.isAudioMuted -> "MUTED"
-                    uiState.audioPitchHz > 0f -> String.format(
-                        Locale.US,
-                        "%.0fHz • %.1f/s",
-                        uiState.audioPitchHz,
-                        uiState.audioCadenceHz
+        // Inner Crook: Panoramic Camera Viewport + Right-Edge Pitch-Stabilization Travel Gauge
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(start = crookStart, top = crookTop),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            PanoramicCameraViewport(
+                uiState = uiState,
+                hasCameraPermission = hasCameraPermission,
+                onRequestCameraPermission = onRequestCameraPermission,
+                onBindPreview = onBindPreview,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(
+                        RoundedCornerShape(
+                            topStart = 10.dp,
+                            topEnd = 4.dp,
+                            bottomStart = 4.dp,
+                            bottomEnd = 4.dp
+                        )
                     )
-                    else -> "IDLE"
-                }
-                val audioStatusColor = when {
-                    uiState.isAudioMuted -> JasperCrimson
-                    uiState.audioPitchHz > 0f -> CarnelianAmber
-                    else -> HudTextSecondary
-                }
+                    .background(LcarsColors.CanvasBlack)
+            )
 
-                Text(
-                    text = audioStatusText,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = audioStatusColor,
-                    maxLines = 1,
-                    softWrap = false
-                )
+            PitchTravelGaugeColumn(
+                cropY = uiState.cropY,
+                eisEnabled = uiState.eisPitchLockEnabled,
+                isPitchClamped = uiState.isPitchClamped,
+                onSyncPitch = onSyncPitch,
+                modifier = Modifier
+                    .width(PitchGaugeWidth)
+                    .fillMaxHeight()
+            )
+        }
+    }
+}
+
+@Composable
+private fun PanoramicCameraViewport(
+    uiState: ScannerUiState,
+    hasCameraPermission: Boolean,
+    onRequestCameraPermission: () -> Unit,
+    onBindPreview: (LifecycleOwner, PreviewView) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isInspection = LocalInspectionMode.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    Box(modifier = modifier) {
+        if (hasCameraPermission && !isInspection) {
+            AndroidView(
+                factory = { ctx ->
+                    ClippingCameraViewportContainer(ctx).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        updateStabilizationState(uiState.cropY, uiState.swathTileMode)
+                        onBindPreview(lifecycleOwner, previewView)
+                    }
+                },
+                update = { container ->
+                    container.updateStabilizationState(uiState.cropY, uiState.swathTileMode)
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            // Offline / Preview / Pre-permission dark gravel diagnostic substrate
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawRect(color = Color(0xFF111317))
+                val gridStep = 24.dp.toPx()
+                var gx = gridStep
+                while (gx < size.width) {
+                    drawLine(
+                        color = Color(0xFF1D222B),
+                        start = Offset(gx, 0f),
+                        end = Offset(gx, size.height),
+                        strokeWidth = 1f
+                    )
+                    gx += gridStep
+                }
+                var gy = gridStep
+                while (gy < size.height) {
+                    drawLine(
+                        color = Color(0xFF1D222B),
+                        start = Offset(0f, gy),
+                        end = Offset(size.width, gy),
+                        strokeWidth = 1f
+                    )
+                    gy += gridStep
+                }
             }
         }
-    }
-}
 
-@Composable
-private fun SlowSweepBanner(speedMps: Float) {
-    Surface(
-        color = AlertRedBanner,
-        contentColor = Color.White,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.5.dp, Color.White),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(
-            modifier = Modifier
-                .padding(horizontal = 12.dp, vertical = 8.dp)
-                .semantics(mergeDescendants = true) {},
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                imageVector = Icons.Default.Warning,
-                contentDescription = null,
-                tint = Color.White,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = String.format(Locale.US, "SLOW SWEEP — %.2f m/s (> 1.10 m/s)", speedMps),
-                color = Color.White,
-                fontWeight = FontWeight.ExtraBold,
-                fontSize = 14.sp,
-                maxLines = 1
-            )
-        }
-    }
-}
+        // Stabilized Push-Broom Strip Brackets, Tile Seam Ticks & High-Contrast Stone Reticles
+        PushBroomTripwireOverlay(
+            uiState = uiState,
+            modifier = Modifier.fillMaxSize()
+        )
 
-@Composable
-private fun FieldLoggerBanner(
-    savedFrames: Int,
-    sessionDir: String
-) {
-    val shortSessionName = remember(sessionDir) {
-        sessionDir.trimEnd('/').substringAfterLast(File.separatorChar, sessionDir)
-    }
-    Surface(
-        color = Color(0xEB0E2419),
-        contentColor = HudTextPrimary,
-        shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, NephriteEmerald),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = "REC 1088×384 PNG+JSONL • $savedFrames saved",
-                color = Color(0xFF69F0AE),
-                fontWeight = FontWeight.Bold,
-                fontSize = 12.sp,
-                maxLines = 1
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = shortSessionName,
-                color = HudTextSecondary,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+        if (!hasCameraPermission && !isInspection) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(horizontal = 24.dp)
+            ) {
+                LcarsPillButton(
+                    label = "AUTHORIZE OPTICAL SENSOR",
+                    subLabel = "GRANT CAMERA FOR 1920X1080 SWATH",
+                    prefixCode = "CAM",
+                    active = true,
+                    activeColor = LcarsColors.GoldenAmber,
+                    onClick = onRequestCameraPermission,
+                    modifier = Modifier
+                        .width(290.dp)
+                        .height(40.dp)
+                )
+            }
         }
     }
 }
 
 @Composable
 private fun PushBroomTripwireOverlay(
-    stripGeometry: StripRoiGeometry,
-    confirmedTargets: List<ConfirmedTarget>,
-    operatingMode: OperatingMode,
-    topHudBottomPx: Float,
+    uiState: ScannerUiState,
     modifier: Modifier = Modifier
 ) {
-    val textMeasurer = rememberTextMeasurer()
-    val borderColor = if (operatingMode == OperatingMode.LOG_DATA) {
-        NephriteEmerald
-    } else {
-        CyanTripwire
+    val labelPaint = remember {
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 24f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        }
+    }
+    val hudPaint = remember {
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 21f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        }
     }
 
     Canvas(modifier = modifier) {
-        val canvasW = size.width
-        val canvasH = size.height
-        if (canvasW <= 0f || canvasH <= 0f) return@Canvas
+        val transform = computePanoramicViewportTransform(
+            viewportWidthPx = size.width,
+            viewportHeightPx = size.height,
+            cropY = uiState.cropY,
+            swathTileMode = uiState.swathTileMode
+        )
 
-        // Map upright camera frame coordinates onto FILL_CENTER viewfinder canvas
-        val frameAspect = stripGeometry.uprightFrameWidth.toFloat() /
-            stripGeometry.uprightFrameHeight.coerceAtLeast(1).toFloat()
-        val canvasAspect = canvasW / canvasH
+        val stripLeft = transform.stripLeftPx
+        val stripTop = transform.stripTopPx
+        val stripW = transform.stripWidthPx
+        val stripH = transform.stripHeightPx
+        val stripRight = stripLeft + stripW
+        val stripBottom = stripTop + stripH
 
-        val renderedW: Float
-        val renderedH: Float
-        val offsetX: Float
-        val offsetY: Float
-
-        if (canvasAspect > frameAspect) {
-            renderedW = canvasW
-            renderedH = canvasW / frameAspect
-            offsetX = 0f
-            offsetY = (canvasH - renderedH) * 0.5f
-        } else {
-            renderedH = canvasH
-            renderedW = canvasH * frameAspect
-            offsetX = (canvasW - renderedW) * 0.5f
-            offsetY = 0f
+        // Subtle dark veil outside the active 384 px push-broom strip
+        val veilColor = Color(0x88000000)
+        if (stripTop > 0f) {
+            drawRect(
+                color = veilColor,
+                topLeft = Offset(0f, 0f),
+                size = Size(size.width, stripTop)
+            )
+        }
+        if (stripBottom < size.height) {
+            drawRect(
+                color = veilColor,
+                topLeft = Offset(0f, stripBottom),
+                size = Size(size.width, size.height - stripBottom)
+            )
+        }
+        if (stripLeft > 0f) {
+            drawRect(
+                color = veilColor,
+                topLeft = Offset(0f, max(0f, stripTop)),
+                size = Size(stripLeft, min(size.height, stripBottom) - max(0f, stripTop))
+            )
+        }
+        if (stripRight < size.width) {
+            drawRect(
+                color = veilColor,
+                topLeft = Offset(stripRight, max(0f, stripTop)),
+                size = Size(size.width - stripRight, min(size.height, stripBottom) - max(0f, stripTop))
+            )
         }
 
-        val boxLeft = (offsetX + stripGeometry.normalizedLeft * renderedW).coerceIn(16f, canvasW - 32f)
-        val boxWidth = (stripGeometry.normalizedWidth * renderedW).coerceAtMost(canvasW - boxLeft - 16f)
-        val boxHeight = (boxWidth * (StripRoiGeometry.STRIP_HEIGHT_PX.toFloat() / stripGeometry.stripWidthPx.coerceAtLeast(1)))
-            .coerceAtLeast(76f)
-
-        // Ensure tripwire header & box never collide with the measured Top HUD bottom edge
-        val minClearTopPx = if (topHudBottomPx > 0f) {
-            (topHudBottomPx + 30.dp.toPx()).coerceAtMost(canvasH * 0.52f)
-        } else {
-            canvasH * 0.24f
+        val railColor = when {
+            uiState.speedState.isOverspeed -> LcarsColors.MarsRed
+            uiState.isPitchClamped -> LcarsColors.MarsRed
+            uiState.operatingMode == OperatingMode.LOG_DATA -> LcarsColors.GoldenAmber
+            else -> LcarsColors.Periwinkle
         }
-        val rawBoxTop = offsetY + stripGeometry.normalizedTop * renderedH
-        val boxTop = rawBoxTop.coerceIn(minClearTopPx, (canvasH * 0.62f).coerceAtLeast(minClearTopPx))
 
-        // Subtle darkened mask outside the active 1088x384 push-broom strip
-        drawRect(
-            color = Color(0x40000000),
-            topLeft = Offset(0f, 0f),
-            size = Size(canvasW, boxTop)
+        // Top and bottom push-broom tripwire rails (clamped inside visible viewport when stripH >= vh)
+        val keylinePx = 2.dp.toPx()
+        val railStrokePx = 2.dp.toPx()
+        val visibleStripTop = stripTop.coerceIn(railStrokePx, max(railStrokePx, size.height - railStrokePx))
+        val visibleStripBottom = stripBottom.coerceIn(railStrokePx, max(railStrokePx, size.height - railStrokePx))
+        drawLine(
+            color = LcarsColors.CanvasBlack,
+            start = Offset(stripLeft, visibleStripTop),
+            end = Offset(stripRight, visibleStripTop),
+            strokeWidth = railStrokePx + 2f * keylinePx
         )
-        drawRect(
-            color = Color(0x40000000),
-            topLeft = Offset(0f, boxTop + boxHeight),
-            size = Size(canvasW, (canvasH - (boxTop + boxHeight)).coerceAtLeast(0f))
+        drawLine(
+            color = LcarsColors.CanvasBlack,
+            start = Offset(stripLeft, visibleStripBottom),
+            end = Offset(stripRight, visibleStripBottom),
+            strokeWidth = railStrokePx + 2f * keylinePx
+        )
+        drawLine(
+            color = railColor,
+            start = Offset(stripLeft, visibleStripTop),
+            end = Offset(stripRight, visibleStripTop),
+            strokeWidth = railStrokePx
+        )
+        drawLine(
+            color = railColor,
+            start = Offset(stripLeft, visibleStripBottom),
+            end = Offset(stripRight, visibleStripBottom),
+            strokeWidth = railStrokePx
         )
 
-        // Outer dark contrast halo + crisp Push-Broom Tripwire Box
-        drawRoundRect(
-            color = Color(0x88000000),
-            topLeft = Offset(boxLeft, boxTop),
-            size = Size(boxWidth, boxHeight),
-            cornerRadius = CornerRadius(10.dp.toPx(), 10.dp.toPx()),
-            style = Stroke(width = 6f)
-        )
-        drawRoundRect(
-            color = borderColor,
-            topLeft = Offset(boxLeft, boxTop),
-            size = Size(boxWidth, boxHeight),
-            cornerRadius = CornerRadius(10.dp.toPx(), 10.dp.toPx()),
-            style = Stroke(width = 3.5f)
-        )
-
-        // Draw internal 3-tile overlap seam ticks (x = 352, 384, 704, 736 in 1088px space)
-        val seamDash = PathEffect.dashPathEffect(floatArrayOf(8f, 8f), 0f)
-        val seamPositionsPx = floatArrayOf(352f, 384f, 704f, 736f)
-        for (seamPx in seamPositionsPx) {
-            val sx = boxLeft + (seamPx / stripGeometry.stripWidthPx.coerceAtLeast(1)) * boxWidth
+        // Left & right vertical strip bracket end-caps
+        val endBracketH = min(22.dp.toPx(), (visibleStripBottom - visibleStripTop) * 0.35f)
+        listOf(stripLeft, stripRight).forEach { edgeX ->
             drawLine(
-                color = borderColor.copy(alpha = 0.38f),
-                start = Offset(sx, boxTop),
-                end = Offset(sx, boxTop + boxHeight),
-                strokeWidth = 1.5f,
-                pathEffect = seamDash
+                color = LcarsColors.CanvasBlack,
+                start = Offset(edgeX, visibleStripTop),
+                end = Offset(edgeX, visibleStripBottom),
+                strokeWidth = railStrokePx + 2f * keylinePx
+            )
+            drawLine(
+                color = LcarsColors.IceBlue,
+                start = Offset(edgeX, visibleStripTop),
+                end = Offset(edgeX, visibleStripTop + endBracketH),
+                strokeWidth = railStrokePx
+            )
+            drawLine(
+                color = LcarsColors.IceBlue,
+                start = Offset(edgeX, visibleStripBottom - endBracketH),
+                end = Offset(edgeX, visibleStripBottom),
+                strokeWidth = railStrokePx
             )
         }
 
-        // High-contrast Tripwire Header Pill anchored cleanly above the box
-        val tripwireLabel = textMeasurer.measure(
-            text = "PUSH-BROOM 1088×384 • 3×384 TILES",
-            style = TextStyle(
-                color = borderColor,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace
-            )
-        )
-        val headerPadX = 6.dp.toPx()
-        val headerPadY = 2.dp.toPx()
-        val headerPillW = tripwireLabel.size.width + headerPadX * 2
-        val headerPillH = tripwireLabel.size.height + headerPadY * 2
-        val headerTop = (boxTop - headerPillH - 5.dp.toPx()).coerceAtLeast(4f)
-
-        drawRoundRect(
-            color = Color(0xDE081018),
-            topLeft = Offset(boxLeft, headerTop),
-            size = Size(headerPillW, headerPillH),
-            cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
-        )
-        drawRoundRect(
-            color = borderColor.copy(alpha = 0.55f),
-            topLeft = Offset(boxLeft, headerTop),
-            size = Size(headerPillW, headerPillH),
-            cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
-            style = Stroke(width = 1.5f)
-        )
-        drawText(
-            textLayoutResult = tripwireLabel,
-            topLeft = Offset(boxLeft + headerPadX, headerTop + headerPadY)
-        )
-
-        // Render world-locked ConfirmedTarget reticles (strictly excluding Class 4 hard_confuser)
-        val scaleX = boxWidth / stripGeometry.stripWidthPx.coerceAtLeast(1).toFloat()
-        val scaleY = boxHeight / StripRoiGeometry.STRIP_HEIGHT_PX.toFloat()
-
-        for (target in confirmedTargets) {
-            if (!target.stoneClass.isUserAlertable) continue
-
-            val primaryColor = Color(target.stoneClass.primaryHexColor)
-            val accentColor = Color(target.stoneClass.accentHexColor)
-
-            val rx = boxLeft + target.stripLeftPx * scaleX
-            val ry = boxTop + target.stripTopPx * scaleY
-            val rw = ((target.stripRightPx - target.stripLeftPx) * scaleX).coerceAtLeast(24f)
-            val rh = ((target.stripBottomPx - target.stripTopPx) * scaleY).coerceAtLeast(24f)
-
-            // Dark outer halo + vibrant class reticle
-            drawRoundRect(
-                color = Color(0xAA000000),
-                topLeft = Offset(rx, ry),
-                size = Size(rw, rh),
-                cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
-                style = Stroke(width = 6.5f)
-            )
-            drawRoundRect(
-                color = primaryColor,
-                topLeft = Offset(rx, ry),
-                size = Size(rw, rh),
-                cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
-                style = Stroke(width = 3.5f)
-            )
-
-            // Center reticle crosshair
-            val cx = rx + rw * 0.5f
-            val cy = ry + rh * 0.5f
-            drawCircle(
-                color = Color(0xAA000000),
-                radius = 6f,
-                center = Offset(cx, cy)
-            )
-            drawCircle(
-                color = accentColor,
-                radius = 4f,
-                center = Offset(cx, cy)
-            )
-
-            // High-contrast dark obsidian badge with bright white text + colored border (never dark-on-dark!)
-            val tagText = String.format(
-                Locale.US,
-                "%s %.0fmm [%d/%d]",
-                target.stoneClass.displayName,
-                target.estimatedDiameterMm,
-                target.hitCountInWindow,
-                target.windowSize
-            )
-            val measuredTag = textMeasurer.measure(
-                text = tagText,
-                style = TextStyle(
-                    color = HudTextPrimary,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
+        // Subtle 1.dp vertical tile seam ticks (x = [64, 416, 768, 1120, 1472, 1856] in 5-tile)
+        val seamTickH = 10.dp.toPx()
+        val tileOffsets = uiState.swathTileMode.frameXOffsets
+        val seamDash = PathEffect.dashPathEffect(floatArrayOf(6f, 8f), 0f)
+        tileOffsets.forEachIndexed { idx, tileX ->
+            if (idx > 0) {
+                val seamStartX = transform.frameLeftPx + tileX * transform.scale
+                val seamEndX = transform.frameLeftPx + (tileX + StripRoiGeometry.TILE_OVERLAP_PX) * transform.scale
+                drawLine(
+                    color = LcarsColors.Periwinkle.copy(alpha = 0.32f),
+                    start = Offset(seamStartX, visibleStripTop),
+                    end = Offset(seamStartX, visibleStripBottom),
+                    strokeWidth = 1.dp.toPx(),
+                    pathEffect = seamDash
                 )
-            )
-            val dotSpace = 14.dp.toPx()
-            val padX = 7.dp.toPx()
-            val padY = 3.dp.toPx()
-            val pillW = dotSpace + measuredTag.size.width + padX * 2
-            val pillH = measuredTag.size.height + padY * 2
-
-            val tagLeft = rx.coerceIn(
-                boxLeft + 4f,
-                (boxLeft + boxWidth - pillW - 4f).coerceAtLeast(boxLeft + 4f)
-            )
-            val tagTop = if (ry - pillH - 6f >= boxTop + 4f) {
-                ry - pillH - 6f
-            } else {
-                (ry + rh + 6f).coerceAtMost(boxTop + boxHeight - pillH - 4f)
-            }
-
-            drawRoundRect(
-                color = Color(0xF00A121B),
-                topLeft = Offset(tagLeft, tagTop),
-                size = Size(pillW, pillH),
-                cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
-            )
-            drawRoundRect(
-                color = primaryColor,
-                topLeft = Offset(tagLeft, tagTop),
-                size = Size(pillW, pillH),
-                cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
-                style = Stroke(width = 2f)
-            )
-            drawCircle(
-                color = primaryColor,
-                radius = 4.dp.toPx(),
-                center = Offset(tagLeft + padX + 4.dp.toPx(), tagTop + pillH * 0.5f)
-            )
-            drawText(
-                textLayoutResult = measuredTag,
-                topLeft = Offset(tagLeft + padX + dotSpace, tagTop + padY)
-            )
-        }
-    }
-}
-
-@Composable
-private fun ScannerControlsSheet(
-    selectedTab: ControlsSheetTab,
-    uiState: ScannerUiState,
-    onSelectTab: (ControlsSheetTab) -> Unit,
-    onDismiss: () -> Unit,
-    onToggleShutterClamp: (Boolean) -> Unit,
-    onToggleTwoXCrop: (Boolean) -> Unit,
-    onChangeExposureBias: (Float) -> Unit,
-    onChangeSimSpeed: (Float?) -> Unit,
-    onSelectBackend: (DetectorBackend) -> Unit,
-    onSelectSyntheticProfile: (SyntheticTargetProfile) -> Unit
-) {
-    HudPanel(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 345.dp),
-        backgroundColor = SlateCardElevated,
-        borderColor = CyanTripwire.copy(alpha = 0.38f),
-        cornerRadius = 16.dp
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            // Sheet Header: Tab Switcher + Explicit Close Button
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(40.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color(0xFF081018))
-                        .border(1.dp, HudBorderSubtle, RoundedCornerShape(10.dp))
-                        .padding(3.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    ControlsSheetTab.entries.forEach { tab ->
-                        val selected = tab == selectedTab
-                        Surface(
-                            onClick = { onSelectTab(tab) },
-                            color = if (selected) CyanTripwire.copy(alpha = 0.22f) else Color.Transparent,
-                            contentColor = if (selected) CyanTripwire else HudTextSecondary,
-                            shape = RoundedCornerShape(7.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxSize()
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Text(
-                                    text = tab.title,
-                                    color = if (selected) CyanTripwire else HudTextSecondary,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-                }
-
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color(0xFF172635))
-                        .border(1.dp, HudBorderSubtle, RoundedCornerShape(10.dp))
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Close scanner controls",
-                        tint = HudTextPrimary,
-                        modifier = Modifier.size(18.dp)
+                listOf(seamStartX, seamEndX).forEach { tickX ->
+                    drawLine(
+                        color = LcarsColors.IceBlue.copy(alpha = 0.85f),
+                        start = Offset(tickX, visibleStripTop),
+                        end = Offset(tickX, visibleStripTop + seamTickH),
+                        strokeWidth = 1.dp.toPx()
                     )
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                when (selectedTab) {
-                    ControlsSheetTab.OPTICS_AND_SPEED -> {
-                        OpticsAndSpeedTabContent(
-                            shutterClampEnabled = uiState.shutterClampEnabled,
-                            twoXCropEnabled = uiState.twoXCropEnabled,
-                            exposureBiasEv = uiState.exposureBiasEv,
-                            simulatedSpeedMps = uiState.simulatedSpeedOverrideMps,
-                            onToggleShutterClamp = onToggleShutterClamp,
-                            onToggleTwoXCrop = onToggleTwoXCrop,
-                            onChangeExposureBias = onChangeExposureBias,
-                            onChangeSimSpeed = onChangeSimSpeed
-                        )
-                    }
-
-                    ControlsSheetTab.MODEL_AND_SIM -> {
-                        ModelAndSimTabContent(
-                            uiState = uiState,
-                            onSelectBackend = onSelectBackend,
-                            onSelectSyntheticProfile = onSelectSyntheticProfile
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun OpticsAndSpeedTabContent(
-    shutterClampEnabled: Boolean,
-    twoXCropEnabled: Boolean,
-    exposureBiasEv: Float,
-    simulatedSpeedMps: Float?,
-    onToggleShutterClamp: (Boolean) -> Unit,
-    onToggleTwoXCrop: (Boolean) -> Unit,
-    onChangeExposureBias: (Float) -> Unit,
-    onChangeSimSpeed: (Float?) -> Unit
-) {
-    val switchColors = SwitchDefaults.colors(
-        checkedThumbColor = ObsidianSurface,
-        checkedTrackColor = CyanTripwire,
-        uncheckedThumbColor = HudTextSecondary,
-        uncheckedTrackColor = Color(0xFF1B2B3A),
-        uncheckedBorderColor = HudBorderSubtle
-    )
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .toggleable(
-                value = shutterClampEnabled,
-                role = Role.Switch,
-                onValueChange = onToggleShutterClamp
-            )
-            .padding(vertical = 2.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-            Text(
-                text = "Shutter Clamp (≤ 1/500 s)",
-                color = HudTextPrimary,
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 13.sp
-            )
-            Text(
-                text = "Locks ≤ 2,000,000 ns exposure with floating ISO",
-                color = HudTextSecondary,
-                fontSize = 11.sp
-            )
-        }
-        Switch(
-            checked = shutterClampEnabled,
-            onCheckedChange = null,
-            colors = switchColors
-        )
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = 40.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .toggleable(
-                value = twoXCropEnabled,
-                role = Role.Switch,
-                onValueChange = onToggleTwoXCrop
-            )
-            .padding(vertical = 2.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = "2.0× Lossless Center Sensor Crop",
-            color = HudTextPrimary,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 13.sp,
-            modifier = Modifier.weight(1f).padding(end = 10.dp)
-        )
-        Switch(
-            checked = twoXCropEnabled,
-            onCheckedChange = null,
-            colors = switchColors
-        )
-    }
-
-    Column {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Canopy Exposure Bias",
-                color = HudTextPrimary,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Text(
-                text = String.format(Locale.US, "%+.1f EV", exposureBiasEv),
-                color = CyanTripwire,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
-        Slider(
-            value = exposureBiasEv,
-            onValueChange = onChangeExposureBias,
-            valueRange = -2.0f..2.0f,
-            steps = 7,
-            modifier = Modifier.padding(horizontal = 4.dp),
-            colors = SliderDefaults.colors(
-                thumbColor = CyanTripwire,
-                activeTrackColor = CyanTripwire,
-                inactiveTrackColor = Color(0xFF223446)
-            )
-        )
-    }
-
-    // Desk-test Walk Speed Override for verifying the 1.1 m/s SLOW SWEEP banner & buzz indoors
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f).padding(end = 8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Speed,
-                    contentDescription = null,
-                    tint = CyanTripwire,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    text = if (simulatedSpeedMps == null) {
-                        "Speed Gate: Live IMU / ARCore"
-                    } else {
-                        String.format(Locale.US, "Desk Test Speed: %.2f m/s", simulatedSpeedMps)
-                    },
-                    color = HudTextPrimary,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            Surface(
-                onClick = { onChangeSimSpeed(if (simulatedSpeedMps == null) 1.35f else null) },
-                color = if (simulatedSpeedMps != null) {
-                    CarnelianAmber.copy(alpha = 0.20f)
-                } else {
-                    CyanTripwire.copy(alpha = 0.14f)
-                },
-                contentColor = if (simulatedSpeedMps != null) CarnelianAmber else CyanTripwire,
-                shape = RoundedCornerShape(8.dp),
-                border = BorderStroke(
-                    1.dp,
-                    if (simulatedSpeedMps != null) CarnelianAmber else CyanTripwire.copy(alpha = 0.6f)
-                )
-            ) {
-                Text(
-                    text = if (simulatedSpeedMps == null) "Test Gate" else "Use Live IMU",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                )
-            }
-        }
-        if (simulatedSpeedMps != null) {
-            Slider(
-                value = simulatedSpeedMps,
-                onValueChange = { onChangeSimSpeed(it) },
-                valueRange = 0.0f..2.0f,
-                modifier = Modifier.padding(horizontal = 4.dp),
-                colors = SliderDefaults.colors(
-                    thumbColor = CarnelianAmber,
-                    activeTrackColor = CarnelianAmber,
-                    inactiveTrackColor = Color(0xFF223446)
-                )
-            )
-        }
-    }
-}
-
-@Composable
-private fun ModelAndSimTabContent(
-    uiState: ScannerUiState,
-    onSelectBackend: (DetectorBackend) -> Unit,
-    onSelectSyntheticProfile: (SyntheticTargetProfile) -> Unit
-) {
-    Text(
-        text = "On-Device StoneDetector Engine",
-        color = HudTextSecondary,
-        fontSize = 11.sp,
-        fontWeight = FontWeight.SemiBold
-    )
-
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        DetectorBackend.entries.forEach { backend ->
-            val selected = backend == uiState.detectorBackend
-            Surface(
-                onClick = { onSelectBackend(backend) },
-                color = if (selected) CyanTripwire.copy(alpha = 0.20f) else Color(0xFF13202D),
-                contentColor = if (selected) HudTextPrimary else HudTextSecondary,
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(
-                    width = if (selected) 1.5.dp else 1.dp,
-                    color = if (selected) CyanTripwire else HudBorderSubtle
-                ),
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = 42.dp)
-            ) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp)
-                ) {
-                    Text(
-                        text = backend.label,
-                        fontSize = 12.sp,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                    drawLine(
+                        color = LcarsColors.IceBlue.copy(alpha = 0.85f),
+                        start = Offset(tickX, visibleStripBottom - seamTickH),
+                        end = Offset(tickX, visibleStripBottom),
+                        strokeWidth = 1.dp.toPx()
                     )
                 }
             }
         }
-    }
 
-    Text(
-        text = String.format(
+        // Compact strip descriptor tag pinned inside top-left of strip
+        val stripTag = String.format(
             Locale.US,
-            "%s • Sweep %.1f ms (P1 %.1f | TopK %.1f | P2 %.1f)",
-            uiState.detectorStatus,
-            uiState.rollingLatencyMs,
-            uiState.part1LatencyMs,
-            uiState.bridgeLatencyMs,
-            uiState.part2LatencyMs
-        ),
-        color = HudTextSecondary,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 10.sp,
-        maxLines = 2
-    )
-
-    if (uiState.detectorBackend == DetectorBackend.SYNTHETIC_DEMO) {
-        Spacer(Modifier.height(2.dp))
-        Text(
-            text = "Simulation Target Preset (All 4 Visible)",
-            color = HudTextSecondary,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold
+            "%d-TILE • %dX%d • Y=%03d",
+            uiState.swathTileMode.tileCount,
+            uiState.swathTileMode.stripWidthPx,
+            StripRoiGeometry.STRIP_HEIGHT_PX,
+            uiState.cropY
+        )
+        hudPaint.textSize = 10.dp.toPx()
+        val tagW = hudPaint.measureText(stripTag) + 12.dp.toPx()
+        val tagH = 15.dp.toPx()
+        val tagTop = (visibleStripTop + 3.dp.toPx()).coerceAtMost(size.height - tagH)
+        drawRect(
+            color = LcarsColors.CanvasBlack,
+            topLeft = Offset(stripLeft + 4.dp.toPx(), tagTop),
+            size = Size(tagW, tagH)
+        )
+        hudPaint.color = LcarsColors.IceBlue.toArgb()
+        drawContext.canvas.nativeCanvas.drawText(
+            stripTag,
+            stripLeft + 10.dp.toPx(),
+            tagTop + tagH - 3.5.dp.toPx(),
+            hudPaint
         )
 
-        val presets = SyntheticTargetProfile.entries
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            presets.chunked(2).forEach { rowItems ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    rowItems.forEach { preset ->
-                        val selected = preset == uiState.syntheticProfile
-                        Surface(
-                            onClick = { onSelectSyntheticProfile(preset) },
-                            color = if (selected) {
-                                CarnelianAmber.copy(alpha = 0.22f)
-                            } else {
-                                Color(0xFF13202D)
-                            },
-                            contentColor = if (selected) HudTextPrimary else HudTextSecondary,
-                            shape = RoundedCornerShape(9.dp),
-                            border = BorderStroke(
-                                width = if (selected) 1.5.dp else 1.dp,
-                                color = if (selected) CarnelianAmber else HudBorderSubtle
-                            ),
-                            modifier = Modifier
-                                .weight(1f)
-                                .heightIn(min = 42.dp)
-                        ) {
-                            Box(
-                                contentAlignment = Alignment.CenterStart,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                            ) {
-                                Text(
-                                    text = preset.label,
-                                    color = if (selected) CarnelianAmber else HudTextPrimary,
-                                    fontSize = 11.sp,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
+        // Confirmed Target Reticles (SCAN mode only; hard_confuser strictly muted)
+        if (uiState.operatingMode == OperatingMode.SCAN) {
+            labelPaint.textSize = 11.dp.toPx()
+            uiState.confirmedTargets.forEach { target ->
+                if (!target.stoneClass.isUserAlertable) return@forEach
+                if (!uiState.enabledClasses.contains(target.stoneClass)) return@forEach
+
+                val left = stripLeft + target.stripLeftPx * transform.scale
+                val top = stripTop + target.stripTopPx * transform.scale
+                val right = stripLeft + target.stripRightPx * transform.scale
+                val bottom = stripTop + target.stripBottomPx * transform.scale
+
+                val reticleColor = Color(target.stoneClass.primaryHexColor)
+                drawHighContrastCornerBrackets(
+                    left = left,
+                    top = top,
+                    right = right,
+                    bottom = bottom,
+                    foregroundColor = reticleColor
+                )
+
+                val callout = String.format(
+                    Locale.US,
+                    "%s %s %.0fMM [%d/%d]",
+                    target.stoneClass.codePrefix,
+                    target.stoneClass.lcarsShortName.substringBefore(" /"),
+                    target.estimatedDiameterMm,
+                    target.hitCountInWindow,
+                    target.windowSize
+                )
+                val calloutW = labelPaint.measureText(callout) + 10.dp.toPx()
+                val calloutH = 16.dp.toPx()
+                val calloutLeft = left.coerceIn(
+                    stripLeft + 2f,
+                    max(stripLeft + 2f, stripRight - calloutW - 2f)
+                )
+                val calloutTop = if (top - calloutH - 3.dp.toPx() >= 0f) {
+                    top - calloutH - 3.dp.toPx()
+                } else {
+                    min(size.height - calloutH, bottom + 3.dp.toPx())
                 }
+
+                drawRect(
+                    color = LcarsColors.CanvasBlack,
+                    topLeft = Offset(calloutLeft, calloutTop),
+                    size = Size(calloutW, calloutH)
+                )
+                labelPaint.color = reticleColor.toArgb()
+                drawContext.canvas.nativeCanvas.drawText(
+                    callout,
+                    calloutLeft + 5.dp.toPx(),
+                    calloutTop + calloutH - 3.5.dp.toPx(),
+                    labelPaint
+                )
             }
+        }
+
+        // MarsRed Overspeed Banner (> 1.10 m/s)
+        if (uiState.speedState.isOverspeed) {
+            val alertText = String.format(
+                Locale.US,
+                "SLOW SWEEP — %.2f M/S EXCEEDS 1.10 M/S GATE",
+                uiState.speedState.speedMps
+            )
+            labelPaint.textSize = 12.dp.toPx()
+            val bannerW = labelPaint.measureText(alertText) + 24.dp.toPx()
+            val bannerH = 22.dp.toPx()
+            val bannerLeft = ((size.width - bannerW) * 0.5f).coerceAtLeast(4f)
+            val bannerTop = 4.dp.toPx()
+            drawRect(
+                color = LcarsColors.CanvasBlack,
+                topLeft = Offset(bannerLeft - 2.dp.toPx(), bannerTop - 2.dp.toPx()),
+                size = Size(bannerW + 4.dp.toPx(), bannerH + 4.dp.toPx())
+            )
+            drawRect(
+                color = LcarsColors.MarsRed,
+                topLeft = Offset(bannerLeft, bannerTop),
+                size = Size(bannerW, bannerH)
+            )
+            labelPaint.color = LcarsColors.AlertWhite.toArgb()
+            drawContext.canvas.nativeCanvas.drawText(
+                alertText,
+                bannerLeft + 12.dp.toPx(),
+                bannerTop + bannerH - 5.dp.toPx(),
+                labelPaint
+            )
         }
     }
 }
 
-@Composable
-private fun TargetClassGridCard(
-    enabledClasses: Set<StoneClass>,
-    onToggleStoneClass: (StoneClass) -> Unit
+/**
+ * Draws anti-camouflage corner reticle brackets backed by a crisp `2.dp` `#000000` outer keyline halo.
+ */
+private fun DrawScope.drawHighContrastCornerBrackets(
+    left: Float,
+    top: Float,
+    right: Float,
+    bottom: Float,
+    foregroundColor: Color
 ) {
-    HudPanel(
-        modifier = Modifier.fillMaxWidth(),
-        cornerRadius = 14.dp
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            StoneClass.alertableClasses.chunked(2).forEach { rowClasses ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    rowClasses.forEach { stoneClass ->
-                        val enabled = stoneClass in enabledClasses
-                        val swatchColor = Color(stoneClass.primaryHexColor)
+    val boxW = max(12.dp.toPx(), right - left)
+    val boxH = max(12.dp.toPx(), bottom - top)
+    val cx = (left + right) * 0.5f
+    val cy = (top + bottom) * 0.5f
+    val l = cx - boxW * 0.5f
+    val r = cx + boxW * 0.5f
+    val t = cy - boxH * 0.5f
+    val b = cy + boxH * 0.5f
 
-                        Surface(
-                            onClick = { onToggleStoneClass(stoneClass) },
-                            color = if (enabled) {
-                                swatchColor.copy(alpha = 0.18f)
-                            } else {
-                                Color(0xFF0E1822)
-                            },
-                            contentColor = if (enabled) HudTextPrimary else HudTextSecondary,
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(
-                                width = if (enabled) 1.5.dp else 1.dp,
-                                color = if (enabled) swatchColor.copy(alpha = 0.85f) else HudBorderSubtle
-                            ),
-                            modifier = Modifier
-                                .weight(1f)
-                                .heightIn(min = 44.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 10.dp, vertical = 10.dp)
-                                    .semantics(mergeDescendants = true) {},
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(10.dp)
-                                        .clip(CircleShape)
-                                        .then(
-                                            if (enabled) {
-                                                Modifier.background(swatchColor)
-                                            } else {
-                                                Modifier.border(1.5.dp, HudTextSecondary, CircleShape)
-                                            }
-                                        )
-                                )
-                                Spacer(Modifier.width(7.dp))
-                                Text(
-                                    text = stoneClass.displayName,
-                                    color = if (enabled) HudTextPrimary else HudTextSecondary.copy(alpha = 0.72f),
-                                    fontSize = 12.sp,
-                                    fontWeight = if (enabled) FontWeight.SemiBold else FontWeight.Normal,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                if (enabled) {
-                                    Icon(
-                                        imageVector = Icons.Default.Check,
-                                        contentDescription = null,
-                                        tint = swatchColor,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    val arm = min(14.dp.toPx(), min(boxW, boxH) * 0.36f).coerceAtLeast(5.dp.toPx())
+    val innerStroke = 2.2.dp.toPx()
+    val haloStroke = innerStroke + 4.dp.toPx() // 2.dp #000000 outer keyline halo on each side
+
+    val segments = arrayOf(
+        Offset(l, t) to Offset(l + arm, t),
+        Offset(l, t) to Offset(l, t + arm),
+        Offset(r, t) to Offset(r - arm, t),
+        Offset(r, t) to Offset(r, t + arm),
+        Offset(l, b) to Offset(l + arm, b),
+        Offset(l, b) to Offset(l, b - arm),
+        Offset(r, b) to Offset(r - arm, b),
+        Offset(r, b) to Offset(r, b - arm)
+    )
+
+    segments.forEach { (start, end) ->
+        drawLine(
+            color = LcarsColors.CanvasBlack,
+            start = start,
+            end = end,
+            strokeWidth = haloStroke,
+            cap = StrokeCap.Square
+        )
+    }
+
+    segments.forEach { (start, end) ->
+        drawLine(
+            color = foregroundColor,
+            start = start,
+            end = end,
+            strokeWidth = innerStroke,
+            cap = StrokeCap.Square
+        )
     }
 }
 
 @Composable
-private fun PermissionFallbackCard(
-    onRequestCameraPermission: () -> Unit,
+private fun PitchTravelGaugeColumn(
+    cropY: Int,
+    eisEnabled: Boolean,
+    isPitchClamped: Boolean,
+    onSyncPitch: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    HudPanel(
-        modifier = modifier.padding(24.dp),
-        backgroundColor = SlateCardElevated,
-        cornerRadius = 16.dp
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(LcarsGutter)
     ) {
-        Column(
-            modifier = Modifier.padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+        LcarsPillButton(
+            label = if (isPitchClamped) "LIM" else String.format(Locale.US, "%03d", cropY),
+            subLabel = "Y-PX",
+            active = eisEnabled,
+            activeColor = if (isPitchClamped) LcarsColors.MarsRed else LcarsColors.Periwinkle,
+            endStyle = LcarsPillEndStyle.FlatBlock,
+            compactStemMode = true,
+            onClick = onSyncPitch,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(34.dp)
+        )
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .background(LcarsColors.CanvasBlack)
         ) {
-            Icon(
-                imageVector = Icons.Default.CameraAlt,
-                contentDescription = null,
-                tint = CyanTripwire,
-                modifier = Modifier.size(44.dp)
+            val w = size.width
+            val h = size.height
+            drawRect(
+                color = LcarsColors.MutedSlate,
+                topLeft = Offset(0f, 0f),
+                size = Size(w, h)
             )
-            Text(
-                text = "GneissFind Optical Push-Broom Scanner",
-                color = HudTextPrimary,
-                fontWeight = FontWeight.Bold,
-                fontSize = 17.sp
+            val inset = 3.dp.toPx()
+            drawRect(
+                color = LcarsColors.CanvasBlack,
+                topLeft = Offset(inset, inset),
+                size = Size(max(1f, w - 2f * inset), max(1f, h - 2f * inset))
             )
-            Text(
-                text = "Grant Rear 50MP Camera access to run the 4K 2× shutter-clamped (≤1/500s) rockhounding scanner and offline field logger.",
-                color = HudTextSecondary,
-                fontSize = 13.sp
+
+            // Nominal 348 center reference tick
+            val midY = h * 0.5f
+            drawLine(
+                color = LcarsColors.ApricotPeach,
+                start = Offset(0f, midY),
+                end = Offset(w, midY),
+                strokeWidth = 2.dp.toPx()
             )
-            Button(onClick = onRequestCameraPermission) {
-                Text("Enable Rear Camera")
+
+            // Active 384/1080 strip window indicator inside [0..696]
+            val windowFrac = StripRoiGeometry.STRIP_HEIGHT_PX.toFloat() /
+                StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat()
+            val thumbH = (h * windowFrac).coerceAtLeast(10.dp.toPx())
+            val travelFrac = cropY.coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX).toFloat() /
+                StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+            val thumbTop = travelFrac * max(0f, h - thumbH)
+
+            val thumbColor = when {
+                !eisEnabled -> LcarsColors.MutedSlate
+                isPitchClamped -> LcarsColors.MarsRed
+                else -> LcarsColors.Periwinkle
             }
+            drawRect(
+                color = thumbColor,
+                topLeft = Offset(inset + 2.dp.toPx(), thumbTop),
+                size = Size(max(2f, w - 2f * (inset + 2.dp.toPx())), thumbH)
+            )
         }
     }
 }
 
-private fun samplePreviewUiState(): ScannerUiState {
-    return ScannerUiState(
-        operatingMode = OperatingMode.SCAN,
-        detectorBackend = DetectorBackend.SYNTHETIC_DEMO,
-        syntheticProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK,
-        imuPitchDeg = 45f,
-        slantRangeMeters = 1.50f,
-        gsdMmPerPx = 0.85f,
-        exposureTimeNs = 1_992_000L,
-        sensorIso = 1250,
-        activeZoomRatio = 2.0f,
-        audioPitchHz = 320f,
-        audioCadenceHz = 13.0f,
-        confirmedTargets = listOf(
-            ConfirmedTarget(
-                trackId = 1L,
-                stoneClass = StoneClass.JASPER_RED_YELLOW,
-                worldPosition = WorldPoint3D(0.05f, 0f, 1.06f),
-                stripLeftPx = 460f,
-                stripTopPx = 150f,
-                stripRightPx = 530f,
-                stripBottomPx = 220f,
-                smoothedConfidence = 0.92f,
-                estimatedDiameterMm = 54f,
-                slantRangeMeters = 1.50f,
-                hitCountInWindow = 6,
-                windowSize = 6,
-                lastUpdatedTimestampNs = 1_000_000L
+@Composable
+private fun TacticalControlDeckZone(
+    uiState: ScannerUiState,
+    onSelectMode: (OperatingMode) -> Unit,
+    onSelectBackend: (DetectorBackend) -> Unit,
+    onCycleScenario: () -> Unit,
+    onToggleSwathTileMode: () -> Unit,
+    onToggleEisLock: (Boolean) -> Unit,
+    onSyncPitch: () -> Unit,
+    onToggleStoneClass: (StoneClass) -> Unit,
+    onToggleShutterClamp: (Boolean) -> Unit,
+    onToggleTwoXCrop: (Boolean) -> Unit,
+    onChangeExposureBias: (Float) -> Unit,
+    onToggleOverspeedTest: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isScanning = uiState.operatingMode == OperatingMode.SCAN
+    val isLogging = uiState.operatingMode == OperatingMode.LOG_DATA
+    val isLiveGpu = uiState.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU
+    val crookStart = LcarsStemWidth + LcarsGutter
+    val crookBottom = LcarsBarHeight + LcarsGutter
+
+    Box(modifier = modifier.background(LcarsColors.CanvasBlack)) {
+        // Left 68.dp Primary Mode Stem Above Bottom-Left Elbow
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(bottom = BottomElbowStemHeight + LcarsGutter)
+                .width(LcarsStemWidth)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            LcarsPillButton(
+                label = "SCAN",
+                subLabel = if (isScanning) "ACTIVE" else "READY",
+                prefixCode = "M-01",
+                active = isScanning,
+                activeColor = LcarsColors.GoldenAmber,
+                endStyle = LcarsPillEndStyle.FlatBlock,
+                compactStemMode = true,
+                onClick = { onSelectMode(OperatingMode.SCAN) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
             )
+
+            LcarsPillButton(
+                label = "LOG",
+                subLabel = if (isLogging) {
+                    String.format(Locale.US, "%04d PNG", uiState.loggedFrameCount)
+                } else {
+                    "4.0 HZ"
+                },
+                prefixCode = "M-02",
+                active = isLogging,
+                activeColor = LcarsColors.MarsRed,
+                endStyle = LcarsPillEndStyle.FlatBlock,
+                compactStemMode = true,
+                onClick = {
+                    onSelectMode(if (isLogging) OperatingMode.SCAN else OperatingMode.LOG_DATA)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+
+            LcarsPillButton(
+                label = if (isLiveGpu) "GPU" else "SIM",
+                subLabel = if (isLiveGpu) "FP16" else "DEMO",
+                prefixCode = "M-03",
+                active = true,
+                activeColor = if (isLiveGpu) LcarsColors.IceBlue else LcarsColors.WarmSand,
+                endStyle = LcarsPillEndStyle.FlatBlock,
+                compactStemMode = true,
+                onClick = {
+                    onSelectBackend(
+                        if (isLiveGpu) {
+                            DetectorBackend.SYNTHETIC_DEMO
+                        } else {
+                            DetectorBackend.RF_DETR_NANO_GPU
+                        }
+                    )
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
+        }
+
+        // Bottom-Left Swept LCARS Elbow ("SYS-01")
+        LcarsElbow(
+            orientation = LcarsElbowOrientation.BottomLeft,
+            color = LcarsColors.Lavender,
+            armLabel = "SYS-01",
+            stemCode = "M1B",
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .width(BottomElbowArmWidth)
+                .height(BottomElbowStemHeight)
         )
-    )
+
+        // Bottom 22.dp Segmented Telemetry Footer Rail
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .fillMaxWidth()
+                .padding(start = BottomElbowArmWidth + LcarsGutter)
+                .height(LcarsBarHeight),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            LcarsHeaderSegment(
+                text = "47-${uiState.swathTileMode.stripWidthPx}",
+                color = LcarsColors.Periwinkle
+            )
+
+            LcarsHeaderSegment(
+                text = String.format(
+                    Locale.US,
+                    "SWEEP %.1f MS (G1 %.1f | TOPK %.1f | G2 %.1f)",
+                    uiState.rollingLatencyMs,
+                    uiState.part1LatencyMs,
+                    uiState.bridgeLatencyMs,
+                    uiState.part2LatencyMs
+                ),
+                color = LcarsColors.ApricotPeach,
+                modifier = Modifier.weight(1f)
+            )
+
+            val audioTelemetry = when {
+                uiState.isAudioMuted -> "AUDIO MUTED"
+                uiState.audioPitchHz > 0f -> String.format(
+                    Locale.US,
+                    "PING %.0f HZ @ %.1f/S",
+                    uiState.audioPitchHz,
+                    uiState.audioCadenceHz
+                )
+                else -> "SONIFIER ARMED"
+            }
+            LcarsHeaderSegment(
+                text = audioTelemetry,
+                color = if (uiState.audioPitchHz > 0f && !uiState.isAudioMuted) {
+                    LcarsColors.GoldenAmber
+                } else {
+                    LcarsColors.WarmSand
+                },
+                endStyle = LcarsPillEndStyle.FlatLeftRoundRight,
+                alignEnd = true
+            )
+        }
+
+        // 2-Column Tactical Control Matrix Inside Bottom-Left Crook (Zero Modal Sheets)
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(start = crookStart, bottom = crookBottom),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter * 2)
+        ) {
+            OpticsAndEisColumn(
+                uiState = uiState,
+                onToggleTwoXCrop = onToggleTwoXCrop,
+                onToggleShutterClamp = onToggleShutterClamp,
+                onToggleEisLock = onToggleEisLock,
+                onSyncPitch = onSyncPitch,
+                onToggleSwathTileMode = onToggleSwathTileMode,
+                onChangeExposureBias = onChangeExposureBias,
+                modifier = Modifier
+                    .weight(0.47f)
+                    .fillMaxHeight()
+            )
+
+            ProspectMatrixColumn(
+                uiState = uiState,
+                onToggleStoneClass = onToggleStoneClass,
+                onCycleScenario = onCycleScenario,
+                onToggleOverspeedTest = onToggleOverspeedTest,
+                modifier = Modifier
+                    .weight(0.53f)
+                    .fillMaxHeight()
+            )
+        }
+    }
 }
 
-@Preview(name = "Scanner HUD (Default Scan)", device = Devices.PIXEL_7_PRO, showSystemUi = true)
 @Composable
-private fun ScannerScreenDefaultPreview() {
-    GneissFindTheme {
-        ScannerScreen(
-            uiState = samplePreviewUiState(),
-            hasCameraPermission = true,
-            onRequestCameraPermission = {},
-            onBindPreview = { _, _ -> },
-            onSelectMode = {},
-            onSelectBackend = {},
-            onSelectSyntheticProfile = {},
-            onToggleStoneClass = {},
-            onToggleShutterClamp = {},
-            onToggleTwoXCrop = {},
-            onChangeExposureBias = {},
-            onToggleAudioMute = {},
-            onChangeSimSpeed = {}
+private fun OpticsAndEisColumn(
+    uiState: ScannerUiState,
+    onToggleTwoXCrop: (Boolean) -> Unit,
+    onToggleShutterClamp: (Boolean) -> Unit,
+    onToggleEisLock: (Boolean) -> Unit,
+    onSyncPitch: () -> Unit,
+    onToggleSwathTileMode: () -> Unit,
+    onChangeExposureBias: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(LcarsGutter)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "OPT-2X // OPTICS & EIS STABILIZATION",
+                style = LcarsTypography.MicroCode,
+                color = LcarsColors.Lavender
+            )
+            Text(
+                text = if (uiState.isPitchClamped) "PITCH LIMIT" else "EIS-SYNC",
+                style = LcarsTypography.MicroCode,
+                color = if (uiState.isPitchClamped) LcarsColors.MarsRed else LcarsColors.Periwinkle
+            )
+        }
+
+        // Row 1: 2.0X Sensor Crop [ON] + <= 1/500s Shutter Clamp [ON]
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            LcarsPillButton(
+                label = if (uiState.twoXCropEnabled) "2.0X CROP [ON]" else "2.0X CROP [OFF]",
+                subLabel = if (uiState.twoXCropEnabled) "LOSSLESS • 0.59MM" else "1.0X WIDE • 1.18MM",
+                prefixCode = "OPT",
+                active = uiState.twoXCropEnabled,
+                activeColor = LcarsColors.Lavender,
+                endStyle = LcarsPillEndStyle.FlatLeftRoundRight,
+                onClick = { onToggleTwoXCrop(!uiState.twoXCropEnabled) },
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+
+            LcarsPillButton(
+                label = if (uiState.shutterClampEnabled) "1/500S [ON]" else "1/500S [OFF]",
+                subLabel = if (uiState.shutterClampEnabled) "<= 2.0MS + ISO" else "AUTO SHUTTER",
+                prefixCode = "EXP",
+                active = uiState.shutterClampEnabled,
+                activeColor = LcarsColors.Lavender,
+                endStyle = LcarsPillEndStyle.Capsule,
+                onClick = { onToggleShutterClamp(!uiState.shutterClampEnabled) },
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+        }
+
+        // Row 2: EIS Pitch Lock [ON] + SYNC PITCH (45°) + Swath 5-TILE / 3-TILE
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            LcarsPillButton(
+                label = if (uiState.eisPitchLockEnabled) {
+                    if (uiState.isPitchClamped) "PITCH LIMIT" else "EIS LOCK [ON]"
+                } else {
+                    "EIS LOCK [OFF]"
+                },
+                subLabel = String.format(Locale.US, "CROP Y %03d", uiState.cropY),
+                prefixCode = "EIS",
+                active = uiState.eisPitchLockEnabled,
+                activeColor = if (uiState.isPitchClamped) {
+                    LcarsColors.MarsRed
+                } else {
+                    LcarsColors.Periwinkle
+                },
+                endStyle = LcarsPillEndStyle.FlatLeftRoundRight,
+                onClick = { onToggleEisLock(!uiState.eisPitchLockEnabled) },
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+
+            LcarsPillButton(
+                label = String.format(Locale.US, "SYNC (%02.0f°)", uiState.referencePitchDeg),
+                subLabel = String.format(Locale.US, "NOW %02.0f°", uiState.imuPitchDeg),
+                prefixCode = "CAL",
+                active = true,
+                activeColor = LcarsColors.WarmSand,
+                endStyle = LcarsPillEndStyle.Capsule,
+                onClick = onSyncPitch,
+                modifier = Modifier
+                    .weight(0.88f)
+                    .fillMaxHeight()
+            )
+
+            LcarsPillButton(
+                label = "${uiState.swathTileMode.tileCount}-TILE",
+                subLabel = "${uiState.swathTileMode.stripWidthPx}PX",
+                prefixCode = "SW",
+                active = uiState.swathTileMode == SwathTileMode.FIVE_TILE,
+                activeColor = LcarsColors.Periwinkle,
+                endStyle = LcarsPillEndStyle.Capsule,
+                onClick = onToggleSwathTileMode,
+                modifier = Modifier
+                    .weight(0.84f)
+                    .fillMaxHeight()
+            )
+        }
+
+        // Row 3: Segmented LCARS Bar-Graph for Canopy Exposure Bias (-2.0 .. +1.0 EV)
+        LcarsSegmentedEvBar(
+            exposureBiasEv = uiState.exposureBiasEv,
+            onSelectEv = onChangeExposureBias,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }
 
-@Preview(name = "Scanner HUD (Setup Sheet Open)", device = Devices.PIXEL_7_PRO, showSystemUi = true)
 @Composable
-private fun ScannerScreenOpticsOpenPreview() {
+private fun ProspectMatrixColumn(
+    uiState: ScannerUiState,
+    onToggleStoneClass: (StoneClass) -> Unit,
+    onCycleScenario: () -> Unit,
+    onToggleOverspeedTest: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val classes = StoneClass.alertableClasses
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(LcarsGutter)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "PROSPECT MATRIX // MIN 20MM TARGETS",
+                style = LcarsTypography.MicroCode,
+                color = LcarsColors.GoldenAmber
+            )
+            Text(
+                text = "${uiState.enabledClasses.size}/4 ACTIVE • CONFUSERS MUTED",
+                style = LcarsTypography.MicroCode,
+                color = LcarsColors.IceBlue
+            )
+        }
+
+        // 2x2 Grid of Hemispherical Mineral Target Toggle Pills
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(2f),
+            verticalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+            ) {
+                MineralTargetPill(
+                    stoneClass = classes[0],
+                    pillFillColor = LcarsColors.GoldenAmber,
+                    enabled = uiState.enabledClasses.contains(classes[0]),
+                    onClick = { onToggleStoneClass(classes[0]) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                )
+                MineralTargetPill(
+                    stoneClass = classes[1],
+                    pillFillColor = LcarsColors.ApricotPeach,
+                    enabled = uiState.enabledClasses.contains(classes[1]),
+                    onClick = { onToggleStoneClass(classes[1]) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+            ) {
+                MineralTargetPill(
+                    stoneClass = classes[2],
+                    pillFillColor = LcarsColors.IceBlue,
+                    enabled = uiState.enabledClasses.contains(classes[2]),
+                    onClick = { onToggleStoneClass(classes[2]) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                )
+                MineralTargetPill(
+                    stoneClass = classes[3],
+                    pillFillColor = LcarsColors.WarmSand,
+                    enabled = uiState.enabledClasses.contains(classes[3]),
+                    onClick = { onToggleStoneClass(classes[3]) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                )
+            }
+        }
+
+        // Inline Scenario Cycler + Speed Gate Test Row (Zero Modal Sheets)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(0.92f),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            val scenarioTitle = if (uiState.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
+                "LIVE CAM (GPU FP16)"
+            } else {
+                when (uiState.syntheticProfile) {
+                    SyntheticTargetProfile.MIXED_GRAVEL_WALK -> "MIXED GRAVEL SIM"
+                    SyntheticTargetProfile.PEBBLE_20MM_HIGH_PITCH -> "20MM AGATE (780HZ)"
+                    SyntheticTargetProfile.COBBLE_55MM_LOW_PITCH -> "55MM JASPER (320HZ)"
+                    SyntheticTargetProfile.QUIET_GRAVEL_CONFUSERS -> "CONFUSER MUTE SIM"
+                }
+            }
+            LcarsPillButton(
+                label = scenarioTitle,
+                subLabel = "TAP TO CYCLE SOURCE",
+                prefixCode = "SRC",
+                active = true,
+                activeColor = if (uiState.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
+                    LcarsColors.IceBlue
+                } else {
+                    LcarsColors.WarmSand
+                },
+                endStyle = LcarsPillEndStyle.Capsule,
+                onClick = onCycleScenario,
+                modifier = Modifier
+                    .weight(1.45f)
+                    .fillMaxHeight()
+            )
+
+            val simOverspeedActive = uiState.simulatedSpeedOverrideMps != null
+            LcarsPillButton(
+                label = if (simOverspeedActive) "OVERSPEED TEST" else "GATE <= 1.10M/S",
+                subLabel = if (simOverspeedActive) "1.38 M/S SIM" else "LIVE VIO / IMU",
+                prefixCode = "VEL",
+                active = simOverspeedActive,
+                activeColor = LcarsColors.MarsRed,
+                endStyle = LcarsPillEndStyle.Capsule,
+                onClick = onToggleOverspeedTest,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+        }
+    }
+}
+
+@Composable
+private fun MineralTargetPill(
+    stoneClass: StoneClass,
+    pillFillColor: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val stateLabel = if (enabled) "ACTIVE" else "MUTED"
+    LcarsPillButton(
+        label = stoneClass.lcarsShortName,
+        subLabel = "RETICLE • $stateLabel",
+        prefixCode = stoneClass.codePrefix,
+        swatchColor = Color(stoneClass.primaryHexColor),
+        active = enabled,
+        activeColor = pillFillColor,
+        endStyle = LcarsPillEndStyle.Capsule,
+        onClick = onClick,
+        modifier = modifier
+    )
+}
+
+private fun formatShutterFraction(exposureNs: Long): String {
+    if (exposureNs <= 0L) return "1/500S"
+    val denom = (1_000_000_000.0 / exposureNs.toDouble()).roundToInt().coerceAtLeast(1)
+    return "1/${denom}S"
+}
+
+@Preview(
+    name = "LCARS Geological Tricorder — Active 5-Tile Scan",
+    device = "spec:width=915dp,height=411dp,dpi=420,orientation=landscape"
+)
+@Composable
+private fun ScannerScreenActivePreview() {
     GneissFindTheme {
         ScannerScreen(
-            uiState = samplePreviewUiState(),
+            uiState = ScannerUiState(
+                sweepHz = 18.4f,
+                rollingLatencyMs = 14.2f,
+                part1LatencyMs = 8.9f,
+                bridgeLatencyMs = 0.7f,
+                part2LatencyMs = 4.6f,
+                imuPitchDeg = 45f,
+                referencePitchDeg = 45f,
+                cropY = 348,
+                speedState = ScanSpeedState.Normal(0.42f),
+                sensorIso = 640,
+                audioPitchHz = 780f,
+                audioCadenceHz = 10.5f,
+                confirmedTargets = listOf(
+                    ConfirmedTarget(
+                        trackId = 1L,
+                        stoneClass = StoneClass.CHALCEDONY_AGATE,
+                        worldPosition = WorldPoint3D(-0.18f, 0f, -1.05f),
+                        stripLeftPx = 370f,
+                        stripTopPx = 112f,
+                        stripRightPx = 438f,
+                        stripBottomPx = 180f,
+                        smoothedConfidence = 0.89f,
+                        estimatedDiameterMm = 26f,
+                        slantRangeMeters = 1.50f,
+                        hitCountInWindow = 4,
+                        windowSize = 6,
+                        lastUpdatedTimestampNs = 1_000_000L
+                    ),
+                    ConfirmedTarget(
+                        trackId = 2L,
+                        stoneClass = StoneClass.JASPER_RED_YELLOW,
+                        worldPosition = WorldPoint3D(0.24f, 0f, -1.06f),
+                        stripLeftPx = 1140f,
+                        stripTopPx = 88f,
+                        stripRightPx = 1265f,
+                        stripBottomPx = 212f,
+                        smoothedConfidence = 0.92f,
+                        estimatedDiameterMm = 54f,
+                        slantRangeMeters = 1.50f,
+                        hitCountInWindow = 5,
+                        windowSize = 6,
+                        lastUpdatedTimestampNs = 1_000_000L
+                    )
+                )
+            ),
             hasCameraPermission = true,
             onRequestCameraPermission = {},
             onBindPreview = { _, _ -> },
             onSelectMode = {},
             onSelectBackend = {},
-            onSelectSyntheticProfile = {},
+            onCycleScenario = {},
+            onToggleSwathTileMode = {},
+            onToggleEisLock = {},
+            onSyncPitch = {},
             onToggleStoneClass = {},
             onToggleShutterClamp = {},
             onToggleTwoXCrop = {},
             onChangeExposureBias = {},
             onToggleAudioMute = {},
-            onChangeSimSpeed = {},
-            initialActiveSheetTab = ControlsSheetTab.OPTICS_AND_SPEED
+            onToggleOverspeedTest = {}
+        )
+    }
+}
+
+@Preview(
+    name = "LCARS Geological Tricorder — Overspeed & Pitch Limit Alert",
+    device = "spec:width=915dp,height=411dp,dpi=420,orientation=landscape"
+)
+@Composable
+private fun ScannerScreenAlertPreview() {
+    GneissFindTheme {
+        ScannerScreen(
+            uiState = ScannerUiState(
+                operatingMode = OperatingMode.LOG_DATA,
+                loggedFrameCount = 128,
+                imuPitchDeg = 54f,
+                referencePitchDeg = 45f,
+                cropY = 0,
+                isPitchClamped = true,
+                speedState = ScanSpeedState.SpeedWarning(1.38f),
+                simulatedSpeedOverrideMps = 1.38f,
+                exposureBiasEv = -0.5f,
+                sensorIso = 1250
+            ),
+            hasCameraPermission = true,
+            onRequestCameraPermission = {},
+            onBindPreview = { _, _ -> },
+            onSelectMode = {},
+            onSelectBackend = {},
+            onCycleScenario = {},
+            onToggleSwathTileMode = {},
+            onToggleEisLock = {},
+            onSyncPitch = {},
+            onToggleStoneClass = {},
+            onToggleShutterClamp = {},
+            onToggleTwoXCrop = {},
+            onChangeExposureBias = {},
+            onToggleAudioMute = {},
+            onToggleOverspeedTest = {}
         )
     }
 }
