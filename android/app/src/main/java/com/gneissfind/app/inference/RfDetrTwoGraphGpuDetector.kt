@@ -151,6 +151,10 @@ class RfDetrTwoGraphGpuDetector(
     private var activeTopology: String = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH
     private var activeAcceleratorLabel: String = "GPU FP16"
     private var compiledBatchSize: Int = StripRoiGeometry.MAX_TILES
+    private var overrideActiveTiles: Int? = null
+    private var overridePreferTextureWeights: Boolean? = null
+    private var overrideConstantTensorSharing: Boolean? = null
+    private var overrideBufferStorageType: CompiledModel.GpuOptions.BufferStorageType? = null
     private var lastOverrideMtimeMs: Long = -1L
 
     private var initializedOnThread = false
@@ -270,6 +274,28 @@ class RfDetrTwoGraphGpuDetector(
             val singleFileOverride = overrideJson?.optString("single_graph_path", "")?.takeIf { it.isNotEmpty() }
             val part1FileOverride = overrideJson?.optString("part1_path", "")?.takeIf { it.isNotEmpty() }
             val part2FileOverride = overrideJson?.optString("part2_path", "")?.takeIf { it.isNotEmpty() }
+            overrideActiveTiles = if (overrideJson != null && overrideJson.has("active_tiles")) {
+                overrideJson.optInt("active_tiles", StripRoiGeometry.MAX_TILES)
+                    .coerceIn(1, StripRoiGeometry.MAX_TILES)
+            } else {
+                null
+            }
+            overridePreferTextureWeights = if (overrideJson != null && overrideJson.has("prefer_texture_weights")) {
+                overrideJson.optBoolean("prefer_texture_weights")
+            } else {
+                null
+            }
+            overrideConstantTensorSharing = if (overrideJson != null && overrideJson.has("constant_tensor_sharing")) {
+                overrideJson.optBoolean("constant_tensor_sharing")
+            } else {
+                null
+            }
+            overrideBufferStorageType = when (overrideJson?.optString("buffer_storage_type", "")?.lowercase(Locale.US)) {
+                "buffer" -> CompiledModel.GpuOptions.BufferStorageType.BUFFER
+                "texture_2d" -> CompiledModel.GpuOptions.BufferStorageType.TEXTURE_2D
+                "default" -> CompiledModel.GpuOptions.BufferStorageType.DEFAULT
+                else -> null
+            }
 
             val hasTwoGraphOverride = part1FileOverride != null && part2FileOverride != null &&
                 File(part1FileOverride).exists() && File(part2FileOverride).exists()
@@ -347,13 +373,21 @@ class RfDetrTwoGraphGpuDetector(
 
     private fun buildGpuOptions(cacheKey: String): CompiledModel.Options {
         val cacheDir = appContext.codeCacheDir.absolutePath
-        return CompiledModel.Options(Accelerator.GPU).apply {
+        val xnnCache = File(appContext.codeCacheDir, "xnnpack_${cacheKey}.cache").absolutePath
+        return CompiledModel.Options(Accelerator.GPU, Accelerator.CPU).apply {
             gpuOptions = CompiledModel.GpuOptions(
+                constantTensorSharing = overrideConstantTensorSharing ?: true,
                 precision = CompiledModel.GpuOptions.Precision.FP16,
+                bufferStorageType = overrideBufferStorageType,
+                preferTextureWeights = overridePreferTextureWeights,
                 serializationDir = cacheDir,
                 modelCacheKey = cacheKey,
                 serializeProgramCache = true,
                 priority = CompiledModel.GpuOptions.Priority.HIGH
+            )
+            cpuOptions = CompiledModel.CpuOptions(
+                numThreads = 4,
+                xnnPackWeightCachePath = xnnCache
             )
         }
     }
@@ -456,7 +490,8 @@ class RfDetrTwoGraphGpuDetector(
         var part2NsAcc = 0L
 
         val detections = ArrayList<TileDetection>(16)
-        val activeTiles = sweepBuffers.activeTileCount.coerceIn(1, StripRoiGeometry.MAX_TILES)
+        val activeTiles = (overrideActiveTiles ?: sweepBuffers.activeTileCount)
+            .coerceIn(1, StripRoiGeometry.MAX_TILES)
 
         val m1 = part1Model
         val m2 = part2Model
@@ -650,7 +685,7 @@ class RfDetrTwoGraphGpuDetector(
             rollingLatencyMs * 0.85f + totalMs * 0.15f
         }
 
-        if (sweepCount <= 5L || sweepCount % 5L == 0L) {
+        if (sweepCount <= 120L || sweepCount % 5L == 0L) {
             Log.i(
                 TAG,
                 String.format(

@@ -9,12 +9,18 @@ in ``[0.0, 1.0]`` (`.agents/rules/litert-inference.md` §2). This module wraps `
 - :class:`RfDetrPart1BackboneEncoder` + :func:`host_select_topk_queries` +
   :class:`RfDetrPart2DecoderHead`: two-graph split that moves two-stage ``TopK`` query selection to
   the host CPU so both GPU subgraphs compile without ``TOPK_V2`` or ``GATHER_ND`` partitions.
+
+Additionally rewrites DINOv2 windowed attention and deformable cross-attention tensor reshapes to
+stay strictly within rank ``<= 4`` without ``BROADCAST_TO`` ops, matching the Android OpenCL GPU
+delegate (`LITERT_CL`) rank-4 tensor constraint.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import os
+import types
 from collections.abc import Callable
 from typing import Any
 
@@ -23,6 +29,12 @@ import torch
 import torch.nn.functional as F
 from numpy.typing import NDArray
 from rfdetr import RFDETRNano
+from rfdetr.models import transformer as rfdetr_transformer
+from rfdetr.models.backbone.dinov2_with_windowed_attn import (
+    BackboneOutput,
+    WindowedDinov2WithRegistersBackbone,
+    WindowedDinov2WithRegistersEmbeddings,
+)
 from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
 from torch import Tensor, nn
 
@@ -31,6 +43,42 @@ IMAGENET_STD_RGB: tuple[float, float, float] = (0.229, 0.224, 0.225)
 DEFAULT_INPUT_RESOLUTION: int = 384
 ENCODER_GRID_HW: tuple[int, int] = (24, 24)
 DEFAULT_PROPOSAL_WH: float = 0.05
+
+
+def _clamp_unit_interval_via_relu(tensor: Tensor) -> Tensor:
+    """Clamps ``tensor`` to ``[0.0, 1.0]`` via ``RELU(x) - RELU(x - 1)`` to avoid ``RELU_0_TO_1``."""
+    return F.relu(tensor) - F.relu(tensor - 1.0)
+
+
+def _gpu_friendly_sineembed_for_position(
+    pos_tensor: Tensor,
+    dim: int = 128,
+    out_dtype: torch.dtype | None = None,
+) -> Tensor:
+    """Computes sine/cosine box coordinate embeddings without ``FLOOR_DIV`` or rank ``> 4`` ops."""
+    batch_size, num_queries, coord_dim = pos_tensor.shape
+    scale = 2.0 * math.pi
+    half_dim = dim // 2
+    denom = [10000.0 ** (2.0 * i / float(dim)) for i in range(half_dim)]
+    denom_t = (
+        pos_tensor.new_tensor(denom, dtype=torch.float32)
+        .to(pos_tensor.dtype)
+        .view(1, 1, half_dim)
+    )
+    if coord_dim == 2:
+        order: tuple[int, ...] = (1, 0)
+    elif coord_dim == 4:
+        order = (1, 0, 2, 3)
+    else:
+        raise ValueError(f"Unknown pos_tensor shape(-1): {coord_dim}")
+
+    parts = []
+    for idx in order:
+        ang = (pos_tensor[:, :, idx : idx + 1] * scale) / denom_t
+        emb = torch.stack((ang.sin(), ang.cos()), dim=3).reshape(batch_size, num_queries, dim)
+        parts.append(emb)
+    pos = torch.cat(parts, dim=2)
+    return pos if out_dtype is None else pos.to(out_dtype)
 
 
 def pin_cuda_device_zero() -> str:
@@ -54,13 +102,20 @@ def pin_cuda_device_zero() -> str:
         return "cpu"
 
 
+def _repeat_along_dim0(tensor: Tensor, count: int) -> Tensor:
+    """Repeats ``tensor`` ``count`` times along dimension 0 using ``torch.cat`` instead of ``BROADCAST_TO``."""
+    if count <= 1:
+        return tensor
+    return torch.cat([tensor] * count, dim=0)
+
+
 def bilinear_matmul_grid_sample(
     value: Tensor,
     grid: Tensor,
     padding_mode: str = "zeros",
     align_corners: bool = False,
 ) -> Tensor:
-    """Samples a 2D feature map bilinearly using separable tent weights and ``torch.bmm``.
+    """Samples a 2D feature map bilinearly using rank-4 separable tent weights and ``torch.bmm``.
 
     ``litert_torch`` lowers ``torch.nn.functional.grid_sample`` to ``GATHER_ND`` plus boolean
     bounds masks (``LOGICAL_AND``, ``SELECT_V2``) that fall back to single-threaded CPU kernels,
@@ -68,7 +123,8 @@ def bilinear_matmul_grid_sample(
     arithmetic that exceeds ``float16``'s exact integer limit (2048) once ``N * 676 > 2048``
     (see ``rfdetr/export/_litert/sampling.py``). Computing separable 1D bilinear tent weights
     ``relu(1 - |p - i|)`` over ``0..H-1`` and ``0..W-1`` uses integer coordinates ``<= 23`` (exact
-    in both FP16 and FP32) and lowers exclusively to GPU-native elementwise ops and ``BATCH_MATMUL``.
+    in both FP16 and FP32) and lowers exclusively to rank-4 GPU-native elementwise ops and
+    ``BATCH_MATMUL``.
 
     Args:
         value: Feature map tensor of shape ``(N, C, H, W)`` in ``float32`` or ``float16``.
@@ -95,16 +151,12 @@ def bilinear_matmul_grid_sample(
     num_points = grid_h * grid_w
 
     grid_flat = grid.reshape(batch_heads, num_points, 2)
-    # FMA form ``g * (S / 2) + (S - 1) / 2`` avoids ``(g + 1)`` rounding near ``g = -1`` in FP16.
     px = grid_flat[..., 0] * (width * 0.5) + ((width - 1.0) * 0.5)
     py = grid_flat[..., 1] * (height * 0.5) + ((height - 1.0) * 0.5)
 
     cols = torch.arange(width, dtype=value.dtype, device=value.device).view(1, 1, width)
     rows = torch.arange(height, dtype=value.dtype, device=value.device).view(1, 1, height)
 
-    # For padding_mode="zeros" and align_corners=False, a grid column ``iw`` contributes
-    # ``max(0, 1 - |px - iw|)``, naturally tapering to zero across the [-0.5, 0.0] and
-    # [W - 1, W - 0.5] half-pixel zero-padded borders.
     wx = F.relu(1.0 - (px.unsqueeze(-1) - cols).abs())
     wy = F.relu(1.0 - (py.unsqueeze(-1) - rows).abs())
 
@@ -112,6 +164,232 @@ def bilinear_matmul_grid_sample(
     sampled_y = torch.bmm(wy, value_hcw).reshape(batch_heads, num_points, channels, width)
     sampled_xy = (sampled_y * wx.unsqueeze(2)).sum(dim=-1)
     return sampled_xy.permute(0, 2, 1).reshape(batch_heads, channels, grid_h, grid_w)
+
+
+def _gpu_rank4_embeddings_forward(
+    self: WindowedDinov2WithRegistersEmbeddings,
+    pixel_values: Tensor,
+    bool_masked_pos: Tensor | None = None,
+) -> Tensor:
+    """Computes windowed DINOv2 patch embeddings using only rank ``<= 4`` tensors and no ``BROADCAST_TO``."""
+    batch_size, _, height, width = pixel_values.shape
+    target_dtype = self.patch_embeddings.projection.weight.dtype
+    embeddings = self.patch_embeddings(pixel_values.to(dtype=target_dtype))
+
+    cls_tokens = _repeat_along_dim0(self.cls_token, batch_size)
+    embeddings = torch.cat((cls_tokens, embeddings), dim=1)
+    embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
+
+    if self.config.num_windows > 1:
+        num_h_patches = height // self.config.patch_size
+        num_w_patches = width // self.config.patch_size
+        cls_token_with_pos_embed = embeddings[:, :1]
+        pixel_tokens_with_pos_embed = embeddings[:, 1:]
+        channels = pixel_tokens_with_pos_embed.shape[-1]
+
+        num_windows = self.config.num_windows
+        num_h_win = num_h_patches // num_windows
+        num_w_win = num_w_patches // num_windows
+
+        # Fuse (num_w_win, channels) during the 2D window transpose so rank never exceeds 4.
+        windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape(
+            batch_size * num_windows,
+            num_h_win,
+            num_windows,
+            num_w_win * channels,
+        )
+        windowed_pixel_tokens = windowed_pixel_tokens.permute(0, 2, 1, 3).reshape(
+            batch_size * (num_windows**2),
+            num_h_win * num_w_win,
+            channels,
+        )
+        windowed_cls_token_with_pos_embed = _repeat_along_dim0(
+            cls_token_with_pos_embed, num_windows**2
+        )
+        embeddings = torch.cat((windowed_cls_token_with_pos_embed, windowed_pixel_tokens), dim=1)
+
+    if self.config.num_register_tokens > 0 and self.register_tokens is not None:
+        reg_tokens = _repeat_along_dim0(self.register_tokens, embeddings.shape[0])
+        embeddings = torch.cat((embeddings[:, :1], reg_tokens, embeddings[:, 1:]), dim=1)
+
+    return self.dropout(embeddings)
+
+
+def _gpu_rank4_backbone_forward(
+    self: WindowedDinov2WithRegistersBackbone,
+    pixel_values: Tensor,
+    output_hidden_states: bool | None = None,
+    output_attentions: bool | None = None,
+    return_dict: bool | None = None,
+) -> tuple[Any, ...] | BackboneOutput:
+    """Runs DINOv2 windowed encoder and un-windows output maps using only rank ``<= 4`` tensors."""
+    return_dict = return_dict if return_dict is not None else self.config.return_dict
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    output_attentions = (
+        output_attentions if output_attentions is not None else self.config.output_attentions
+    )
+
+    embedding_output = self.embeddings(pixel_values)
+    outputs = self.encoder(
+        embedding_output,
+        output_hidden_states=True,
+        output_attentions=output_attentions,
+        return_dict=return_dict,
+    )
+    hidden_states = outputs.hidden_states if return_dict else outputs[1]
+
+    feature_maps: tuple[Tensor, ...] = ()
+    for stage, hidden_state in zip(self.stage_names, hidden_states):
+        if stage in self.out_features:
+            if self.config.apply_layernorm:
+                hidden_state = self.layernorm(hidden_state)
+            if self.config.reshape_hidden_states:
+                hidden_state = hidden_state[:, self.num_register_tokens + 1 :]
+                batch_size, _, height, width = pixel_values.shape
+                patch_size = self.config.patch_size
+                num_h_patches = height // patch_size
+                num_w_patches = width // patch_size
+
+                if self.config.num_windows > 1:
+                    num_windows = self.config.num_windows
+                    num_windows_squared = num_windows**2
+                    batch_windows, _, channels = hidden_state.shape
+                    num_h_win = num_h_patches // num_windows
+                    num_w_win = num_w_patches // num_windows
+                    # Fuse (num_w_win, channels) so un-windowing stays rank 4.
+                    hidden_state = hidden_state.reshape(
+                        (batch_windows // num_windows_squared) * num_windows,
+                        num_windows,
+                        num_h_win,
+                        num_w_win * channels,
+                    )
+                    hidden_state = hidden_state.permute(0, 2, 1, 3)
+
+                hidden_state = hidden_state.reshape(batch_size, num_h_patches, num_w_patches, -1)
+                hidden_state = hidden_state.permute(0, 3, 1, 2).contiguous()
+
+            feature_maps += (hidden_state,)
+
+    if not return_dict:
+        if output_hidden_states:
+            return (feature_maps,) + outputs[1:]
+        return (feature_maps,) + outputs[2:]
+
+    return BackboneOutput(
+        feature_maps=feature_maps,  # type: ignore[arg-type]
+        hidden_states=outputs.hidden_states if output_hidden_states else None,
+        attentions=outputs.attentions if output_attentions else None,
+    )
+
+
+def _gpu_rank4_ms_deform_attn_forward(
+    self: MSDeformAttn,
+    query: Tensor,
+    reference_points: Tensor,
+    input_flatten: Tensor,
+    input_spatial_shapes: Tensor,
+    input_level_start_index: Tensor,
+    input_padding_mask: Tensor | None = None,
+    input_spatial_shapes_hw: list[tuple[int, int]] | None = None,
+) -> Tensor:
+    """Executes multi-scale deformable cross-attention using exclusively rank ``<= 4`` tensors."""
+    batch_size, len_query, _ = query.shape
+    _, len_input, _ = input_flatten.shape
+    bq = batch_size * len_query
+    head_dim = self.d_model // self.n_heads
+    total_pts = self.n_levels * self.n_points
+
+    value = self.value_proj(input_flatten)
+    if input_padding_mask is not None:
+        value = value.masked_fill(input_padding_mask[..., None], float(0))
+
+    attention_weights = self.attention_weights(query).view(
+        batch_size, len_query, self.n_heads, total_pts
+    )
+    attention_weights = F.softmax(attention_weights, -1)
+
+    # Flatten (batch_size, len_query) -> bq so sampling_offsets and sampling_locations stay rank 4.
+    sampling_offsets = self.sampling_offsets(query).view(bq, self.n_heads, total_pts, 2)
+
+    n_ref_levels = reference_points.shape[2]
+    ref_4d = reference_points.reshape(bq, 1, n_ref_levels, reference_points.shape[-1])
+    if n_ref_levels == 1 and self.n_levels > 1:
+        ref_4d = torch.cat([ref_4d] * self.n_levels, dim=2)
+
+    # Repeat each level self.n_points times along dim=2 via torch.cat to avoid rank-5 repeat_interleave.
+    ref_pts = torch.cat(
+        [
+            ref_4d[:, :, lvl : lvl + 1, :]
+            for lvl in range(self.n_levels)
+            for _ in range(self.n_points)
+        ],
+        dim=2,
+    )
+
+    if reference_points.shape[-1] == 4:
+        sampling_locations = (
+            ref_pts[:, :, :, :2]
+            + sampling_offsets * (ref_pts[:, :, :, 2:] * (0.5 / float(self.n_points)))
+        )
+    else:
+        offset_normalizer = torch.stack(
+            [input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1
+        )
+        offset_normalizer = torch.cat(
+            [
+                offset_normalizer[lvl : lvl + 1, :]
+                for lvl in range(self.n_levels)
+                for _ in range(self.n_points)
+            ],
+            dim=0,
+        ).view(1, 1, total_pts, 2)
+        sampling_locations = ref_pts + sampling_offsets / offset_normalizer
+
+    sampling_grids = 2.0 * sampling_locations - 1.0
+    value = value.transpose(1, 2).contiguous().view(batch_size, self.n_heads, head_dim, len_input)
+
+    shapes = (
+        input_spatial_shapes_hw if input_spatial_shapes_hw is not None else input_spatial_shapes
+    )
+    num_levels = len(shapes)
+    if num_levels == 1:
+        value_list = [value]
+    else:
+        value_list = value.split([int(h) * int(w) for h, w in shapes], dim=3)  # type: ignore[no-untyped-call]
+
+    sampling_value_list = []
+    for level_index, (height, width) in enumerate(shapes):
+        value_l = value_list[level_index].view(
+            batch_size * self.n_heads, head_dim, int(height), int(width)
+        )
+        grid_l = sampling_grids[
+            :, :, level_index * self.n_points : (level_index + 1) * self.n_points, :
+        ]
+        # Transpose (len_query, n_heads) in 4D by fusing (n_points, 2) -> n_points * 2.
+        sampling_grid_l = (
+            grid_l.reshape(batch_size, len_query, self.n_heads, self.n_points * 2)
+            .transpose(1, 2)
+            .reshape(batch_size * self.n_heads, len_query, self.n_points, 2)
+        )
+        sampling_value_l = self.grid_sample(
+            value_l, sampling_grid_l, padding_mode="zeros", align_corners=False
+        )
+        sampling_value_list.append(sampling_value_l)
+
+    attention_weights_4d = attention_weights.transpose(1, 2).reshape(
+        batch_size * self.n_heads, 1, len_query, total_pts
+    )
+    if num_levels == 1:
+        sampling_values = sampling_value_list[0]
+    else:
+        sampling_values = torch.cat(sampling_value_list, dim=-1)
+
+    output = (sampling_values * attention_weights_4d).sum(-1).view(
+        batch_size, self.n_heads * head_dim, len_query
+    )
+    return self.output_proj(output.transpose(1, 2).contiguous())
 
 
 def flat_gather_top_rows(scores: Tensor, k: int) -> Callable[[Tensor], Tensor]:
@@ -151,8 +429,8 @@ def load_prepared_lwdetr(
     """Loads ``RFDETRNano`` on CPU and prepares a deep-copied ``LWDETR`` module for LiteRT export.
 
     Freezes DINOv2 position embeddings to ``(resolution, resolution)``, switches submodules to
-    export mode, and patches every :class:`MSDeformAttn` instance to use
-    :func:`bilinear_matmul_grid_sample`.
+    export mode, and patches DINOv2 windowed attention and :class:`MSDeformAttn` to use rank ``<= 4``
+    tensors without ``BROADCAST_TO``.
 
     Args:
         resolution: Square input edge length in pixels (must be divisible by 32; 384 for Nano).
@@ -179,8 +457,14 @@ def load_prepared_lwdetr(
     lwdetr.export()
 
     for module in lwdetr.modules():
-        if isinstance(module, MSDeformAttn):
+        if isinstance(module, WindowedDinov2WithRegistersEmbeddings):
+            module.forward = types.MethodType(_gpu_rank4_embeddings_forward, module)
+        elif isinstance(module, WindowedDinov2WithRegistersBackbone):
+            module.forward = types.MethodType(_gpu_rank4_backbone_forward, module)
+        elif isinstance(module, MSDeformAttn):
             module.grid_sample = bilinear_matmul_grid_sample
+            module.forward = types.MethodType(_gpu_rank4_ms_deform_attn_forward, module)
+    rfdetr_transformer.gen_sineembed_for_position = _gpu_friendly_sineembed_for_position
     lwdetr.transformer.select_top_rows = flat_gather_top_rows
     return lwdetr, detector
 
@@ -224,7 +508,7 @@ class FusedRfDetrSingleGraph(nn.Module):
         nchw = nhwc_rgb_01.permute(0, 3, 1, 2).contiguous()
         normalized = (nchw - self.mean) / self.std
         boxes_cxcywh, raw_logits = self.model(normalized)
-        return boxes_cxcywh.clamp(0.0, 1.0), raw_logits.sigmoid()
+        return _clamp_unit_interval_via_relu(boxes_cxcywh), raw_logits.sigmoid()
 
 
 class RfDetrPart1BackboneEncoder(nn.Module):
@@ -274,8 +558,6 @@ class RfDetrPart1BackboneEncoder(nn.Module):
         nchw = nhwc_rgb_01.permute(0, 3, 1, 2).contiguous()
         normalized = (nchw - self.mean) / self.std
         srcs, _, _ = self.encoder_backbone(normalized)
-        # All 576 anchors in a 24x24 grid satisfy (0.01 < (i + 0.5)/24 < 0.99), so
-        # gen_encoder_output_proposals's validity mask is identically True at 384x384.
         memory = srcs[0].flatten(2).transpose(1, 2).contiguous()
         output_memory_prenorm = self.enc_output(memory)
         output_memory_norm = self.enc_output_norm(output_memory_prenorm)
@@ -343,7 +625,6 @@ def host_select_topk_queries(
 
     selected_indices = np.empty((batch_size, top_k), dtype=np.int64)
     for b in range(batch_size):
-        # np.lexsort sorts by last key primary: (-scores, +token_index).
         ranked = np.lexsort((token_order, -enc_max_scores[b]))[:top_k]
         selected_indices[b] = ranked
 
@@ -435,15 +716,16 @@ class RfDetrPart2DecoderHead(nn.Module):
         ref_ts_wh = enc_delta[..., 2:].exp() * selected_proposals[..., 2:]
         ref_ts = torch.cat([ref_ts_cxcy, ref_ts_wh], dim=-1)
 
-        # 2. Combine learned decoder query embeddings with Stage 1 reference boxes.
-        tgt = self.query_feat.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-        ref_init = self.refpoint_embed.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+        # 2. Combine learned decoder query embeddings with Stage 1 reference boxes using torch.cat
+        #    along dim=0 so batch expansion never emits BROADCAST_TO on GPU.
+        tgt = _repeat_along_dim0(self.query_feat.unsqueeze(0), batch_size)
+        ref_init = _repeat_along_dim0(self.refpoint_embed.unsqueeze(0), batch_size)
         ref_cxcy = ref_init[..., :2] * ref_ts[..., 2:] + ref_ts[..., :2]
         ref_wh = ref_init[..., 2:].exp() * ref_ts[..., 2:]
         refpoints = torch.cat([ref_cxcy, ref_wh], dim=-1)
 
         # 3. Run 2-layer deformable cross-attention decoder and reparameterized output heads.
-        pos = self.pos_embed.expand(batch_size, -1, -1).contiguous()
+        pos = _repeat_along_dim0(self.pos_embed, batch_size)
         hs, ref_unsigmoid = self.decoder(
             tgt,
             memory,
@@ -459,7 +741,7 @@ class RfDetrPart2DecoderHead(nn.Module):
         dec_delta = self.bbox_embed(hs)
         boxes_cxcy = dec_delta[..., :2] * ref_unsigmoid[..., 2:] + ref_unsigmoid[..., :2]
         boxes_wh = dec_delta[..., 2:].exp() * ref_unsigmoid[..., 2:]
-        boxes = torch.cat([boxes_cxcy, boxes_wh], dim=-1).clamp(0.0, 1.0)
+        boxes = _clamp_unit_interval_via_relu(torch.cat([boxes_cxcy, boxes_wh], dim=-1))
         scores = self.class_embed(hs).sigmoid()
 
         if boxes.dim() == 4:

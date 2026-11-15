@@ -110,6 +110,7 @@ def test_single_graph_and_two_graph_pytorch_equivalence(
 
 
 def test_two_graph_tflite_eliminates_topk_and_gather_nd() -> None:
+    forbidden_gpu_ops = ("TOPK_V2", "GATHER_ND", "BROADCAST_TO", "FLOOR_DIV", "RELU_0_TO_1")
     for filename in (
         "rf_detr_nano_part1_b1.tflite",
         "rf_detr_nano_part2_b1.tflite",
@@ -120,8 +121,10 @@ def test_two_graph_tflite_eliminates_topk_and_gather_nd() -> None:
         assert model_path.is_file(), f"Missing exported artifact {model_path}; run export_rfdetr_litert.py"
         interp = Interpreter(model_path=str(model_path))
         ops = Counter(op["op_name"] for op in interp._get_ops_details())
-        assert ops["TOPK_V2"] == 0, f"{filename} unexpectedly contains TOPK_V2"
-        assert ops["GATHER_ND"] == 0, f"{filename} unexpectedly contains GATHER_ND"
+        for op_name in forbidden_gpu_ops:
+            assert ops[op_name] == 0, f"{filename} unexpectedly contains {op_name}"
+        max_rank = max(len(t["shape"]) for t in interp.get_tensor_details())
+        assert max_rank <= 4, f"{filename} has tensor rank {max_rank} > 4 (unsupported by LITERT_CL)"
 
 
 def test_stand_in_coco_class_oracle_and_tflite_parity(

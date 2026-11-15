@@ -88,7 +88,7 @@
       "class_id": 75,
       "pytorch_top_score": 0.956245,
       "tflite_top_score": 0.956245,
-      "max_score_abs_diff": 4e-06,
+      "max_score_abs_diff": 5e-06,
       "max_box_abs_diff": 0.0,
       "top_box_iou": 1.0
     }
