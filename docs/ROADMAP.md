@@ -1,30 +1,25 @@
 # GneissFind — Execution Roadmap & Acceptance Criteria (`docs/ROADMAP.md`)
 
+> [!IMPORTANT]
+> **Agent & Architecture Coordination Ledger:** Before modifying this roadmap or designing Milestone 2+ architecture, read **[`docs/ENGINEERING_LEDGER.md`](ENGINEERING_LEDGER.md)** in full. It records the complete progression from Milestone 1 through Milestone 1B, all Pixel 10 Pro XL hardware validation findings, Camera2/Compose/EIS architectural invariants, and the exact on-device data contracts (`PushBroomCropper`, `StoneDetector`, `FieldDataLogger`).
+
 ## Milestone 1 — Baseline Push-Broom Skeleton *(Completed)*
 - [x] Initial Android project (`com.gneissfind.app`), CameraX + `Camera2Interop` `<= 1/500 s` shutter clamp with floating ISO verified on Pixel 10 Pro (`1/502s`).
 - [x] Simulated target stream, temporal vote counter, speed gate, and `AudioTrack` sonifier scaffold.
 
 ---
 
-## Milestone 1B — Reversible Landscape, Classic TNG LCARS, 5-Tile Swath & IMU Pitch Stabilization *(Current Active Task)*
+## Milestone 1B — Reversible Landscape, Classic TNG LCARS, 5-Tile Swath & IMU Pitch Stabilization *(Completed & Validated on Pixel 10 Pro XL)*
+> Detailed implementation record, UX iterations, and Camera2/PreviewView hardware postmortems: **[`docs/ENGINEERING_LEDGER.md`](ENGINEERING_LEDGER.md)**.
 
-### Copy-Paste Prompt for Antigravity in Android Studio Canary
-Paste the block below directly into the Antigravity Agent pane:
+- [x] Lock `MainActivity` to reversible `sensorLandscape` (`ROTATION_90` and `ROTATION_270`), synchronizing CameraX `Preview` + `ImageAnalysis` `targetRotation`, ARCore display geometry, and `SensorManager.remapCoordinateSystem`.
+- [x] Default `2.0x` lossless center sensor crop (`ZoomRatio = 2.0f`) and `<= 1/500 s` shutter clamp to ON at startup while driving dynamic AE / floating ISO / Canopy EV controls via `Camera2CameraControl`.
+- [x] Upgrade push-broom strip cropper on the `1920x1080` landscape stream to 5 horizontally overlapping `384x384` tiles (`1792x384 px`, `32 px` overlap, cross-tile NMS) with inline `5-TILE / 3-TILE` toggle.
+- [x] Implement 120 Hz GPU RenderNode IMU pitch stabilization (`Sensor.TYPE_GAME_ROTATION_VECTOR`) dynamically shifting `cropY` within `[0..696]` around the `45 deg` / user `SYNC PITCH` setpoint and lighting `PITCH LIMIT` when clamped.
+- [x] Implement split-screen Classic 2360s TNG LCARS interface (`#000000` OLED canvas, `4.dp` gutters, swept `LcarsElbow` chrome, bundled `Antonio` tabular-numeral typography, 6-role semantic color taxonomy with parameterized HSV value stepping, inline source selection drawer, and silent UI taps).
 
-```text
-Read @AGENTS.md, @.agents/rules/android-camera-ar.md, @.agents/rules/lcars-ui.md, and @docs/ROADMAP.md in full—the project specification has been updated for Milestone 1B.
-
-Refactor the Android app in `android/` to implement every Milestone 1B requirement:
-1. Lock `MainActivity` to reversible `sensorLandscape` (`ROTATION_90` and `ROTATION_270`), synchronizing CameraX `Preview` + `ImageAnalysis` targetRotation, ARCore display geometry, and `SensorManager.remapCoordinateSystem` so pitch and roll stay accurate when flipping landscape 180 degrees.
-2. Default `2.0x` lossless center sensor crop (`ZoomRatio = 2.0f`) AND `<= 1/500 s` shutter clamp to ON at startup while preserving the working `Camera2Interop` exposure clamp + floating ISO behavior.
-3. Upgrade the push-broom strip cropper on the `1920x1080` landscape stream to 5 horizontally overlapping `384x384` tiles (`xOffsets = [64, 416, 768, 1120, 1472]`, spanning `1792x384 px` = 93.3% width with 32 px overlap and cross-tile NMS), with an inline `5-TILE / 3-TILE` toggle.
-4. Implement IMU-driven ROI pitch stabilization (`Sensor.TYPE_GAME_ROTATION_VECTOR`) that dynamically shifts `cropY` within `[0..696]` around the `45 deg` reference pitch (or user `SYNC PITCH` setpoint) so the scan strip tracks the same ~1.5m ground patch despite wrist pitch wobble, lighting a `PITCH LIMIT` warning when clamped at `0` or `696`.
-5. Replace the portrait card UI and floating setup sheet with the split-screen Classic 2360s TNG LCARS interface specified in `.agents/rules/lcars-ui.md`: pure `#000000` OLED canvas with `4.dp` black gutters, custom swept `LcarsElbow` shapes with concave inner fillets, bundled offline `Antonio` (or `Barlow Condensed`) uppercase tabular-numeral typography, top ~48% panoramic camera + stabilized strip HUD (with black-halo high-contrast stone brackets), and bottom ~52% non-occluding tactical control deck. Keep all LCARS UI button taps silent (`isSoundEffectsEnabled = false`); reserve audio strictly for stone pings and overspeed warning.
-6. Update unit tests (covering 5-tile coordinate math, cross-tile NMS, and IMU pitch-to-`cropY` clamping), verify `./gradlew assembleDebug testDebugUnitTest` passes cleanly, and make atomic one-sentence git commits per `@AGENTS.md`.
-```
-
-### Milestone 1B Acceptance Tests (Oracle)
-1. **Build & Unit Tests:** `./gradlew assembleDebug testDebugUnitTest` succeeds with zero errors, and `git log -n 5 --oneline` shows clean one-sentence atomic commits.
+### Milestone 1B Acceptance Tests (Oracle — All Passed on Pixel 10 Pro XL)
+1. **Build & Unit Tests:** `./gradlew assembleDebug testDebugUnitTest` succeeds with zero errors (`13/13` unit tests passing), and `git log --oneline` shows clean one-sentence atomic commits.
 2. **Reversible `sensorLandscape`:** Flipping the Pixel 10 Pro $180^\circ$ between left-landscape and right-landscape smoothly rotates both UI and camera preview upright, and tilting the lens downward increases `PITCH` in both orientations (never swapping pitch with roll).
 3. **Default Startup Optics:** Cold-launching the app starts immediately at **`2.0x` zoom** and **`<= 1/500 s` shutter clamp** (`GSD ~ 0.59 mm/px` at `R ~ 1.50 m`).
 4. **5-Tile + IMU Pitch Stabilization:** Gently pitching the wrist up/down by $\pm 6^\circ$ visibly shifts the `1792x384` scan strip opposite the wrist motion so the strip stays anchored on the same living-room floor / gravel target; tilting past the frame edge clamps cleanly and lights `PITCH LIMIT`.
