@@ -1,3 +1,10 @@
+/*
+ * IMU pitch stabilization, reversible-landscape axis remapping, and ground-plane raycasting.
+ * Consumes magnetometer-free TYPE_GAME_ROTATION_VECTOR and TYPE_LINEAR_ACCELERATION sensor events
+ * (plus optional ARCore horizontal planes) to emit 120 Hz continuous EIS cropY offsets for display,
+ * timestamp-matched integer cropY offsets for YUV strip extraction, and 3D ground coordinates for
+ * TemporalTargetTracker.
+ */
 package com.gneissfind.app.tracking
 
 import android.content.Context
@@ -24,7 +31,13 @@ import kotlin.math.sqrt
 import kotlin.math.tan
 
 /**
- * Result of raycasting a 2D strip detection onto the horizontal gravel-bar ground plane.
+ * Result of raycasting a 2D strip detection onto the horizontal ground plane (`y = 0 m`).
+ *
+ * @property worldPoint Projected 3D ground coordinates in meters (`yMeters = 0`).
+ * @property slantRangeMeters Line-of-sight distance (m) from the camera optical center to [worldPoint].
+ * @property gsdMmPerPx Ground sample distance (mm/px) at [slantRangeMeters] for the active zoom crop.
+ * @property usedArCorePlane `true` when hit-tested against a tracked ARCore horizontal plane; `false`
+ *   when computed trigonometrically from waist height and IMU pitch.
  */
 data class RaycastResult(
     val worldPoint: WorldPoint3D,
@@ -34,7 +47,28 @@ data class RaycastResult(
 )
 
 /**
- * Computed IMU-stabilized vertical strip position inside the `1920x1080` landscape frame.
+ * Sub-pixel continuous vertical strip position (in 1080p stream rows) used to drive 120 Hz GPU
+ * `PreviewView.translationY` without integer quantization steps.
+ *
+ * @property rawCropYFloat Unclamped top row offset (px) before `[0, MAX_CROP_Y_PX]` clamping.
+ * @property clampedCropYFloat Clamped top row offset (px) in `[0f, MAX_CROP_Y_PX]`.
+ * @property isPitchClamped `true` when [rawCropYFloat] exceeded `[0f, MAX_CROP_Y_PX]`.
+ * @property matchedPitchDeg Downward optical pitch (degrees, `0` = horizon, `90` = nadir) used.
+ * @property referencePitchDeg Active EIS pitch setpoint (degrees).
+ * @property verticalFocalLengthPx Stream-scaled vertical focal length (px) used for `fy * tan(delta)`.
+ */
+data class PitchStabilizationFloatState(
+    val rawCropYFloat: Float,
+    val clampedCropYFloat: Float,
+    val isPitchClamped: Boolean,
+    val matchedPitchDeg: Float,
+    val referencePitchDeg: Float,
+    val verticalFocalLengthPx: Float
+)
+
+/**
+ * Integer-quantized IMU-stabilized vertical strip position inside the landscape camera frame for
+ * YUV row slicing in [PushBroomCropper].
  */
 data class PitchStabilizationState(
     val rawCropY: Int,
@@ -133,7 +167,21 @@ class GroundPlaneRaycaster(
     @Volatile
     var simulatedPitchOverrideDeg: Float? = null
 
+    /**
+     * Optional high-rate (~120 Hz) callback invoked on the main sensor looper thread whenever a new
+     * smoothed landscape pitch sample is ready so the UI and GPU `PreviewView.translationY` update
+     * smoothly at display refresh rate instead of waiting for ~10–15 Hz `ImageAnalysis` sweeps.
+     */
+    @Volatile
+    var onRealtimeImuPitchListener: ((smoothedPitchDeg: Float, rollDeg: Float, referencePitchDeg: Float) -> Unit)? = null
+
+    @Volatile
+    var hasLiveImuStream: Boolean = false
+        private set
+
     private var hasInitializedDisplayPitch = false
+    private var lastGameRotationTimestampNs = 0L
+    private var lastRealtimeCallbackNs = 0L
     private var integratedX = 0f
     private var integratedZ = 0f
     private var vx = 0f
@@ -147,12 +195,23 @@ class GroundPlaneRaycaster(
 
     fun startImuListening() {
         val sm = sensorManager ?: return
-        gameRotationSensor?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        gameRotationSensor?.let { sensor ->
+            // Request 8,000 us (125 Hz, safely within Android 12's <= 200 Hz unprivileged rate cap)
+            // so EIS translation matches 120 Hz ProMotion displays; fall back to SENSOR_DELAY_GAME.
+            val registered = runCatching {
+                sm.registerListener(this, sensor, TARGET_IMU_SAMPLING_PERIOD_US)
+            }.getOrDefault(false)
+            if (!registered) {
+                sm.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+            }
+        }
         linearAccelSensor?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     }
 
     fun stopImuListening() {
         sensorManager?.unregisterListener(this)
+        hasLiveImuStream = false
+        lastGameRotationTimestampNs = 0L
     }
 
     override fun close() {
@@ -184,11 +243,12 @@ class GroundPlaneRaycaster(
 
     /**
      * Captures the user's current handheld downward tilt as the active EIS `thetaRef` setpoint
-     * (`SYNC PITCH` actuator).
+     * (`SYNC PITCH` actuator) and snaps the smoothed display pitch to avoid transient slew.
      */
     fun syncReferencePitch(): Float {
         val synced = (simulatedPitchOverrideDeg ?: latestRawPitchDeg).coerceIn(12.0f, 85.0f)
         referencePitchDeg = synced
+        currentForwardPitchDeg = synced
         return synced
     }
 
@@ -207,14 +267,29 @@ class GroundPlaneRaycaster(
                 )
                 val (rawPitch, rawRoll) = computePitchAndRollDegrees(remappedRotationMatrix)
                 latestRawPitchDeg = rawPitch
-                currentRollDeg = currentRollDeg * (1f - UI_PITCH_LOWPASS_ALPHA) + rawRoll * UI_PITCH_LOWPASS_ALPHA
+                hasLiveImuStream = true
+
+                val dtSec = if (lastGameRotationTimestampNs != 0L && event.timestamp > lastGameRotationTimestampNs) {
+                    ((event.timestamp - lastGameRotationTimestampNs) * 1e-9f).coerceIn(0.002f, 0.1f)
+                } else {
+                    0.008f
+                }
+                lastGameRotationTimestampNs = event.timestamp
 
                 if (!hasInitializedDisplayPitch) {
                     currentForwardPitchDeg = rawPitch
+                    currentRollDeg = rawRoll
                     hasInitializedDisplayPitch = true
                 } else {
-                    currentForwardPitchDeg =
-                        currentForwardPitchDeg * (1f - UI_PITCH_LOWPASS_ALPHA) + rawPitch * UI_PITCH_LOWPASS_ALPHA
+                    // Adaptive first-order low-pass filter: damp <0.35 deg stationary hand tremor
+                    // (tau = 45 ms) while tracking deliberate wrist pitch changes with near-zero lag
+                    // (tau = 14 ms) so 120 Hz GPU preview translation feels locked to the ground.
+                    val pitchDelta = abs(rawPitch - currentForwardPitchDeg)
+                    val motionBlend = ((pitchDelta - 0.15f) / 1.10f).coerceIn(0f, 1f)
+                    val tauSec = 0.045f * (1f - motionBlend) + 0.014f * motionBlend
+                    val alpha = (dtSec / (tauSec + dtSec)).coerceIn(0.08f, 0.78f)
+                    currentForwardPitchDeg += (rawPitch - currentForwardPitchDeg) * alpha
+                    currentRollDeg += (rawRoll - currentRollDeg) * alpha
                 }
 
                 synchronized(imuRingLock) {
@@ -223,6 +298,15 @@ class GroundPlaneRaycaster(
                     ringRollDeg[ringWriteIndex] = rawRoll
                     ringWriteIndex = (ringWriteIndex + 1) % IMU_RING_CAPACITY
                     if (ringCount < IMU_RING_CAPACITY) ringCount++
+                }
+
+                val listener = onRealtimeImuPitchListener
+                if (listener != null &&
+                    (lastRealtimeCallbackNs == 0L || event.timestamp - lastRealtimeCallbackNs >= MIN_DISPLAY_UPDATE_INTERVAL_NS)
+                ) {
+                    lastRealtimeCallbackNs = event.timestamp
+                    val displayPitch = simulatedPitchOverrideDeg ?: currentForwardPitchDeg
+                    listener.invoke(displayPitch, currentRollDeg, referencePitchDeg)
                 }
             }
 
@@ -413,8 +497,9 @@ class GroundPlaneRaycaster(
     companion object {
         const val DEFAULT_WAIST_HEIGHT_METERS = 1.06f
         const val DEFAULT_PITCH_DEGREES = 45.0f
-        private const val UI_PITCH_LOWPASS_ALPHA = 0.25f
-        private const val IMU_RING_CAPACITY = 32
+        private const val TARGET_IMU_SAMPLING_PERIOD_US = 8_000 // 125 Hz (<= 200 Hz Android 12 unprivileged cap)
+        private const val MIN_DISPLAY_UPDATE_INTERVAL_NS = 8_000_000L // ~125 Hz max UI/GPU translation cadence
+        private const val IMU_RING_CAPACITY = 64
         // Vertical angular span of the 384 px tall 2x-cropped push-broom strip (~7.4 deg on 1080p)
         private const val STRIP_VERTICAL_FOV_2X_DEG = 7.36f
 
@@ -474,7 +559,49 @@ class GroundPlaneRaycaster(
         }
 
         /**
-         * Computes stabilized `cropY` inside `[0..696]` on the `1920x1080` stream:
+         * Computes continuous sub-pixel stabilized `cropY` inside `[0f..MAX_CROP_Y_PX]` on the
+         * `1920x1080` landscape stream for 120 Hz GPU preview translation (`PreviewView.translationY`).
+         */
+        fun computeStabilizedCropYFloat(
+            currentPitchDeg: Float,
+            referencePitchDeg: Float = DEFAULT_PITCH_DEGREES,
+            verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
+            eisEnabled: Boolean = true
+        ): PitchStabilizationFloatState {
+            if (!eisEnabled) {
+                val nominal = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat()
+                return PitchStabilizationFloatState(
+                    rawCropYFloat = nominal,
+                    clampedCropYFloat = nominal,
+                    isPitchClamped = false,
+                    matchedPitchDeg = currentPitchDeg,
+                    referencePitchDeg = referencePitchDeg,
+                    verticalFocalLengthPx = verticalFocalLengthPx
+                )
+            }
+
+            val deltaPitchRad = Math.toRadians(
+                (currentPitchDeg - referencePitchDeg).coerceIn(-60f, 60f).toDouble()
+            )
+            val deltaYPx = (verticalFocalLengthPx * tan(deltaPitchRad)).toFloat()
+            val rawCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat() - deltaYPx
+            val maxCropY = StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+            val clampedCropY = rawCropY.coerceIn(0f, maxCropY)
+            val isClamped = rawCropY < 0f || rawCropY > maxCropY
+
+            return PitchStabilizationFloatState(
+                rawCropYFloat = rawCropY,
+                clampedCropYFloat = clampedCropY,
+                isPitchClamped = isClamped,
+                matchedPitchDeg = currentPitchDeg,
+                referencePitchDeg = referencePitchDeg,
+                verticalFocalLengthPx = verticalFocalLengthPx
+            )
+        }
+
+        /**
+         * Computes integer-quantized stabilized `cropY` inside `[0..MAX_CROP_Y_PX]` on the `1920x1080`
+         * stream for YUV strip slicing:
          *  - When user pitches DOWN (`currentPitchDeg > referencePitchDeg`), the ground patch moves
          *    UP toward the top of the sensor frame (`cropY` decreases toward `0`).
          *  - When user pitches UP (`currentPitchDeg < referencePitchDeg`), the ground patch moves
@@ -486,22 +613,13 @@ class GroundPlaneRaycaster(
             verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
             eisEnabled: Boolean = true
         ): PitchStabilizationState {
-            if (!eisEnabled) {
-                return PitchStabilizationState(
-                    rawCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
-                    clampedCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
-                    isPitchClamped = false,
-                    matchedPitchDeg = currentPitchDeg,
-                    referencePitchDeg = referencePitchDeg,
-                    verticalFocalLengthPx = verticalFocalLengthPx
-                )
-            }
-
-            val deltaPitchRad = Math.toRadians(
-                (currentPitchDeg - referencePitchDeg).coerceIn(-60f, 60f).toDouble()
+            val floatState = computeStabilizedCropYFloat(
+                currentPitchDeg = currentPitchDeg,
+                referencePitchDeg = referencePitchDeg,
+                verticalFocalLengthPx = verticalFocalLengthPx,
+                eisEnabled = eisEnabled
             )
-            val deltaYPx = (verticalFocalLengthPx * tan(deltaPitchRad)).roundToInt()
-            val rawCropY = StripRoiGeometry.NOMINAL_CROP_Y_PX - deltaYPx
+            val rawCropY = floatState.rawCropYFloat.roundToInt()
             val clampedCropY = rawCropY.coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX)
             val isClamped = rawCropY < 0 || rawCropY > StripRoiGeometry.MAX_CROP_Y_PX
 

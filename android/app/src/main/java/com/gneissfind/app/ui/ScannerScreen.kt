@@ -111,10 +111,28 @@ fun computePanoramicViewportTransform(
     viewportHeightPx: Float,
     cropY: Int,
     swathTileMode: SwathTileMode
+): PanoramicViewportTransform = computePanoramicViewportTransform(
+    viewportWidthPx = viewportWidthPx,
+    viewportHeightPx = viewportHeightPx,
+    cropYFloat = cropY.toFloat(),
+    swathTileMode = swathTileMode
+)
+
+/**
+ * Computes continuous sub-pixel optical mapping from `1920x1080` landscape sensor coordinates into
+ * the panoramic LCARS viewport slot so 120 Hz GPU `PreviewView.translationY` and the Compose strip
+ * overlay stay registered without integer quantization jumps.
+ */
+fun computePanoramicViewportTransform(
+    viewportWidthPx: Float,
+    viewportHeightPx: Float,
+    cropYFloat: Float,
+    swathTileMode: SwathTileMode
 ): PanoramicViewportTransform {
     val vw = max(1f, viewportWidthPx)
     val vh = max(1f, viewportHeightPx)
-    val clampedCropY = cropY.coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX)
+    val maxCropY = StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+    val clampedCropY = cropYFloat.coerceIn(0f, maxCropY)
 
     // Always fill 100% of the panoramic horizontal viewport width (zero side letterbox bars)
     // unless the container is taller than 16:9 (e.g. square desktop window), in which case fit height.
@@ -134,7 +152,7 @@ fun computePanoramicViewportTransform(
     val frameTop = if (renderedH <= vh) {
         (vh - renderedH) * 0.5f
     } else {
-        val travelFraction = clampedCropY.toFloat() / StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+        val travelFraction = clampedCropY / maxCropY
         val desiredStripTop = if (stripH <= vh) {
             travelFraction * (vh - stripH)
         } else {
@@ -164,7 +182,8 @@ fun computePanoramicViewportTransform(
 /**
  * Hardware-clipped Android [FrameLayout] wrapper that confines CameraX [PreviewView]'s underlying
  * [android.view.TextureView] strictly inside the panoramic LCARS viewport bounds (`[0..vw] x [0..vh]`),
- * preventing camera pixels from ever bleeding behind the `4.dp` black gutters of the lower deck.
+ * applying 120 Hz EIS pitch stabilization via GPU RenderNode `previewView.translationY` instead of
+ * expensive per-frame View `requestLayout()` passes.
  */
 private class ClippingCameraViewportContainer(context: Context) : FrameLayout(context) {
     val previewView: PreviewView = PreviewView(context).apply {
@@ -173,8 +192,10 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         isSoundEffectsEnabled = false
     }
 
-    private var currentCropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX
+    private var currentCropYFloat: Float = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat()
     private var currentSwathMode: SwathTileMode = SwathTileMode.FIVE_TILE
+    private var lastMeasuredViewportW: Int = -1
+    private var lastMeasuredViewportH: Int = -1
 
     init {
         clipChildren = true
@@ -193,32 +214,43 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         )
     }
 
-    fun updateStabilizationState(cropY: Int, swathTileMode: SwathTileMode) {
-        if (currentCropY != cropY || currentSwathMode != swathTileMode) {
-            currentCropY = cropY
-            currentSwathMode = swathTileMode
-            requestLayout()
+    fun updateStabilizationState(cropYFloat: Float, swathTileMode: SwathTileMode) {
+        currentCropYFloat = cropYFloat
+        currentSwathMode = swathTileMode
+        if (width > 0 && height > 0) {
+            val t = computePanoramicViewportTransform(
+                viewportWidthPx = width.toFloat(),
+                viewportHeightPx = height.toFloat(),
+                cropYFloat = currentCropYFloat,
+                swathTileMode = currentSwathMode
+            )
+            // Pure GPU RenderNode sub-pixel translation — zero measure/layout stalls.
+            previewView.translationY = t.frameTopPx
         }
     }
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
-        val vw = (right - left).toFloat().coerceAtLeast(1f)
-        val vh = (bottom - top).toFloat().coerceAtLeast(1f)
+        val vwInt = (right - left).coerceAtLeast(1)
+        val vhInt = (bottom - top).coerceAtLeast(1)
         val t = computePanoramicViewportTransform(
-            viewportWidthPx = vw,
-            viewportHeightPx = vh,
-            cropY = currentCropY,
+            viewportWidthPx = vwInt.toFloat(),
+            viewportHeightPx = vhInt.toFloat(),
+            cropYFloat = currentCropYFloat,
             swathTileMode = currentSwathMode
         )
-        val childLeft = t.frameLeftPx.roundToInt()
-        val childTop = t.frameTopPx.roundToInt()
-        val childRight = childLeft + t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
-        val childBottom = childTop + t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
-        previewView.measure(
-            MeasureSpec.makeMeasureSpec(childRight - childLeft, MeasureSpec.EXACTLY),
-            MeasureSpec.makeMeasureSpec(childBottom - childTop, MeasureSpec.EXACTLY)
-        )
-        previewView.layout(childLeft, childTop, childRight, childBottom)
+        if (vwInt != lastMeasuredViewportW || vhInt != lastMeasuredViewportH) {
+            lastMeasuredViewportW = vwInt
+            lastMeasuredViewportH = vhInt
+            val childLeft = t.frameLeftPx.roundToInt()
+            val childW = t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
+            val childH = t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
+            previewView.measure(
+                MeasureSpec.makeMeasureSpec(childW, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(childH, MeasureSpec.EXACTLY)
+            )
+            previewView.layout(childLeft, 0, childLeft + childW, childH)
+        }
+        previewView.translationY = t.frameTopPx
     }
 }
 
@@ -511,12 +543,12 @@ private fun PanoramicCameraViewport(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT
                         )
-                        updateStabilizationState(uiState.cropY, uiState.swathTileMode)
+                        updateStabilizationState(uiState.displayCropYFloat, uiState.swathTileMode)
                         onBindPreview(lifecycleOwner, previewView)
                     }
                 },
                 update = { container ->
-                    container.updateStabilizationState(uiState.cropY, uiState.swathTileMode)
+                    container.updateStabilizationState(uiState.displayCropYFloat, uiState.swathTileMode)
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -598,7 +630,7 @@ private fun PushBroomTripwireOverlay(
         val transform = computePanoramicViewportTransform(
             viewportWidthPx = size.width,
             viewportHeightPx = size.height,
-            cropY = uiState.cropY,
+            cropYFloat = uiState.displayCropYFloat,
             swathTileMode = uiState.swathTileMode
         )
 

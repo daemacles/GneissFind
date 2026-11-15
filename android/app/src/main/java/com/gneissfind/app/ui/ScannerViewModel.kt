@@ -1,3 +1,9 @@
+/*
+ * AndroidViewModel coordinating the live push-broom camera stream, 120 Hz IMU pitch stabilization,
+ * tile cropping, stone detection, 3D temporal voting, audio sonification, and field strip logging.
+ * Exposes immutable ScannerUiState to Compose while decoupling display-rate EIS translation from
+ * analyzer-rate inference sweeps.
+ */
 package com.gneissfind.app.ui
 
 import android.app.Application
@@ -32,6 +38,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlin.math.atan2
+import kotlin.math.roundToInt
 
 data class ScannerUiState(
     val operatingMode: OperatingMode = OperatingMode.SCAN,
@@ -55,6 +63,7 @@ data class ScannerUiState(
     val rollDeg: Float = 0f,
     val referencePitchDeg: Float = GroundPlaneRaycaster.DEFAULT_PITCH_DEGREES,
     val cropY: Int = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+    val displayCropYFloat: Float = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
     val isPitchClamped: Boolean = false,
     val verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
     val slantRangeMeters: Float = PushBroomCropper.DEFAULT_SLANT_RANGE_METERS,
@@ -103,6 +112,39 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         )
     )
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
+
+    init {
+        raycaster.onRealtimeImuPitchListener = { smoothedPitchDeg, rollDeg, refPitchDeg ->
+            _uiState.update { prev ->
+                val fy = prev.verticalFocalLengthPx
+                val floatStab = GroundPlaneRaycaster.computeStabilizedCropYFloat(
+                    currentPitchDeg = smoothedPitchDeg,
+                    referencePitchDeg = refPitchDeg,
+                    verticalFocalLengthPx = fy,
+                    eisEnabled = prev.eisPitchLockEnabled
+                )
+                val stripCenterOffsetPx = floatStab.clampedCropYFloat - StripRoiGeometry.NOMINAL_CROP_Y_PX
+                val lookPitchDeg = smoothedPitchDeg + Math.toDegrees(
+                    atan2(stripCenterOffsetPx.toDouble(), fy.toDouble())
+                ).toFloat()
+                val slantR = GroundPlaneRaycaster.computeSlantRangeForPitch(
+                    forwardPitchDeg = lookPitchDeg
+                )
+                val gsd = PushBroomCropper.computeGsdMmPerPx(slantR, prev.activeZoomRatio)
+                prev.copy(
+                    imuPitchDeg = smoothedPitchDeg,
+                    rollDeg = rollDeg,
+                    referencePitchDeg = refPitchDeg,
+                    cropY = floatStab.clampedCropYFloat.roundToInt()
+                        .coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX),
+                    displayCropYFloat = floatStab.clampedCropYFloat,
+                    isPitchClamped = floatStab.isPitchClamped,
+                    slantRangeMeters = slantR,
+                    gsdMmPerPx = gsd
+                )
+            }
+        }
+    }
 
     fun bindCamera(
         lifecycleOwner: LifecycleOwner,
@@ -227,11 +269,19 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun setEisPitchLockEnabled(enabled: Boolean) {
         raycaster.eisPitchLockEnabled = enabled
-        _uiState.update {
-            it.copy(
+        _uiState.update { prev ->
+            val floatStab = GroundPlaneRaycaster.computeStabilizedCropYFloat(
+                currentPitchDeg = prev.imuPitchDeg,
+                referencePitchDeg = prev.referencePitchDeg,
+                verticalFocalLengthPx = prev.verticalFocalLengthPx,
+                eisEnabled = enabled
+            )
+            prev.copy(
                 eisPitchLockEnabled = enabled,
-                cropY = if (enabled) it.cropY else StripRoiGeometry.NOMINAL_CROP_Y_PX,
-                isPitchClamped = if (enabled) it.isPitchClamped else false
+                cropY = floatStab.clampedCropYFloat.roundToInt()
+                    .coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX),
+                displayCropYFloat = floatStab.clampedCropYFloat,
+                isPitchClamped = floatStab.isPitchClamped
             )
         }
     }
@@ -240,8 +290,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val synced = raycaster.syncReferencePitch()
         _uiState.update {
             it.copy(
+                imuPitchDeg = synced,
                 referencePitchDeg = synced,
                 cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                displayCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
                 isPitchClamped = false
             )
         }
@@ -417,6 +469,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             )
             val audioTel = sonifier.latestTelemetry
 
+            val useLiveImuDisplay = raycaster.hasLiveImuStream
             _uiState.update { prev ->
                 prev.copy(
                     detectorStatus = activeDetector.statusSummary,
@@ -424,14 +477,23 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     rawStripDetections = filteredDetections,
                     confirmedTargets = trackerOutput.confirmedTargets,
                     speedState = trackerOutput.speedState,
-                    imuPitchDeg = poseSnapshot.forwardPitchDeg,
-                    rollDeg = poseSnapshot.rollDeg,
-                    referencePitchDeg = poseSnapshot.referencePitchDeg,
-                    cropY = poseSnapshot.cropY,
-                    isPitchClamped = poseSnapshot.isPitchClamped,
+                    imuPitchDeg = if (useLiveImuDisplay) prev.imuPitchDeg else poseSnapshot.forwardPitchDeg,
+                    rollDeg = if (useLiveImuDisplay) prev.rollDeg else poseSnapshot.rollDeg,
+                    referencePitchDeg = if (useLiveImuDisplay) prev.referencePitchDeg else poseSnapshot.referencePitchDeg,
+                    cropY = if (useLiveImuDisplay) prev.cropY else poseSnapshot.cropY,
+                    displayCropYFloat = if (useLiveImuDisplay) {
+                        prev.displayCropYFloat
+                    } else {
+                        poseSnapshot.cropY.toFloat()
+                    },
+                    isPitchClamped = if (useLiveImuDisplay) prev.isPitchClamped else poseSnapshot.isPitchClamped,
                     verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx,
-                    slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
-                    gsdMmPerPx = centerGsdMmPerPx,
+                    slantRangeMeters = if (useLiveImuDisplay) prev.slantRangeMeters else poseSnapshot.centerSlantRangeMeters,
+                    gsdMmPerPx = if (useLiveImuDisplay) {
+                        PushBroomCropper.computeGsdMmPerPx(prev.slantRangeMeters, activeZoom)
+                    } else {
+                        centerGsdMmPerPx
+                    },
                     sweepLatencyMs = inferenceResult.totalSweepLatencyMs,
                     rollingLatencyMs = inferenceResult.rollingAvgLatencyMs,
                     sweepHz = smoothedSweepHz,

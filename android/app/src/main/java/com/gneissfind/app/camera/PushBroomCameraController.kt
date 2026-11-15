@@ -1,3 +1,9 @@
+/*
+ * CameraX + Camera2Interop controller for the landscape push-broom camera pipeline.
+ * Binds Preview and YUV_420_888 ImageAnalysis to the activity lifecycle, enforces the shutter-speed
+ * clamp with floating ISO servoing and lossless sensor zoom crop, and reports per-frame exposure and
+ * calibrated focal-length telemetry to ScannerViewModel.
+ */
 package com.gneissfind.app.camera
 
 import android.content.Context
@@ -75,6 +81,8 @@ class PushBroomCameraController(
     private var sensorIsoRange: Range<Int> = Range(100, 6400)
     private var sensorExposureRangeNs: Range<Long> = Range(100_000L, 100_000_000L)
     private var activeArraySize: Rect? = null
+    private var hardwareMaxZoomRatio: Float = 8.0f
+    private var lastAppliedZoomRatio: Float = -1.0f
 
     @Volatile
     var targetSurfaceRotation: Int = Surface.ROTATION_90
@@ -240,8 +248,10 @@ class PushBroomCameraController(
             imageAnalysis
         )
         boundCamera = camera
+        lastAppliedZoomRatio = -1.0f
 
-        // Query hardware ISO, exposure & sensor array dimensions via Camera2CameraInfo
+        // Query hardware ISO, exposure, max digital zoom & sensor array dimensions synchronously
+        // via Camera2CameraInfo so initial 2.0x zoom never races CameraX's uninitialized zoomState.
         runCatching {
             val chars = Camera2CameraInfo.from(camera.cameraInfo)
             chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let {
@@ -250,40 +260,46 @@ class PushBroomCameraController(
             chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let {
                 sensorExposureRangeNs = it
             }
+            chars.getCameraCharacteristic(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.let {
+                if (it > 1.0f) hardwareMaxZoomRatio = it
+            }
             activeArraySize = chars.getCameraCharacteristic(
                 CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE
             )
         }
 
         // Immediately apply default 2.0x lossless sensor crop + <= 1/500s shutter clamp
-        applyZoomAndExposureControls()
+        applyZoomAndExposureControls(forceZoomUpdate = true)
     }
 
     fun setShutterClamp(enabled: Boolean) {
         shutterClampEnabled = enabled
-        applyZoomAndExposureControls()
+        applyZoomAndExposureControls(forceZoomUpdate = false)
     }
 
     fun setExposureBiasEv(ev: Float) {
         exposureBiasEv = ev.coerceIn(MIN_CANOPY_EV_BIAS, MAX_CANOPY_EV_BIAS)
-        applyZoomAndExposureControls()
+        applyZoomAndExposureControls(forceZoomUpdate = false)
     }
 
     fun setTwoXSensorCrop(enabled: Boolean) {
         twoXCropEnabled = enabled
-        applyZoomAndExposureControls()
+        applyZoomAndExposureControls(forceZoomUpdate = true)
     }
 
-    private fun applyZoomAndExposureControls() {
+    private fun applyZoomAndExposureControls(forceZoomUpdate: Boolean = false) {
         val camera = boundCamera ?: return
         val targetZoom = if (twoXCropEnabled) 2.0f else 1.0f
         val zoomState = camera.cameraInfo.zoomState.value
-        val clampedZoom = if (zoomState != null) {
-            targetZoom.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
-        } else {
-            targetZoom
+        val minZoom = zoomState?.minZoomRatio?.takeIf { it > 0f } ?: 1.0f
+        // CameraX initializes zoomState.maxZoomRatio to 1.0f before session open; fall back to
+        // CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM until zoomState populates.
+        val maxZoom = zoomState?.maxZoomRatio?.takeIf { it > 1.01f } ?: hardwareMaxZoomRatio
+        val clampedZoom = targetZoom.coerceIn(minZoom, maxZoom.coerceAtLeast(minZoom))
+        if (forceZoomUpdate || kotlin.math.abs(clampedZoom - lastAppliedZoomRatio) > 0.01f) {
+            lastAppliedZoomRatio = clampedZoom
+            camera.cameraControl.setZoomRatio(clampedZoom)
         }
-        camera.cameraControl.setZoomRatio(clampedZoom)
         latestTelemetry = latestTelemetry.copy(
             activeZoomRatio = clampedZoom,
             verticalFocalLengthPx = fallbackVerticalFocalLengthPx(clampedZoom)
