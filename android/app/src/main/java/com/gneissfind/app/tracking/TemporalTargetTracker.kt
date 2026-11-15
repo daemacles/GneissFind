@@ -1,3 +1,15 @@
+/*
+ * Temporal target tracking: turns single-sweep stone detections into stable, confirmed targets.
+ *
+ * Pipeline position (called once per sweep by ScannerViewModel):
+ *   PushBroomCropper (strip detections, cross-tile NMS)
+ *     -> GroundPlaneRaycaster (each detection placed in world coordinates)
+ *     -> TemporalTargetTracker (this file: N-of-M voting + walking-speed check)
+ *     -> MetalDetectorSonifier (audio pings) and the LCARS UI (reticles)
+ *
+ * Defines the tracker's input type [ProjectedCandidate], its output type [TrackerSweepOutput],
+ * and [TemporalTargetTracker] itself.
+ */
 package com.gneissfind.app.tracking
 
 import com.gneissfind.app.model.ConfirmedTarget
@@ -7,7 +19,17 @@ import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.WorldPoint3D
 
 /**
- * Candidate stone observation projected into 3D ground coordinates for a single sweep.
+ * One detection from the current sweep after [GroundPlaneRaycaster] has placed it in the world.
+ * This is the tracker's unit of input.
+ *
+ * @property stripDetection The detection in push-broom strip pixel coordinates, with class and
+ *   confidence. Its box is passed through to [ConfirmedTarget] so the UI can draw it.
+ * @property worldPosition Where the detection's ray meets the ground, in world coordinates
+ *   (meters; y is vertical, as in [GroundPlaneRaycaster]). The tracker compares these positions to
+ *   decide whether two detections are the same stone.
+ * @property slantRangeMeters Straight-line camera-to-stone distance, in meters.
+ * @property refinedDiameterMm Stone size estimate in millimeters: the detection box's longer side
+ *   (px) times the ground sample distance (mm/px) at this stone's range (see ScannerViewModel).
  */
 data class ProjectedCandidate(
     val stripDetection: StripDetection,
@@ -17,7 +39,12 @@ data class ProjectedCandidate(
 )
 
 /**
- * Output of a single sweep update in [TemporalTargetTracker].
+ * What [TemporalTargetTracker.updateSweep] reports after each sweep.
+ *
+ * @property confirmedTargets Tracks currently at or above the vote threshold, strongest first
+ *   (most votes, then highest smoothed confidence). Empty when nothing is confirmed.
+ * @property speedState The user's horizontal walking speed and whether it exceeds the limit.
+ * @property totalCandidateTracks Number of tracks alive after this sweep, confirmed or not.
  */
 data class TrackerSweepOutput(
     val confirmedTargets: List<ConfirmedTarget>,
@@ -26,13 +53,26 @@ data class TrackerSweepOutput(
 )
 
 /**
- * World-locked multi-frame spatial voter & ARCore/VIO walk-speed gate:
- *  - Maintains a rolling window of `M = 6` sweeps (`windowSize = 6`).
- *  - Associates detections falling within a `40 mm` (`0.040 m`) 3D ground radius.
- *  - Promotes a candidate stone to [ConfirmedTarget] ONLY after `N >= 3` hits within the rolling
- *    6-sweep window (`3-of-6` temporal voting).
- *  - Monitors horizontal ground translation speed `v_xy`: triggers [ScanSpeedState.SpeedWarning]
- *    (`"SLOW SWEEP"`) whenever `v_xy > 1.10 m/s`.
+ * Turns noisy per-sweep detections into confirmed stone targets by requiring each stone to be
+ * re-detected at the same place on the ground in several recent sweeps ("N-of-M voting",
+ * AGENTS.md §5). Also classifies the user's walking speed against the over-speed limit that
+ * drives the "SLOW SWEEP" warning.
+ *
+ * State: a list of tracks, one per suspected stone. Each track remembers its smoothed world
+ * position, class, confidence, diameter, latest strip box, and the recent sweeps it was seen in.
+ * A track that stops being re-detected ages out on its own once its votes leave the window.
+ *
+ * Votes are counted in sweeps, not seconds, so the window's wall-clock length depends on the
+ * sweep rate.
+ *
+ * Thread safety: [updateSweep] and [reset] are synchronized on this instance.
+ *
+ * @param minVotesToConfirm N: hits within the window needed for a track to be reported as confirmed.
+ * @param rollingWindowSweeps M: how many of the most recent sweeps count toward votes.
+ * @param clusterRadiusMeters Maximum 3D world-space distance (m) at which a detection and an
+ *   existing track are treated as the same stone.
+ * @param maxWalkSpeedMps Horizontal speed (m/s) above which [updateSweep] reports
+ *   [ScanSpeedState.SpeedWarning].
  */
 class TemporalTargetTracker(
     private val minVotesToConfirm: Int = DEFAULT_MIN_VOTES,
@@ -40,6 +80,17 @@ class TemporalTargetTracker(
     private val clusterRadiusMeters: Float = DEFAULT_CLUSTER_RADIUS_METERS,
     private val maxWalkSpeedMps: Float = MAX_SWEEP_SPEED_MPS
 ) {
+    /**
+     * Mutable state for one suspected stone. Internal; copied into a [ConfirmedTarget] for output.
+     *
+     * - [stoneClass] never changes after creation: detections only match tracks of their own class.
+     * - [worldPosition], [smoothedConfidence] and [smoothedDiameterMm] are exponential moving
+     *   averages over the track's hits.
+     * - The strip box (`stripLeftPx`..`stripBottomPx`) and [slantRangeMeters] are copied from
+     *   the latest hit, not smoothed.
+     * - [hitSweepIds] holds the sweep numbers in which this track was matched, oldest first, at
+     *   most one per sweep. Its size is the track's vote count.
+     */
     private class TrackEntry(
         val trackId: Long,
         var stoneClass: StoneClass,
@@ -55,19 +106,37 @@ class TemporalTargetTracker(
         val hitSweepIds: ArrayDeque<Long> = ArrayDeque()
     )
 
+    /** All live tracks, confirmed or not. */
     private val activeTracks = ArrayList<TrackEntry>()
+
+    /** Id for the next new track. Never reset, so ids stay unique for this tracker's lifetime. */
     private var nextTrackId = 1L
+
+    /** Number of the most recent sweep; incremented at the start of each [updateSweep]. */
     private var currentSweepSeq = 0L
 
+    /** Previous camera position and its timestamp; used only by [computeHorizontalSpeedFromPose]. */
     private var prevCameraPos: WorldPoint3D? = null
     private var prevPoseTimestampNs: Long = 0L
 
     /**
-     * Updates world-locked spatial clusters for a new push-broom sweep.
+     * Processes one sweep: matches its detections to tracks, ages out old votes, and returns the
+     * currently confirmed targets and the walking-speed state.
      *
-     * @param candidates Raycasted strip detections for this sweep (already post-NMS and confuser-filtered).
-     * @param currentSpeedMps Instantaneous horizontal ground speed `v_xy` in m/s (if `null`, computed
-     *   directly from consecutive [cameraWorldPos] and [timestampNs]).
+     * Call exactly once per sweep, including sweeps with no detections. Votes age by sweep count,
+     * so skipped calls make old votes last longer.
+     *
+     * @param candidates This sweep's detections in world coordinates, already merged across tiles
+     *   and filtered upstream. Candidates whose class is not [StoneClass.isUserAlertable] are
+     *   ignored here as well.
+     * @param timestampNs Capture time of the sweep's camera frame, in nanoseconds. Recorded on
+     *   every track this sweep updates, and used for pose-derived speed.
+     * @param cameraWorldPos Camera position in world coordinates (m). Used only when
+     *   [currentSpeedMps] is null.
+     * @param currentSpeedMps Horizontal walking speed in m/s, if the caller already has it
+     *   (ScannerViewModel passes the pose tracker's speed). If null, speed is estimated from the
+     *   change in [cameraWorldPos] since the previous call.
+     * @return Confirmed targets, speed state and live-track count; see [TrackerSweepOutput].
      */
     @Synchronized
     fun updateSweep(
@@ -87,14 +156,18 @@ class TemporalTargetTracker(
             ScanSpeedState.Normal(measuredSpeedMps)
         }
 
-        // 2. Evict expired sweep votes outside the rolling 6-sweep window
+        // 2. Drop votes older than the rolling window
         for (track in activeTracks) {
             while (track.hitSweepIds.isNotEmpty() && track.hitSweepIds.first() < minValidSweepId) {
                 track.hitSweepIds.removeFirst()
             }
         }
 
-        // 3. Match incoming 3D candidates within 40 mm (0.040 m) spatial radius
+        // 3. Associate candidates with tracks. Greedy nearest neighbor in input order: each
+        //    candidate claims the closest unclaimed same-class track within clusterRadiusMeters,
+        //    otherwise it starts a new track. An earlier candidate can therefore claim a track
+        //    that a later candidate was closer to.
+        // Tracks already claimed this sweep, so that each track gets at most one vote per sweep.
         val matchedTrackIdsThisSweep = HashSet<Long>(candidates.size)
 
         for (cand in candidates) {
@@ -117,7 +190,9 @@ class TemporalTargetTracker(
 
             if (bestTrack != null) {
                 matchedTrackIdsThisSweep.add(bestTrack.trackId)
-                // Exponential moving average smoothing of 3D ground coordinate, confidence, and metric diameter
+                // Exponential moving average of world position, confidence and diameter.
+                // RATIONALE-UNKNOWN: how were these smoothing weights chosen? Not recorded in
+                // AGENTS.md or docs/.
                 bestTrack.worldPosition = WorldPoint3D(
                     xMeters = bestTrack.worldPosition.xMeters * 0.65f + cand.worldPosition.xMeters * 0.35f,
                     yMeters = bestTrack.worldPosition.yMeters * 0.65f + cand.worldPosition.yMeters * 0.35f,
@@ -135,6 +210,9 @@ class TemporalTargetTracker(
                     bestTrack.hitSweepIds.addLast(sweepId)
                 }
             } else {
+                // No match: start a new track with this detection as its first vote. It is marked
+                // as claimed, so a second same-class candidate within the radius in this sweep
+                // starts its own track instead of adding a second vote.
                 val newId = nextTrackId++
                 matchedTrackIdsThisSweep.add(newId)
                 val entry = TrackEntry(
@@ -155,10 +233,11 @@ class TemporalTargetTracker(
             }
         }
 
-        // 4. Prune stale tracks with zero hits remaining in the rolling 6-sweep window
+        // 4. Remove tracks that have no votes left in the window
         activeTracks.removeAll { it.hitSweepIds.isEmpty() }
 
-        // 5. Promote tracks meeting N-of-M (3-of-6) spatial votes
+        // 5. Report every track with at least minVotesToConfirm votes. Confirmation is not
+        //    latched: a track drops out of the output when its votes age below the threshold.
         val confirmed = activeTracks
             .filter { it.hitSweepIds.size >= minVotesToConfirm }
             .map { track ->
@@ -190,6 +269,10 @@ class TemporalTargetTracker(
         )
     }
 
+    /**
+     * Forgets all tracks, the sweep counter, and the previous camera pose, e.g. when scanning
+     * restarts. Track ids keep counting up, so ids from before the reset are never reused.
+     */
     @Synchronized
     fun reset() {
         activeTracks.clear()
@@ -198,6 +281,18 @@ class TemporalTargetTracker(
         prevPoseTimestampNs = 0L
     }
 
+    /**
+     * Estimates horizontal walking speed (m/s) from the camera's movement since the previous call.
+     * Horizontal means the x-z plane, because y is vertical in the world frame.
+     *
+     * Side effect: stores [cameraWorldPos] and [timestampNs] as the previous pose for the next call.
+     * Called only when [updateSweep] gets no speed from the caller, so the stored pose can be old.
+     * The time-gap guard below discards such stale pairs.
+     *
+     * @return Speed in m/s, or 0 when it cannot be estimated: no position, first call, timestamps
+     *   not increasing, or a time gap outside the accepted range. 0 therefore means either
+     *   "standing still" or "unknown".
+     */
     private fun computeHorizontalSpeedFromPose(
         cameraWorldPos: WorldPoint3D?,
         timestampNs: Long
@@ -218,9 +313,19 @@ class TemporalTargetTracker(
     }
 
     companion object {
+        /** Default N for N-of-M voting (AGENTS.md §5: default 3 of 6 sweeps). */
         const val DEFAULT_MIN_VOTES = 3
+
+        /** Default M for N-of-M voting (AGENTS.md §5). */
         const val DEFAULT_WINDOW_SWEEPS = 6
-        const val DEFAULT_CLUSTER_RADIUS_METERS = 0.040f // 40 mm 3D radius
-        const val MAX_SWEEP_SPEED_MPS = 1.10f            // 1.1 m/s speed gate
+
+        /**
+         * Default association radius in meters, in 3D world space.
+         * RATIONALE-UNKNOWN: how was this radius chosen? Not specified in AGENTS.md or docs/.
+         */
+        const val DEFAULT_CLUSTER_RADIUS_METERS = 0.040f
+
+        /** Walking speed (m/s) above which the "SLOW SWEEP" warning is raised (AGENTS.md §5). */
+        const val MAX_SWEEP_SPEED_MPS = 1.10f
     }
 }

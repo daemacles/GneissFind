@@ -68,3 +68,14 @@ Minimum target stone size: **`20 mm`**. Model outputs 5 classes (`0..3` active p
 Never combine the `RTX 4090` and `RTX 4000 Ada` cards in synchronous PyTorch `DDP` (prevents straggler bottlenecks):
 - **`GPU 0` (`RTX 4090 24GB`):** Primary `RF-DETR-Nano` student training, `RF-DETR-Large` teacher distillation, and `litert-torch` 2-graph `.tflite` export.
 - **`GPU 1 & GPU 2` (`2x RTX 4000 Ada 20GB`):** Parallel `SAM 2` video mask propagation on salted-bar captures, Copy-Paste synthetic compositing onto empty PNW hard-negative gravel frames, and evaluation sweeps.
+
+---
+
+## 7. Code Comments (Purpose-First Documentation)
+Full standard with examples: **`docs/COMMENTING.md`**. Read it before writing or editing comments. Core rules:
+- **Reader:** an experienced engineer who can read any language but should not have to read function bodies to understand purpose. No explanations of language features; no analogies to other languages.
+- **Required:** a header on every file; a doc comment on every non-trivial type (purpose, state, lifecycle, threading); a doc comment on every non-trivial function (one-line purpose, each parameter with units/coordinate frame/valid range/meaning of `null`, return value, plus side effects, failure behavior, and calling contract where present/non-obvious). Omit `"None"` boilerplate on pure, infallible, unrestricted helpers. `override` and trait-impl methods inherit interface docs; add only implementation-specific behavior or constraints. Test files need a file header and scenario/invariant comments, not full function contracts on self-explanatory `@Test`s.
+- **Prohibited:** restating the code; copying constant values into prose (link the constant instead); change history; spec slogans.
+- **Never invent rationale:** cite the source (`AGENTS.md §N`, `docs/…`), derive it from the code, or write `RATIONALE-UNKNOWN: <question>`.
+- **Keep comments true:** any code change updates the comments describing it in the same edit.
+- **Retrofitting existing code:** use the `annotate-code` skill (`.agents/skills/annotate-code/`). Change comments only, and verify with its `comment_diff_check.py`.
