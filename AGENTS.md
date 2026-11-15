@@ -2,76 +2,65 @@
 
 ## 1. Project Identity & Monorepo Layout
 - **Project Name:** `GneissFind` ("Visual Metal Detector" for PNW rockhounding)
-- **Android Application ID / Namespace:** `com.gneissfind.app` (primary domain: `gneissfind.com`; `gneissfind.net` reserved for future model CDN/telemetry)
-- **Target Hardware:** Google Pixel 10 Pro (Android 16, flagship GPU + Tensor G5)
-- **Training Workstation:** Ubuntu 26.10 on Dell Precision T7920 (96 GB RAM, 2x 24-core Xeon Platinum, `1x RTX 4090 24GB` + `2x RTX 4000 Ada 20GB`)
+- **Android Application ID / Namespace:** `com.gneissfind.app` (`gneissfind.com` primary; `gneissfind.net` reserved)
+- **Validated Target Hardware:** Google Pixel 10 Pro XL (Android 16, flagship GPU + Tensor G5)
+- **Training Workstation:** Ubuntu 26.10 on Dell Precision T7920 (96 GB RAM, 2x 24-core Xeon Platinum, `GPU 0: RTX 4090 24GB`, `GPU 1 & 2: 2x RTX 4000 Ada 20GB`)
 - **Repository Structure:**
-  - `android/` — Native Kotlin + Jetpack Compose app (`minSdk = 34`, `targetSdk = 36`), CameraX + `Camera2Interop`, ARCore VIO, LiteRT GPU FP16 inference, Classic 2360s TNG LCARS UI.
-  - `ml-pipeline/` — Python (`uv` / Docker) pipeline for `SAM 2` video auto-labeling, hard-negative Copy-Paste augmentation, `RF-DETR` training, and 2-graph `litert-torch` `.tflite` export.
-  - `docs/` — Milestone roadmap, acceptance criteria, and field test protocols.
-  - `.agents/rules/` — Scoped engineering rules for Camera/AR/IMU (`android-camera-ar.md`) and LCARS UI (`lcars-ui.md`).
+  - `android/` — Native Kotlin + Jetpack Compose app (`minSdk = 34`, `targetSdk = 36`), CameraX + `Camera2CameraControl`, 120 Hz RenderNode IMU EIS, LiteRT GPU FP16 inference, Classic 2360s TNG LCARS UI.
+  - `ml-pipeline/` — Python (`uv`) pipeline for `RF-DETR-Nano` LiteRT export/benchmarking, `SAM 2` video auto-labeling, hard-negative Copy-Paste augmentation, and PNW stone fine-tuning.
+  - `docs/ROADMAP.md` — Forward-looking milestones and acceptance criteria.
+  - `docs/ENGINEERING_LEDGER.md` — **Canonical append-only hardware & postmortem ledger.** Read before touching camera/UI/inference code; append milestone findings and commit hashes upon milestone completion.
+  - `scripts/pack_context.sh` — Context sync bundler (`/tmp/gneissfind-sync.md`) for external architecture reviews.
 
 ---
 
-## 2. Git Workflow Mandate (Test-Gated Atomic Commits)
-- **Mandatory Rule:** Whenever you complete a functional change in code, first verify that it compiles cleanly without error and passes unit tests:
-  - For `android/` changes: run `./gradlew -p android assembleDebug testDebugUnitTest`
-  - For `ml-pipeline/` changes: run `pytest` (or syntax/smoke check if tests are being bootstrapped)
-- **Immediate Atomic Commit:** Once compilation and tests pass, immediately stage the relevant files and create a Git commit with a **brief, single-sentence imperative description** of the functional change (e.g., `git commit -m "Add 5-tile landscape push-broom cropper with IMU pitch stabilization"`).
-- **Never Commit:** Broken builds, `build/` directories, `.gradle/`, `local.properties`, raw field video captures, or large model binaries (`.pt`, `.pth`, `.onnx`, `.tflite` > 10 MB) unless explicitly tracked via Git LFS. Ensure `.gitignore` enforces this.
+## 2. Git & Ledger Workflow Mandate (Test-Gated Atomic Commits)
+- **Test Before Commit:** Every functional code change MUST compile cleanly and pass unit tests before committing:
+  - `android/`: `./gradlew -p android assembleDebug testDebugUnitTest`
+  - `ml-pipeline/`: `pytest` (using `uv run pytest`)
+- **Immediate Atomic Commit:** Stage relevant files and commit with a **single-sentence imperative summary** (e.g., `git commit -m "Wire LiteRT GPU RF-DETR-Nano detector with COCO proxy mapping"`).
+- **Ledger Sync:** At the close of each milestone, append benchmark numbers, hardware discoveries, and commit hashes to `docs/ENGINEERING_LEDGER.md` and run `./scripts/pack_context.sh`.
+- **Never Commit:** `build/`, `.gradle/`, `.venv/`, `local.properties`, raw field captures, or model weights (`*.pt`, `*.pth`, `*.onnx`, `*.tflite` > 10 MB) unless tracked via Git LFS or explicitly ignored with a reproducible export command in `ml-pipeline/`.
 
 ---
 
-## 3. Locked Optical & Push-Broom Geometry (Landscape v2)
-- **Screen Orientation:** Reversible landscape (`android:screenOrientation="sensorLandscape"` supporting both `Surface.ROTATION_90` and `Surface.ROTATION_270`) so the user can hold the Pixel 10 Pro with the camera bar + clip-on Circular Polarizer (CPL) filter free of hand occlusion, while maximizing horizontal sensor usage.
-- **Split-Screen Non-Occluding Layout:**
-  - **Top ~48% of screen:** Live wide camera viewport + stabilized push-broom strip overlay, seam markers, target reticles, and pitch-travel gauge.
-  - **Bottom ~52% of screen:** Persistent Classic 2360s TNG LCARS tactical control deck on pure `#000000` OLED canvas. **Zero modal bottom sheets or floating cards may ever cover the live camera feed.**
-- **Camera Sensor & Stream:**
-  - Rear 50 MP Main Wide camera (`f/1.68`) with **`2.0x` lossless in-sensor center crop (`ZoomRatio = 2.0f` / `SCALER_CROP_REGION`) DEFAULTED TO ON (`true`)** at startup.
-  - CameraX `ImageAnalysis` configured for `1920x1080` (`YUV_420_888`, `STRATEGY_KEEP_ONLY_LATEST`) in landscape buffer coordinates.
-  - `Camera2Interop` shutter clamp: **<= 1/500 s (`<= 2,000,000 ns`)** DEFAULTED TO ON (`true`) with floating ISO + Canopy EV bias control (`-2.0 EV` to `+1.0 EV`) to eliminate motion blur under overcast PNW skies and tree canopy.
-- **5-Tile Cross-Track Swath Packing (`1792 x 384 px`):**
-  - Default **5-TILE mode**: 5 horizontally overlapping `384 x 384` native-resolution patches with `32 px` seam overlap (`stride = 352 px`), spanning `1792 x 384 px` (`93.3%` of horizontal `1920 px` frame width, `x_left = [64, 416, 768, 1120, 1472]`).
-  - Optional **3-TILE fast mode** toggle (`1088 x 384 px`, `x_left = [416, 768, 1120]`) for higher sweep rate testing.
-  - At nominal `45 deg` pitch from waist height (`h ~ 1.06 m`, slant range `R ~ 1.50 m`) with `2.0x` crop ON: cross-track swath is `~1.05 m` wide x `~0.25 m` deep at `~0.59 mm/px` GSD (`20 mm` minimum target stone = `~34 px`).
-- **IMU-Driven ROI Pitch Stabilization (Software EIS):**
-  - Uses `Sensor.TYPE_GAME_ROTATION_VECTOR` (magnetometer-free, immune to magnetic basalt) remapped via `SensorManager.remapCoordinateSystem` for `ROTATION_90` and `ROTATION_270`.
-  - Dynamically shifts the strip's vertical top coordinate `cropY` inside `[0, 696]` (`1080 - 384 = 696`, nominal center `cropY = 348` at `45 deg` reference pitch or user `"SYNC PITCH"` setpoint) using vertical pixel focal length `fy` (`deltaY = fy * tan(pitch - refPitch)`), keeping the strip pointed at the same `~1.50 m` ground patch despite wrist pitch wobble (`~ +/-7 deg` stabilization authority).
-  - When `cropY` hits `0` or `696`, clamp cleanly and illuminate an LCARS `"PITCH LIMIT"` warning pill.
+## 3. Hardware-Validated Android Invariants (DO NOT REGRESS)
+1. **`PreviewView` Unconditional Child Layout (`fc80785`):** `ClippingCameraViewportContainer` MUST run standard `onMeasure` and unconditional `onLayout` child sizing so CameraX's asynchronous internal `TextureView` never starves at `0x0`. Drive 120 Hz IMU EIS strictly via `previewView.translationY = t.frameTopPx` on the RenderNode.
+2. **Dynamic-Only `Camera2CameraControl` Exposure (`fc80785`):** NEVER attach static AE request options (`CONTROL_AE_MODE_OFF`, `SENSOR_EXPOSURE_TIME`, `SENSOR_SENSITIVITY`) to `Camera2Interop.Extender` (`ALWAYS_OVERRIDE`). Keep only `setSessionCaptureCallback` on `Camera2Interop.Extender` and apply/clear `<= 1/500 s` shutter clamp + EV-scaled auto-ISO exclusively via `Camera2CameraControl`.
+3. **Cold-Start `2.0x` Zoom Bound (`fc80785`):** Query `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` synchronously via `Camera2CameraInfo` right after `bindToLifecycle` so cold-start `2.0x` lossless sensor crop never clamps to `1.0x`.
+4. **6-Role LCARS Semantic Color Taxonomy (`8707282`):** Preserve `LcarsSemanticColors` (`valueStepDelta = 0.05f`), left-side `LcarsPitchTravelGauge`, single-action controls, high-water-mark telemetry widths, silent UI chrome (`isSoundEffectsEnabled = false`), and the inline `LcarsSourceDrawerOverlay` (`SRC` drawer).
 
 ---
 
-## 4. Target Taxonomy (PNW Gravel Bars & Beaches)
-Minimum target stone size: **`20 mm`**. Model outputs 5 classes (`0..3` active prospect targets, `4` muted auxiliary hard negative):
-0. `chalcedony_agate` — Translucent carnelian, clear/banded agate
-1. `jasper_red_yellow` — Opaque red, yellow/mustard, and orbicular jasper
-2. `green_gem_rock` — Opaque green Dallasite breccia and nephrite jade
-3. `petrified_wood` — Silicified wood exhibiting grain or bark structure
-4. `hard_confuser` — *(Internal auxiliary negative supervision ONLY; **strictly muted in UI & audio**)* Wet orange alder leaves, iron-stained quartz, red brick/clay fragments, and specular water glints.
+## 4. Push-Broom Geometry & Target Taxonomy
+- **Landscape Stream & Swath (`sensorLandscape`):** `1920x1080` `YUV_420_888` at `2.0x` sensor crop (`0.59 mm/px` GSD at `R ~ 1.50 m`, `45 deg` pitch).
+  - `FIVE_TILE` (default): `5 x 384x384` tiles (`xOffsets = [64, 416, 768, 1120, 1472]`, `32 px` overlap, `1792x384` strip = `93.3%` width).
+  - `THREE_TILE`: `3 x 384x384` tiles (`xOffsets = [416, 768, 1120]`, `1088x384` strip).
+  - Pre-allocated `PushBroomSweepBuffers`: `FloatArray(384 * 384 * 3)` RGB `[0.0..1.0]` NHWC per active tile.
+- **Production PNW Taxonomy (`TargetMineral` + `HARD_CONFUSER`):**
+  0. `CHALCEDONY_AGATE` (`01 Agate / Carnelian`)
+  1. `JASPER_RED_YELLOW` (`02 Red / Yellow Jasper`)
+  2. `GREEN_GEM_ROCK` (`03 Dallasite / Nephrite`)
+  3. `PETRIFIED_WOOD` (`04 Petrified Wood`)
+  4. `HARD_CONFUSER` *(Internal negative class; strictly muted in UI reticles & audio)*
+- **Milestone 2 Temporary COCO Stand-In Mapping (UI labels unchanged):**
+  - `CHALCEDONY_AGATE` <- COCO **`cup`**
+  - `JASPER_RED_YELLOW` <- COCO **`apple`**
+  - `GREEN_GEM_ROCK` <- COCO **`toothbrush`**
+  - `PETRIFIED_WOOD` <- COCO **`remote`**
+  - Other high-confidence COCO detections (`person`, `chair`, `tv`, `book`, `bottle`, `keyboard`, `laptop`, etc.) -> **`HARD_CONFUSER`** (muted in UI/audio to test real indoor clutter rejection).
 
 ---
 
-## 5. On-Device Inference, Speed Gate & Sonification
-- **Detector Interface (`StoneDetector`):** Pluggable Kotlin interface taking a batch/list of `384x384` RGB tiles and returning normalized tile detections merged via cross-tile Non-Maximum Suppression (NMS) in strip space (`1792x384`).
-- **Primary Model Architecture (Apache-2.0):** `RF-DETR-Nano` (`384x384`) exported as a **2-graph LiteRT GPU FP16** pipeline (Graph A backbone/encoder + Kotlin `TopK` bridge + Graph B decoder head) avoiding `GATHER_ND`/`TOPK` GPU fallback bottlenecks and avoiding Android 16 sideloaded EdgeTPU allowlist blocks. Optional `YOLO26s` single-graph GPU runner supported behind the same interface.
-- **Temporal Voting & ARCore Speed Gate:**
-  - Detections project onto ground/slant plane and accumulate N-of-M multi-frame votes (`default 3 of 6 sweeps`) before highlighting or chirping.
-  - Monitor ground speed via ARCore VIO (with IMU/optical-flow fallback when ARCore tracking initializes). Flash Mars Red `#CC4444` `"SLOW SWEEP"` warning if speed exceeds **`1.10 m/s`**.
-- **Audio Rules:**
-  - **LCARS UI button taps are SILENT** (`SoundEffectConstants` disabled on custom LCARS pills; UI sound tweaks deferred to Milestone 5).
-  - Low-latency `AudioTrack` synthesizer is strictly reserved for **stone detection pings** (ping rate `2-14 Hz` scaled to vote persistence; frequency `780 Hz` for `20-30 mm` pebbles down to `320 Hz` for `50 mm+` cobbles based on metric diameter) and the overspeed warning tone.
+## 5. Inference Performance Target & Dell T7920 GPU Split
+- **Milestone 2 Pixel 10 Pro XL Pass Floor:** `FIVE_TILE` (`5 x 384x384`) end-to-end LiteRT GPU FP16 sweep latency **`<= 125 ms/sweep` (`>= 8.0 Hz`)** with zero per-frame heap allocations causing GC stutter and 120 Hz EIS smoothness preserved.
+- **T7920 Multi-GPU Pinning (`ml-pipeline/`):** Never mix `RTX 4090` and `RTX 4000 Ada` in synchronous `DDP`:
+  - `CUDA_VISIBLE_DEVICES=0` (`RTX 4090 24GB`): `RF-DETR` training, distillation, and `litert-torch` export.
+  - `CUDA_VISIBLE_DEVICES=1,2` (`2x RTX 4000 Ada 20GB`): `SAM 2` video auto-labeling, Copy-Paste synthetic gravel generation, and evaluation sweeps.
 
 ---
 
-## 6. Dell T7920 Multi-GPU Split (`ml-pipeline/`)
-Never combine the `RTX 4090` and `RTX 4000 Ada` cards in synchronous PyTorch `DDP` (prevents straggler bottlenecks):
-- **`GPU 0` (`RTX 4090 24GB`):** Primary `RF-DETR-Nano` student training, `RF-DETR-Large` teacher distillation, and `litert-torch` 2-graph `.tflite` export.
-- **`GPU 1 & GPU 2` (`2x RTX 4000 Ada 20GB`):** Parallel `SAM 2` video mask propagation on salted-bar captures, Copy-Paste synthetic compositing onto empty PNW hard-negative gravel frames, and evaluation sweeps.
-
----
-
-## 7. Code Comments (Purpose-First Documentation)
+## 6. Code Comments (Purpose-First Documentation)
 Full standard with examples: **`docs/COMMENTING.md`**. Read it before writing or editing comments. Core rules:
 - **Reader:** an experienced engineer who can read any language but should not have to read function bodies to understand purpose. No explanations of language features; no analogies to other languages.
 - **Required:** a header on every file; a doc comment on every non-trivial type (purpose, state, lifecycle, threading); a doc comment on every non-trivial function (one-line purpose, each parameter with units/coordinate frame/valid range/meaning of `null`, return value, plus side effects, failure behavior, and calling contract where present/non-obvious). Omit `"None"` boilerplate on pure, infallible, unrestricted helpers. `override` and trait-impl methods inherit interface docs; add only implementation-specific behavior or constraints. Test files need a file header and scenario/invariant comments, not full function contracts on self-explanatory `@Test`s.
