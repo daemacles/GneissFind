@@ -59,8 +59,8 @@ enum class DetectorSourceOption(
 ) {
     LIVE_CAMERA_GPU(
         code = "S-01",
-        title = "LIVE CAM (GPU FP16)",
-        subtitle = "RF-DETR NANO TWO-GRAPH • REALTIME CAMERA",
+        title = "RF-DETR NANO GPU",
+        subtitle = "COCO PROXY • REALTIME CAMERA",
         backend = DetectorBackend.RF_DETR_NANO_GPU,
         syntheticProfile = null
     ),
@@ -96,9 +96,9 @@ enum class DetectorSourceOption(
 
 data class ScannerUiState(
     val operatingMode: OperatingMode = OperatingMode.SCAN,
-    val detectorBackend: DetectorBackend = DetectorBackend.SYNTHETIC_DEMO,
+    val detectorBackend: DetectorBackend = DetectorBackend.RF_DETR_NANO_GPU,
     val syntheticProfile: SyntheticTargetProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK,
-    val detectorStatus: String = "SYNTHETIC (MIXED GRAVEL SIM)",
+    val detectorStatus: String = "RF-DETR NANO GPU [COCO PROXY]",
     val enabledClasses: Set<StoneClass> = StoneClass.alertableClasses.toSet(),
     val swathTileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
     val shutterClampEnabled: Boolean = true,
@@ -149,7 +149,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     private val appContext = application.applicationContext
 
-    private val cropper = PushBroomCropper(applyImageNetNormalization = true)
+    private val cropper = PushBroomCropper(applyImageNetNormalization = false)
     private val sweepBuffers = PushBroomSweepBuffers()
 
     private val syntheticDetector = SyntheticStoneDetector()

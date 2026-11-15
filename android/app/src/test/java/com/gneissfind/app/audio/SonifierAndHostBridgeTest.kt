@@ -1,3 +1,8 @@
+/*
+ * Unit tests for MetalDetectorSonifier acoustic curves, RfDetrTwoGraphGpuDetector Host Top-K
+ * proposal bridge and COCO stand-in metadata mapping, reversible landscape IMU coordinate
+ * remapping, and 120 Hz EIS cropY stabilization.
+ */
 package com.gneissfind.app.audio
 
 import android.media.AudioAttributes
@@ -6,13 +11,16 @@ import com.gneissfind.app.camera.PushBroomCameraController
 import com.gneissfind.app.inference.RfDetrTwoGraphGpuDetector
 import com.gneissfind.app.logging.FieldDataLogger
 import com.gneissfind.app.logging.FieldStripMetadata
+import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripRoiGeometry
+import com.gneissfind.app.model.TileDetection
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
 import com.google.common.truth.Truth.assertThat
 import org.json.JSONObject
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
@@ -77,6 +85,101 @@ class SonifierAndHostBridgeTest {
     }
 
     @Test
+    fun cocoMetadataAndBatchedTop300Bridge_mapsStandInClassesAndConfusersAccurately() {
+        val metadataFile = listOf(
+            File("src/main/assets/rf_detr_coco_metadata.json"),
+            File("app/src/main/assets/rf_detr_coco_metadata.json")
+        ).first { it.exists() }
+        val metadata = RfDetrTwoGraphGpuDetector.parseCocoMetadataJson(metadataFile.readText())
+
+        assertThat(metadata.numQueries).isEqualTo(300)
+        assertThat(metadata.numClasses).isEqualTo(91)
+        assertThat(metadata.numEncoderTokens).isEqualTo(576)
+        assertThat(metadata.cocoClassIdToStoneClassId[47]).isEqualTo(StoneClass.CHALCEDONY_AGATE.id)
+        assertThat(metadata.cocoClassIdToStoneClassId[53]).isEqualTo(StoneClass.JASPER_RED_YELLOW.id)
+        assertThat(metadata.cocoClassIdToStoneClassId[90]).isEqualTo(StoneClass.GREEN_GEM_ROCK.id)
+        assertThat(metadata.cocoClassIdToStoneClassId[75]).isEqualTo(StoneClass.PETRIFIED_WOOD.id)
+        // Unmapped COCO classes (e.g., chair=62, book=84) route to HARD_CONFUSER (4)
+        assertThat(metadata.cocoClassIdToStoneClassId[62]).isEqualTo(StoneClass.HARD_CONFUSER.id)
+        assertThat(metadata.cocoClassIdToStoneClassId[84]).isEqualTo(StoneClass.HARD_CONFUSER.id)
+
+        // Verify batched B=5 Top-300 proposal gather on 576 tokens
+        val batchSize = 5
+        val numTokens = 576
+        val hiddenDim = 8
+        val topK = 300
+        val baseProposals = RfDetrTwoGraphGpuDetector.buildNormalizedProposalGrid(24, 24, 0.05f)
+        val encMaxScores = FloatArray(batchSize * numTokens) { 0.01f }
+        val prenorm = FloatArray(batchSize * numTokens * hiddenDim) { idx -> (idx / hiddenDim).toFloat() }
+
+        // Tile 0 top tokens: 511 (0.96), 128 (0.89); Tile 2 top token: 300 (0.94)
+        encMaxScores[0 * numTokens + 511] = 0.96f
+        encMaxScores[0 * numTokens + 128] = 0.89f
+        encMaxScores[2 * numTokens + 300] = 0.94f
+
+        val outPrenorm = FloatArray(batchSize * topK * hiddenDim)
+        val outProposals = FloatArray(batchSize * topK * 4)
+        val outIndices = IntArray(batchSize * topK)
+
+        RfDetrTwoGraphGpuDetector.selectTopKProposalsFromMaxScores(
+            encMaxScores = encMaxScores,
+            outputMemoryPrenorm = prenorm,
+            baseProposals = baseProposals,
+            batchSize = batchSize,
+            activeBatchItems = 3, // Test 3-tile zero-padding of tiles 3 and 4
+            numTokens = numTokens,
+            hiddenDim = hiddenDim,
+            topK = topK,
+            outSelectedPrenorm = outPrenorm,
+            outSelectedProposals = outProposals,
+            outSelectedIndices = outIndices
+        )
+
+        assertThat(outIndices[0]).isEqualTo(511)
+        assertThat(outIndices[1]).isEqualTo(128)
+        assertThat(outIndices[2 * topK + 0]).isEqualTo(300)
+        // Inactive tile 4 is zero-padded
+        assertThat(outProposals[4 * topK * 4]).isEqualTo(0f)
+
+        // Verify COCO batch prediction decoding across 5 tiles
+        val boxes = FloatArray(batchSize * metadata.numQueries * 4)
+        val scores = FloatArray(batchSize * metadata.numQueries * metadata.numClasses)
+
+        // Tile 0, query 0: cup (47) at center (0.5, 0.5) size (0.2, 0.2), score 0.92
+        boxes[0] = 0.5f; boxes[1] = 0.5f; boxes[2] = 0.2f; boxes[3] = 0.2f
+        scores[47] = 0.92f
+
+        // Tile 1, query 5: toothbrush (90) at center (0.25, 0.5) size (0.4, 0.1), score 0.87
+        val t1q5Box = (1 * metadata.numQueries + 5) * 4
+        val t1q5Score = (1 * metadata.numQueries + 5) * metadata.numClasses
+        boxes[t1q5Box] = 0.25f; boxes[t1q5Box + 1] = 0.5f; boxes[t1q5Box + 2] = 0.4f; boxes[t1q5Box + 3] = 0.1f
+        scores[t1q5Score + 90] = 0.87f
+
+        // Tile 2, query 1: chair (62 -> HARD_CONFUSER), score 0.95
+        val t2q1Box = (2 * metadata.numQueries + 1) * 4
+        val t2q1Score = (2 * metadata.numQueries + 1) * metadata.numClasses
+        boxes[t2q1Box] = 0.5f; boxes[t2q1Box + 1] = 0.5f; boxes[t2q1Box + 2] = 0.3f; boxes[t2q1Box + 3] = 0.3f
+        scores[t2q1Score + 62] = 0.95f
+
+        val decoded = ArrayList<TileDetection>()
+        RfDetrTwoGraphGpuDetector.decodeCocoBatchPredictions(
+            activeTileCount = 5,
+            boxesCxCyWhNorm = boxes,
+            classScores = scores,
+            metadata = metadata,
+            outDetections = decoded
+        )
+
+        assertThat(decoded).hasSize(3)
+        assertThat(decoded[0].tileIndex).isEqualTo(0)
+        assertThat(decoded[0].classId).isEqualTo(StoneClass.CHALCEDONY_AGATE.id)
+        assertThat(decoded[1].tileIndex).isEqualTo(1)
+        assertThat(decoded[1].classId).isEqualTo(StoneClass.GREEN_GEM_ROCK.id)
+        assertThat(decoded[2].tileIndex).isEqualTo(2)
+        assertThat(decoded[2].classId).isEqualTo(StoneClass.HARD_CONFUSER.id)
+    }
+
+    @Test
     fun reversibleLandscapeImuRemapping_preservesPitchAndRollAcross180DegreeFlip() {
         val remapped90 = FloatArray(9)
         val remapped270 = FloatArray(9)
@@ -86,17 +189,12 @@ class SonifierAndHostBridgeTest {
             val c = cos(theta).toFloat()
             val s = sin(theta).toFloat()
 
-            // Construct raw device rotation matrix (device -> ENU world, Row 2 = World Up) for:
-            // 1) ROTATION_90 (screen-right = +Y_dev, screen-up = -X_dev, screen-out = +Z_dev)
-            //    Level roll=0 => Up·Y_dev = 0, Up·(-X_dev) = cos(theta) => Up·X_dev = -cos(theta), Up·Z_dev = sin(theta)
             val rawRot90 = floatArrayOf(
                 0f, 1f, 0f,
                 -s, 0f, -c,
                 -c, 0f, s
             )
 
-            // 2) ROTATION_270 (screen-right = -Y_dev, screen-up = +X_dev, screen-out = +Z_dev)
-            //    Level roll=0 => Up·(-Y_dev) = 0, Up·(+X_dev) = cos(theta), Up·Z_dev = sin(theta)
             val rawRot270 = floatArrayOf(
                 0f, -1f, 0f,
                 s, 0f, -c,

@@ -1102,7 +1102,7 @@ private fun TacticalControlDeckZone(
             orientation = LcarsElbowOrientation.BottomLeft,
             color = LcarsSemanticColors.structuralChrome(LcarsValueLevel.MINUS),
             armLabel = "SYS-01",
-            stemCode = "M1B",
+            stemCode = "M2",
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .width(BottomElbowArmWidth)
@@ -1127,8 +1127,9 @@ private fun TacticalControlDeckZone(
             LcarsHeaderSegment(
                 text = String.format(
                     Locale.US,
-                    "SWEEP %.1f MS (G1 %.1f | TOPK %.1f | G2 %.1f)",
+                    "SWEEP %.1f MS • %s (G1 %.1f | TOPK %.1f | G2 %.1f)",
                     uiState.rollingLatencyMs,
+                    uiState.detectorBackend.label,
                     uiState.part1LatencyMs,
                     uiState.bridgeLatencyMs,
                     uiState.part2LatencyMs

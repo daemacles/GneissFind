@@ -1,15 +1,28 @@
+/*
+ * Core domain models for target taxonomy, push-broom strip ROI geometry, per-tile and unified
+ * strip bounding-box detections, 3D world-space track points, and operating modes.
+ *
+ * Produced by PushBroomCropper, StoneDetector, GroundPlaneRaycaster, and TemporalTargetTracker;
+ * consumed by ScannerViewModel, SpatialAudioSonifier, FieldDataLogger, and ScannerScreen.
+ */
 package com.gneissfind.app.model
 
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Locked 5-Class Target Taxonomy with Auxiliary Confuser Supervision and Anti-Camouflage Video Reticle Palette:
- *  - `0`: `chalcedony_agate` -> `#00FFFF` Electric Cyan
- *  - `1`: `jasper_red_yellow` -> `#FFFF00` High-Vis Solar Yellow
- *  - `2`: `green_gem_rock` -> `#00FF88` Spring Mint
- *  - `3`: `petrified_wood` -> `#FFAA00` Bright Amber-Gold
- *  - `4`: `hard_confuser` -> Strictly muted in normal `SCAN` UI & audio
+ * Target taxonomy classifying geological targets and hard visual confusers, paired with high-contrast
+ * reticle colors designed to remain legible over wet river gravel (AGENTS.md §2).
+ *
+ * @property id Zero-based class index matching model output and metadata mappings.
+ * @property codePrefix Two-digit LCARS numeric prefix rendered on reticles and matrix buttons.
+ * @property wireName Canonical snake_case identifier written to JSONL field logs and metadata files.
+ * @property displayName Human-readable mineral name for telemetry and accessibility.
+ * @property lcarsShortName Uppercase console label rendered inside the LCARS Prospect Matrix.
+ * @property primaryHexColor ARGB hex color (`0xAARRGGBB`) for the reticle brackets and badge.
+ * @property accentHexColor Secondary ARGB hex color (`0xAARRGGBB`) for reticle highlights.
+ * @property isUserAlertable Whether detections of this class may trigger visual reticles or audio pings
+ *   in [OperatingMode.SCAN]. False for [HARD_CONFUSER] so confusers are silently suppressed.
  */
 enum class StoneClass(
     val id: Int,
@@ -73,16 +86,24 @@ enum class StoneClass(
     );
 
     companion object {
+        /** Looks up a [StoneClass] by its integer [id], or returns `null` if out of range. */
         fun fromId(id: Int): StoneClass? = entries.firstOrNull { it.id == id }
 
+        /** Subset of classes that can produce user-visible reticles and audio pings. */
         val alertableClasses: List<StoneClass> = entries.filter { it.isUserAlertable }
     }
 }
 
 /**
- * Cross-track swath tile packing configuration on the `1920 x 1080` landscape stream.
- *  - [FIVE_TILE] (Default): `xOffsets = [64, 416, 768, 1120, 1472]` -> `1792 x 384 px` (`93.3%` width)
- *  - [THREE_TILE] (Fast Mode): `xOffsets = [416, 768, 1120]` -> `1088 x 384 px` (`56.7%` width)
+ * Horizontal tile-packing layout across the `1920 x 1080` landscape camera frame
+ * (`.agents/rules/android-camera-ar.md §2`).
+ *
+ * @property tileCount Number of horizontally overlapping square tiles per sweep.
+ * @property stripWidthPx Total horizontal span of the unified push-broom strip in pixels.
+ * @property canonicalStripLeftPx Left X offset (px) of the strip inside a `1920 px` landscape frame.
+ * @property frameXOffsets Left X offset (px) of each tile in full `1920 px` landscape frame coordinates.
+ * @property stripTileOffsets Left X offset (px) of each tile relative to [canonicalStripLeftPx].
+ * @property lcarsLabel Uppercase telemetry badge describing the active swath width.
  */
 enum class SwathTileMode(
     val tileCount: Int,
@@ -109,12 +130,22 @@ enum class SwathTileMode(
         lcarsLabel = "3-TILE 1088PX"
     );
 
+    /** Returns the alternate [SwathTileMode] when the user toggles the swath width pill. */
     fun toggled(): SwathTileMode = if (this == FIVE_TILE) THREE_TILE else FIVE_TILE
 }
 
 /**
- * Geometry of the active stabilized push-broom strip (`1792x384` or `1088x384`) inside the
- * landscape `1920x1080` camera frame.
+ * Pixel bounds of the active pitch-stabilized push-broom strip inside the upright landscape camera
+ * frame.
+ *
+ * @property uprightFrameWidth Upright landscape frame width in pixels.
+ * @property uprightFrameHeight Upright landscape frame height in pixels.
+ * @property stripLeftPx Left edge of the strip in upright landscape frame pixels.
+ * @property stripTopPx Pitch-stabilized top Y coordinate (`cropY`) in upright landscape frame pixels.
+ * @property stripWidthPx Width of the active strip in pixels.
+ * @property stripHeightPx Height of the active strip in pixels ([STRIP_HEIGHT_PX]).
+ * @property tileMode Active [SwathTileMode] (`FIVE_TILE` or `THREE_TILE`).
+ * @property isPitchClamped True when IMU pitch stabilization saturated at `0` or [MAX_CROP_Y_PX].
  */
 data class StripRoiGeometry(
     val uprightFrameWidth: Int = LANDSCAPE_FRAME_WIDTH_PX,
@@ -155,7 +186,15 @@ data class StripRoiGeometry(
 }
 
 /**
- * Raw bounding box detection inside one of the `384x384` tiles (`[0, 384]` tile-local pixels).
+ * Unmerged bounding-box prediction inside a single square tile before strip-space stitching.
+ *
+ * @property tileIndex Index of the source tile (`0 until activeTileCount`).
+ * @property classId Target class index corresponding to [StoneClass.id].
+ * @property confidence Model probability in `[0.0, 1.0]`.
+ * @property leftPx Left edge in tile-local pixels (`[0.0, 384.0]`).
+ * @property topPx Top edge in tile-local pixels (`[0.0, 384.0]`).
+ * @property rightPx Right edge in tile-local pixels (`[0.0, 384.0]`).
+ * @property bottomPx Bottom edge in tile-local pixels (`[0.0, 384.0]`).
  */
 data class TileDetection(
     val tileIndex: Int,
@@ -168,8 +207,19 @@ data class TileDetection(
 )
 
 /**
- * Bounding box mapped into unified push-broom strip coordinates (`[0..stripWidthPx] x [0..384]`),
- * plus full-frame X coordinates (`frameLeftPx`, `frameRightPx` in `[0..1920]`).
+ * Bounding-box detection mapped into unified push-broom strip coordinates (`[0..stripWidthPx] x [0..384]`)
+ * and full landscape frame X coordinates (`[0..1920]`).
+ *
+ * @property stoneClass Resolved [StoneClass] taxonomy entry.
+ * @property confidence Detection confidence score in `[0.0, 1.0]`.
+ * @property leftPx Left X coordinate in unified strip pixels.
+ * @property topPx Top Y coordinate in unified strip pixels (`[0.0, 384.0]`).
+ * @property rightPx Right X coordinate in unified strip pixels.
+ * @property bottomPx Bottom Y coordinate in unified strip pixels (`[0.0, 384.0]`).
+ * @property estimatedDiameterMm Estimated physical major-axis diameter in millimeters at the current GSD.
+ * @property sourceTileIndex Index of the highest-confidence contributing tile (`0..4`).
+ * @property frameLeftPx Left X coordinate in full `1920 px` upright landscape frame pixels.
+ * @property frameRightPx Right X coordinate in full `1920 px` upright landscape frame pixels.
  */
 data class StripDetection(
     val stoneClass: StoneClass,
@@ -190,6 +240,12 @@ data class StripDetection(
     val centerYPx: Float get() = (topPx + bottomPx) * 0.5f
     val frameCenterXPx: Float get() = (frameLeftPx + frameRightPx) * 0.5f
 
+    /**
+     * Computes standard Intersection-over-Union (`IoU`) with [other] in unified strip pixel coordinates.
+     *
+     * @param other Candidate detection in the same unified strip coordinate frame.
+     * @return Ratio `intersectionArea / unionArea` in `[0.0, 1.0]`, or `0.0` if disjoint.
+     */
     fun iouWith(other: StripDetection): Float {
         val interLeft = max(leftPx, other.leftPx)
         val interTop = max(topPx, other.topPx)
@@ -204,16 +260,61 @@ data class StripDetection(
         val unionArea = widthPx * heightPx + other.widthPx * other.heightPx - interArea
         return if (unionArea > 0f) interArea / unionArea else 0f
     }
+
+    /**
+     * Computes Intersection-over-Minimum (`IoM = intersectionArea / min(areaA, areaB)`) with [other]
+     * in unified strip pixel coordinates so a smaller tile-clipped fragment that is mostly contained
+     * inside a larger adjacent-tile box merges cleanly across a 32 px seam
+     * (`.agents/rules/android-camera-ar.md §2`).
+     *
+     * @param other Candidate detection in the same unified strip coordinate frame.
+     * @return Ratio `intersectionArea / min(areaA, areaB)` in `[0.0, 1.0]`, or `0.0` if disjoint.
+     */
+    fun iomWith(other: StripDetection): Float {
+        val interLeft = max(leftPx, other.leftPx)
+        val interTop = max(topPx, other.topPx)
+        val interRight = min(rightPx, other.rightPx)
+        val interBottom = min(bottomPx, other.bottomPx)
+
+        val interW = (interRight - interLeft).coerceAtLeast(0f)
+        val interH = (interBottom - interTop).coerceAtLeast(0f)
+        val interArea = interW * interH
+        if (interArea <= 0f) return 0f
+
+        val minArea = min(widthPx * heightPx, other.widthPx * other.heightPx)
+        return if (minArea > 0f) (interArea / minArea).coerceIn(0f, 1f) else 0f
+    }
+
+    /**
+     * Computes the 1D vertical projection overlap ratio `interH / min(heightA, heightB)` with [other]
+     * to identify horizontally adjacent fragments of an elongated object straddling a tile seam.
+     *
+     * @param other Candidate detection in the same unified strip coordinate frame.
+     * @return Vertical overlap ratio in `[0.0, 1.0]`, or `0.0` if vertically disjoint.
+     */
+    fun verticalOverlapRatioWith(other: StripDetection): Float {
+        val interTop = max(topPx, other.topPx)
+        val interBottom = min(bottomPx, other.bottomPx)
+        val interH = (interBottom - interTop).coerceAtLeast(0f)
+        if (interH <= 0f) return 0f
+        val minH = min(heightPx, other.heightPx)
+        return if (minH > 0f) (interH / minH).coerceIn(0f, 1f) else 0f
+    }
 }
 
 /**
- * 3D world-space point (in meters) in ARCore or IMU-assisted local world coordinates.
+ * 3D point in local world coordinates (meters) produced by [com.gneissfind.app.tracking.GroundPlaneRaycaster].
+ *
+ * @property xMeters Cross-track horizontal position in meters.
+ * @property yMeters Vertical position in meters (`0.0` on the estimated ground plane).
+ * @property zMeters Along-track forward position in meters.
  */
 data class WorldPoint3D(
     val xMeters: Float,
     val yMeters: Float,
     val zMeters: Float
 ) {
+    /** Returns the Euclidean 3D distance in meters between `this` point and [other]. */
     fun distanceMetersTo(other: WorldPoint3D): Float {
         val dx = xMeters - other.xMeters
         val dy = yMeters - other.yMeters
@@ -223,7 +324,21 @@ data class WorldPoint3D(
 }
 
 /**
- * Confirmed target tracked across sweeps in 3D ground coordinates.
+ * Target track confirmed by multi-frame spatial voting in [com.gneissfind.app.tracking.TemporalTargetTracker].
+ *
+ * @property trackId Monotonically increasing unique identifier assigned when the track is created.
+ * @property stoneClass Confirmed [StoneClass] taxonomy entry.
+ * @property worldPosition Smoothed 3D ground coordinate in meters.
+ * @property stripLeftPx Latest bounding-box left X coordinate in unified strip pixels.
+ * @property stripTopPx Latest bounding-box top Y coordinate in unified strip pixels.
+ * @property stripRightPx Latest bounding-box right X coordinate in unified strip pixels.
+ * @property stripBottomPx Latest bounding-box bottom Y coordinate in unified strip pixels.
+ * @property smoothedConfidence Exponentially smoothed confidence score in `[0.0, 1.0]`.
+ * @property estimatedDiameterMm Smoothed physical diameter estimate in millimeters.
+ * @property slantRangeMeters Slant range from the camera to the ground patch in meters.
+ * @property hitCountInWindow Number of sweeps within the active rolling window that matched this track.
+ * @property windowSize Rolling window length in sweeps (`M` in `N-of-M` spatial voting).
+ * @property lastUpdatedTimestampNs Sensor timestamp (`nanoseconds`) of the most recent matching sweep.
  */
 data class ConfirmedTarget(
     val trackId: Long,
@@ -244,16 +359,19 @@ data class ConfirmedTarget(
         get() = (hitCountInWindow.toFloat() / windowSize.coerceAtLeast(1)).coerceIn(0f, 1f)
 }
 
+/** User-selectable top-level operating mode on the LCARS tactical bridge. */
 enum class OperatingMode {
     SCAN,
     LOG_DATA
 }
 
+/** Active inference backend driving push-broom sweep detections. */
 enum class DetectorBackend(val label: String, val shortCode: String) {
     SYNTHETIC_DEMO("SYNTHETIC SIM", "SIM"),
     RF_DETR_NANO_GPU("RF-DETR GPU FP16", "GPU")
 }
 
+/** Walk-speed state evaluated against the maximum push-broom ground speed gate. */
 sealed interface ScanSpeedState {
     data class Normal(val currentSpeedMps: Float) : ScanSpeedState
     data class SpeedWarning(val currentSpeedMps: Float) : ScanSpeedState

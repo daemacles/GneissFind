@@ -1,3 +1,7 @@
+/*
+ * Unit tests for PushBroomCropper covering reversible landscape 5-tile/3-tile ROI extraction,
+ * 32 px seam pixel identity, and cross-tile IoU + IoM + seam-straddle union box merging.
+ */
 package com.gneissfind.app.vision
 
 import com.gneissfind.app.model.StoneClass
@@ -13,6 +17,10 @@ import java.nio.ByteBuffer
 @RunWith(JUnit4::class)
 class PushBroomCropperTest {
 
+    /**
+     * Deterministic planar `YUV_420_888` test frame whose Y plane encodes `(x * 7 + y * 13) & 0xFF`
+     * so seam overlap tests can verify bit-exact pixel alignment across tiles.
+     */
     private class FakeYuv420Frame(
         override val width: Int,
         override val height: Int,
@@ -46,7 +54,7 @@ class PushBroomCropperTest {
 
     @Test
     fun fiveTileAndThreeTileExtraction_1080pReversibleLandscape_preservesExactOffsetsAnd32PxOverlaps() {
-        val cropper = PushBroomCropper(applyImageNetNormalization = false)
+        val cropper = PushBroomCropper()
         val buffers = PushBroomSweepBuffers()
 
         // Verify locked 5-tile frame X offsets [64, 416, 768, 1120, 1472] -> 1792x384 (93.3% of 1920)
@@ -76,6 +84,10 @@ class PushBroomCropperTest {
             assertThat(geom5.stripHeightPx).isEqualTo(384)
             assertThat(buffers.activeTileCount).isEqualTo(5)
             assertThat(buffers.hasArgbPixels).isTrue()
+
+            // Verify raw [0..1] normalization is default (no CPU ImageNet double-normalization)
+            assertThat(buffers.tileRgbFloats[0][0]).isAtLeast(0.0f)
+            assertThat(buffers.tileRgbFloats[0][0]).isAtMost(1.0f)
 
             // Verify all 4 adjacent tile seams (0/1, 1/2, 2/3, 3/4) match bit-for-bit across 32px overlap
             for (tileIdx in 0 until 4) {
@@ -107,14 +119,15 @@ class PushBroomCropperTest {
     }
 
     @Test
-    fun mergeAndFilterTileDetections_fiveTileNms_deduplicatesSeams_mutesConfusers_andApplies059Gsd() {
+    fun mergeAndFilterTileDetections_fiveTileNms_fusesSeamUnion_mutesConfusers_andApplies059Gsd() {
         val cropper = PushBroomCropper()
 
-        // At 0.59 mm/px GSD (2.0x crop at R = 1.50m), 40 px = 23.6 mm (>= 20 mm), 24 px = 14.2 mm (< 20 mm)
+        // At 0.59 mm/px GSD (2.0x crop at R = 1.50m), 44 px union = 25.96 mm (>= 20 mm), 24 px = 14.16 mm (< 20 mm)
         val rawDetections = listOf(
-            // 1. 40 px Carnelian Agate straddling Tile 3 / Tile 4 overlap seam
+            // 1. Carnelian Agate straddling Tile 3 / Tile 4 overlap seam
             //    Tile 3 [344..384] -> strip [1400..1440], frame [1464..1504]
-            //    Tile 4 [0..36]    -> strip [1408..1444] (IoU = 32*40 / (1600+1440-1280) = 1280/1760 = 0.727 >= 0.45)
+            //    Tile 4 [0..36]    -> strip [1408..1444], frame [1472..1508]
+            //    Union box         -> strip [1400..1444] (44 px), frame [1464..1508], confidence = 0.93f
             TileDetection(
                 tileIndex = 3,
                 classId = StoneClass.CHALCEDONY_AGATE.id,
@@ -133,7 +146,7 @@ class PushBroomCropperTest {
                 rightPx = 36f,
                 bottomPx = 160f
             ),
-            // 2. Class 4 hard_confuser (wet orange alder leaf) with 0.99 confidence — MUST be muted!
+            // 2. Class 4 hard_confuser with 0.99 confidence — MUST be muted!
             TileDetection(
                 tileIndex = 4,
                 classId = StoneClass.HARD_CONFUSER.id,
@@ -165,9 +178,100 @@ class PushBroomCropperTest {
         val kept = merged.single()
         assertThat(kept.stoneClass).isEqualTo(StoneClass.CHALCEDONY_AGATE)
         assertThat(kept.confidence).isWithin(1e-4f).of(0.93f)
-        // Tile 3 strip offset = 3 * 352 = 1056 -> 1056 + 344 = 1400; frame offset = 1120 -> 1120 + 344 = 1464
         assertThat(kept.leftPx).isWithin(1e-3f).of(1400f)
+        assertThat(kept.rightPx).isWithin(1e-3f).of(1444f)
         assertThat(kept.frameLeftPx).isWithin(1e-3f).of(1464f)
-        assertThat(kept.estimatedDiameterMm).isWithin(0.1f).of(23.6f)
+        assertThat(kept.frameRightPx).isWithin(1e-3f).of(1508f)
+        assertThat(kept.estimatedDiameterMm).isWithin(0.1f).of(44f * 0.59f)
+    }
+
+    @Test
+    fun mergeAndFilterTileDetections_elongated300PxObjectAcrossTileSeam_fusesIntoSingleUnionBox() {
+        val cropper = PushBroomCropper()
+
+        // Simulate a 300 px wide elongated object (e.g., toothbrush -> GREEN_GEM_ROCK or remote -> PETRIFIED_WOOD)
+        // spanning strip X = [200..500] across Tile 0 [0..384] and Tile 1 [352..736] (seam [352..384]):
+        //  - Tile 0 sees [200..384] (width = 184 px, height = 48 px)
+        //  - Tile 1 sees [0..148]   -> strip [352..500] (width = 148 px, height = 48 px)
+        // Standard IoU is only 32 / 300 = 0.1067 (< 0.45) and IoM is 32 / 148 = 0.2162 (< 0.65),
+        // but both fragments straddle the [352..384] seam band with 100% vertical overlap.
+        val rawDetections = listOf(
+            TileDetection(
+                tileIndex = 0,
+                classId = StoneClass.GREEN_GEM_ROCK.id,
+                confidence = 0.81f,
+                leftPx = 200f,
+                topPx = 160f,
+                rightPx = 384f,
+                bottomPx = 208f
+            ),
+            TileDetection(
+                tileIndex = 1,
+                classId = StoneClass.GREEN_GEM_ROCK.id,
+                confidence = 0.91f,
+                leftPx = 0f,
+                topPx = 162f,
+                rightPx = 148f,
+                bottomPx = 208f
+            )
+        )
+
+        val merged = cropper.mergeAndFilterTileDetections(
+            tileDetections = rawDetections,
+            tileMode = SwathTileMode.FIVE_TILE,
+            gsdMmPerPx = PushBroomCropper.DEFAULT_GSD_MM_PER_PX
+        )
+
+        assertThat(merged).hasSize(1)
+        val unified = merged.single()
+        assertThat(unified.stoneClass).isEqualTo(StoneClass.GREEN_GEM_ROCK)
+        assertThat(unified.confidence).isWithin(1e-4f).of(0.91f)
+        assertThat(unified.leftPx).isWithin(1e-3f).of(200f)
+        assertThat(unified.rightPx).isWithin(1e-3f).of(500f)
+        assertThat(unified.topPx).isWithin(1e-3f).of(160f)
+        assertThat(unified.bottomPx).isWithin(1e-3f).of(208f)
+        assertThat(unified.widthPx).isWithin(1e-3f).of(300f)
+        assertThat(unified.estimatedDiameterMm).isWithin(0.1f).of(300f * 0.59f)
+    }
+
+    @Test
+    fun mergeAndFilterTileDetections_highIoMWithLowIoU_fusesNestedFragmentIntoParentBox() {
+        val cropper = PushBroomCropper()
+
+        // Large box in Tile 1: strip [400..520] x [100..220] (120x120 = 14,400 px^2)
+        // Smaller clipped fragment in Tile 1: strip [410..450] x [110..150] (40x40 = 1,600 px^2)
+        // IoU = 1,600 / 14,400 = 0.111 (< 0.45), but IoM = 1,600 / 1,600 = 1.00 (>= 0.65).
+        val rawDetections = listOf(
+            TileDetection(
+                tileIndex = 1,
+                classId = StoneClass.PETRIFIED_WOOD.id,
+                confidence = 0.88f,
+                leftPx = 48f,
+                topPx = 100f,
+                rightPx = 168f,
+                bottomPx = 220f
+            ),
+            TileDetection(
+                tileIndex = 1,
+                classId = StoneClass.PETRIFIED_WOOD.id,
+                confidence = 0.64f,
+                leftPx = 58f,
+                topPx = 110f,
+                rightPx = 98f,
+                bottomPx = 150f
+            )
+        )
+
+        val merged = cropper.mergeAndFilterTileDetections(
+            tileDetections = rawDetections,
+            tileMode = SwathTileMode.FIVE_TILE,
+            gsdMmPerPx = PushBroomCropper.DEFAULT_GSD_MM_PER_PX
+        )
+
+        assertThat(merged).hasSize(1)
+        val unified = merged.single()
+        assertThat(unified.stoneClass).isEqualTo(StoneClass.PETRIFIED_WOOD)
+        assertThat(unified.confidence).isWithin(1e-4f).of(0.88f)
+        assertThat(unified.widthPx).isWithin(1e-3f).of(120f)
     }
 }

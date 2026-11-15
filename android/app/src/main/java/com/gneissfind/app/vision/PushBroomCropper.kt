@@ -1,3 +1,11 @@
+/*
+ * Zero-copy YUV_420_888 push-broom strip ROI extractor and cross-tile bounding-box stitcher.
+ *
+ * Consumes upright landscape CameraX ImageProxy frames and pitch-stabilized cropY offsets from
+ * GroundPlaneRaycaster; produces overlapping 384x384 NHWC RGB [0..1] float tiles in
+ * PushBroomSweepBuffers for StoneDetector and stitches per-tile predictions into unified strip
+ * coordinates with IoU + IoM + seam-straddle union merging.
+ */
 package com.gneissfind.app.vision
 
 import androidx.camera.core.ImageProxy
@@ -8,16 +16,22 @@ import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.model.TileDetection
 import java.nio.ByteBuffer
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Abstraction over a `YUV_420_888` camera frame so [PushBroomCropper] can operate zero-copy on
- * CameraX [ImageProxy] planes in production and deterministic fake buffers in unit tests.
+ * Read-only view over a planar or semi-planar `YUV_420_888` camera frame so [PushBroomCropper]
+ * can read CameraX [ImageProxy] planes in production and deterministic synthetic buffers in JVM
+ * unit tests without copying full-frame byte arrays.
  */
 interface Yuv420Frame {
+    /** Raw sensor buffer width in pixels before display rotation. */
     val width: Int
+    /** Raw sensor buffer height in pixels before display rotation. */
     val height: Int
+    /** Clockwise rotation (`0`, `90`, `180`, or `270` degrees) required to orient the frame upright. */
     val rotationDegrees: Int
+    /** Frame capture timestamp in nanoseconds. */
     val timestampNs: Long
 
     val yBuffer: ByteBuffer
@@ -34,7 +48,11 @@ interface Yuv420Frame {
 }
 
 /**
- * Lightweight zero-copy wrapper adapting a CameraX [ImageProxy] (`ImageFormat.YUV_420_888`) to [Yuv420Frame].
+ * Zero-copy adapter wrapping a CameraX [ImageProxy] (`ImageFormat.YUV_420_888`) as a [Yuv420Frame].
+ *
+ * Lifecycle: valid only while the underlying [imageProxy] remains open.
+ *
+ * @param imageProxy Open CameraX `ImageAnalysis` frame.
  */
 class ImageProxyYuv420Frame(private val imageProxy: ImageProxy) : Yuv420Frame {
     override val width: Int get() = imageProxy.width
@@ -57,8 +75,16 @@ class ImageProxyYuv420Frame(private val imageProxy: ImageProxy) : Yuv420Frame {
 }
 
 /**
- * Pre-allocated reusable sweep buffers sized for up to 5 overlapping `384x384` RGB float tiles
- * (`1792x384` max swath) plus an optional packed ARGB pixel buffer for `LOG DATA` strip capture.
+ * Pre-allocated reusable sweep buffers sized for up to [StripRoiGeometry.MAX_TILES] overlapping
+ * `384x384` NHWC RGB `[0.0, 1.0]` float tiles plus an optional packed ARGB pixel buffer for
+ * [com.gneissfind.app.model.OperatingMode.LOG_DATA] strip capture.
+ *
+ * Allocated once per [com.gneissfind.app.ui.ScannerViewModel] and mutated in-place on the camera
+ * analysis thread so per-sweep extraction performs zero heap allocations.
+ *
+ * @property tileRgbFloats Per-tile NHWC float32 arrays (`[tileIdx][384 * 384 * 3]`) in `[0.0, 1.0]`.
+ * @property stripArgbPixels Packed `0xAARRGGBB` pixel buffer (`1792 * 384`) populated when
+ *   [hasArgbPixels] is true.
  */
 class PushBroomSweepBuffers(
     val tileRgbFloats: Array<FloatArray> = Array(StripRoiGeometry.MAX_TILES) {
@@ -68,26 +94,40 @@ class PushBroomSweepBuffers(
         StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX
     )
 ) {
+    /** Active horizontal swath packing mode (`FIVE_TILE` or `THREE_TILE`) for the current sweep. */
     var activeTileMode: SwathTileMode = SwathTileMode.FIVE_TILE
     val activeTileCount: Int get() = activeTileMode.tileCount
     val activeStripWidthPx: Int get() = activeTileMode.stripWidthPx
 
+    /** Strip ROI geometry in the upright landscape frame for the current sweep. */
     var geometry: StripRoiGeometry = StripRoiGeometry()
+    /** Whether [stripArgbPixels] was populated during the most recent [PushBroomCropper.extractTiles] call. */
     var hasArgbPixels: Boolean = false
+    /** Sensor timestamp in nanoseconds of the most recent extracted frame. */
     var timestampNs: Long = 0L
 }
 
 /**
- * Extracts ONLY the stabilized `1792x384` (5-tile default) or `1088x384` (3-tile fast mode)
- * push-broom strip ROI from a `1920x1080` landscape `YUV_420_888` frame directly into horizontally
- * overlapping `384x384` float tiles (`32 px` overlap, `352 px` stride) without full-frame Bitmap
- * allocation.
+ * Extracts only the pitch-stabilized push-broom strip ROI from an upright landscape `YUV_420_888`
+ * frame into horizontally overlapping square float tiles without allocating full-frame bitmaps,
+ * and stitches per-tile predictions back into unified strip coordinates
+ * (`.agents/rules/android-camera-ar.md §2`).
  *
- * Maps tile-local `[0..384]` detections into unified strip space, runs class-aware cross-tile NMS
- * (`IoU >= 0.45`), mutes `classId == 4` (`hard_confuser`), and enforces `>= 20 mm` target diameter.
+ * Responsibility and state: owns three reusable float planar strip caches (`stripNormalizedR`,
+ * `stripNormalizedG`, `stripNormalizedB`) sized for the maximum `1792 x 384` swath so the four
+ * `32 px` overlap seams are decoded from YUV only once per sweep.
+ *
+ * Threading: [extractTiles] is not thread-safe because it mutates the internal planar strip caches;
+ * call it from a single sequential analysis worker. [computeStripGeometry] and
+ * [mergeAndFilterTileDetections] are pure and thread-safe.
+ *
+ * @param applyImageNetNormalization When false (default), outputs raw `[0.0, 1.0]` RGB floats
+ *   matching LiteRT graphs that fuse `(x - mean) / std` inside the model
+ *   (`.agents/rules/litert-inference.md §2`). Set true only for legacy models without fused
+ *   normalization.
  */
 class PushBroomCropper(
-    private val applyImageNetNormalization: Boolean = true
+    private val applyImageNetNormalization: Boolean = false
 ) {
     // Reusable intermediate strip RGB cache allocated once for max 1792x384 swath (~8.2 MB total)
     // so the four 32px overlap seams are decoded from YUV_420_888 only once per sweep.
@@ -95,6 +135,17 @@ class PushBroomCropper(
     private val stripNormalizedG = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
     private val stripNormalizedB = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
 
+    /**
+     * Resolves the upright landscape dimensions and clamped strip ROI bounds for a camera frame.
+     *
+     * @param rawWidth Sensor buffer width in pixels before rotation.
+     * @param rawHeight Sensor buffer height in pixels before rotation.
+     * @param rotationDegrees Clockwise rotation (`0`, `90`, `180`, or `270` degrees) to upright landscape.
+     * @param cropY Pitch-stabilized top Y coordinate in canonical `1920x1080` landscape pixels.
+     * @param tileMode Active horizontal swath packing mode (`FIVE_TILE` or `THREE_TILE`).
+     * @param isPitchClamped Whether IMU pitch stabilization saturated at the top or bottom frame edge.
+     * @return Clamped [StripRoiGeometry] in upright landscape frame pixels.
+     */
     fun computeStripGeometry(
         rawWidth: Int,
         rawHeight: Int,
@@ -139,8 +190,19 @@ class PushBroomCropper(
     }
 
     /**
-     * Extracts the active `1792x384` (5-tile) or `1088x384` (3-tile) strip at stabilized [cropY]
-     * from [frame] and slices it into overlapping `384x384` NHWC RGB float tiles inside [outBuffers].
+     * Decodes only the active push-broom strip at [cropY] from [frame] and slices it into
+     * overlapping square NHWC RGB float tiles inside [outBuffers].
+     *
+     * Side effects: overwrites `outBuffers.tileRgbFloats[0 until tileMode.tileCount]`, metadata
+     * fields on [outBuffers], and (when [populateArgbStrip] is true) `outBuffers.stripArgbPixels`.
+     *
+     * @param frame Source `YUV_420_888` camera frame.
+     * @param outBuffers Pre-allocated destination buffers mutated in-place.
+     * @param cropY Pitch-stabilized top Y coordinate in canonical `1920x1080` landscape pixels.
+     * @param tileMode Active horizontal swath packing mode (`FIVE_TILE` or `THREE_TILE`).
+     * @param isPitchClamped Whether IMU pitch stabilization saturated at the frame limits.
+     * @param populateArgbStrip True when `LOG DATA` mode needs packed ARGB pixels for JPEG/PNG export.
+     * @return Resolved [StripRoiGeometry] for the extracted strip.
      */
     fun extractTiles(
         frame: Yuv420Frame,
@@ -199,6 +261,7 @@ class PushBroomCropper(
 
         val argbOut = outBuffers.stripArgbPixels
 
+        // 1. Decode only the active strip rows from YUV_420_888 into the planar float cache.
         for (sy in 0 until StripRoiGeometry.STRIP_HEIGHT_PX) {
             val uy = if (scaleY == 1.0f) {
                 (geometry.stripTopPx + sy).coerceIn(0, uprightH - 1)
@@ -268,7 +331,7 @@ class PushBroomCropper(
             }
         }
 
-        // Slice the decoded strip into 5 (or 3) overlapping 384x384 tiles with 32px seam overlap
+        // 2. Slice the decoded strip into overlapping 384x384 tiles with 32px seam overlap.
         val stripOffsets = tileMode.stripTileOffsets
         for (tileIdx in 0 until tileMode.tileCount) {
             val xOffset = stripOffsets[tileIdx]
@@ -289,19 +352,35 @@ class PushBroomCropper(
     }
 
     /**
-     * Maps tile-local `[0..384]` bounding boxes into unified strip coordinates (`1792x384` in
-     * 5-tile mode or `1088x384` in 3-tile mode) and `1920x1080` frame X coordinates
-     * (`xOffsets = [64, 416, 768, 1120, 1472]` or `[416, 768, 1120]`), applies class-aware
-     * Cross-Tile Non-Maximum Suppression (`IoU >= 0.45`), and discards:
-     *  - `classId == 4` ([StoneClass.HARD_CONFUSER])
-     *  - Classes disabled in [enabledClasses]
-     *  - Stones smaller than [minDiameterMm] (`20.0 mm`)
+     * Stitches tile-local `[0..384]` bounding boxes into unified push-broom strip coordinates and
+     * full landscape frame X coordinates, fuses same-class fragments across tile seams, and filters
+     * out muted confusers, disabled classes, and targets below [minDiameterMm]
+     * (`.agents/rules/android-camera-ar.md §2`).
+     *
+     * Two same-class detections are fused into their union bounding box (`minLeft`, `minTop`,
+     * `maxRight`, `maxBottom`, `confidence = max(scoreA, scoreB)`) when any of the following hold:
+     * 1. `IoU(boxA, boxB) >= nmsIouThreshold`, OR
+     * 2. `IoM(boxA, boxB) >= nmsIomThreshold`, OR
+     * 3. Both boxes originate from different tiles, touch or straddle the same `[xOffset .. xOffset + 32]`
+     *    seam band within [SEAM_STRADDLE_MARGIN_PX], and have vertical projection overlap
+     *    `>= MIN_VERTICAL_OVERLAP_RATIO`.
+     *
+     * @param tileDetections Raw per-tile bounding-box detections in `[0.0, 384.0]` tile pixels.
+     * @param tileMode Active horizontal swath packing mode (`FIVE_TILE` or `THREE_TILE`).
+     * @param gsdMmPerPx Cross-track ground sample distance in `mm/px` used to compute physical size.
+     * @param nmsIouThreshold Minimum Intersection-over-Union (`[0.0, 1.0]`) to fuse same-class boxes.
+     * @param nmsIomThreshold Minimum Intersection-over-Minimum (`[0.0, 1.0]`) to fuse same-class boxes.
+     * @param minConfidence Minimum confidence score (`[0.0, 1.0]`) required to retain a tile box.
+     * @param minDiameterMm Minimum physical major-axis diameter (`mm`) required to alert the user.
+     * @param enabledClasses Set of user-enabled [StoneClass] targets from the Prospect Matrix.
+     * @return Filtered, seam-merged [StripDetection] list sorted by descending confidence.
      */
     fun mergeAndFilterTileDetections(
         tileDetections: List<TileDetection>,
         tileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
         gsdMmPerPx: Float = DEFAULT_GSD_MM_PER_PX,
         nmsIouThreshold: Float = DEFAULT_NMS_IOU_THRESHOLD,
+        nmsIomThreshold: Float = DEFAULT_NMS_IOM_THRESHOLD,
         minConfidence: Float = DEFAULT_MIN_CONFIDENCE,
         minDiameterMm: Float = MIN_STONE_DIAMETER_MM,
         enabledClasses: Set<StoneClass> = StoneClass.alertableClasses.toSet()
@@ -312,6 +391,7 @@ class PushBroomCropper(
         val stripOffsets = tileMode.stripTileOffsets
         val frameOffsets = tileMode.frameXOffsets
 
+        // 1. Project tile-local [0..384] boxes into unified strip and full-frame coordinates.
         val mappedCandidates = ArrayList<StripDetection>(tileDetections.size)
         for (det in tileDetections) {
             if (det.confidence < minConfidence) continue
@@ -354,34 +434,130 @@ class PushBroomCropper(
 
         if (mappedCandidates.isEmpty()) return emptyList()
 
-        // Sort descending by confidence for greedy Cross-Tile NMS
+        // 2. Sort descending by confidence and iteratively fuse overlapping or seam-straddling
+        //    same-class detections into unified bounding boxes until convergence.
         mappedCandidates.sortByDescending { it.confidence }
 
-        val nmsKept = ArrayList<StripDetection>(mappedCandidates.size)
+        val mergedList = ArrayList<StripDetection>(mappedCandidates.size)
         for (candidate in mappedCandidates) {
-            var suppressed = false
-            for (kept in nmsKept) {
-                if (kept.stoneClass == candidate.stoneClass &&
-                    candidate.iouWith(kept) >= nmsIouThreshold
-                ) {
-                    suppressed = true
+            var fused = false
+            for (i in mergedList.indices) {
+                val kept = mergedList[i]
+                if (shouldFuseDetections(kept, candidate, tileMode, nmsIouThreshold, nmsIomThreshold)) {
+                    mergedList[i] = unionDetections(kept, candidate, gsdMmPerPx)
+                    fused = true
                     break
                 }
             }
-            if (!suppressed) {
-                nmsKept.add(candidate)
+            if (!fused) {
+                mergedList.add(candidate)
             }
         }
 
-        return nmsKept.filter { det ->
+        // Fixed-point pass: coalescing two fragments across a seam can expand a box to bridge a
+        // third adjacent fragment on wide (>352 px) objects.
+        var changed = true
+        while (changed && mergedList.size > 1) {
+            changed = false
+            outer@ for (i in 0 until mergedList.size) {
+                for (j in i + 1 until mergedList.size) {
+                    val a = mergedList[i]
+                    val b = mergedList[j]
+                    if (shouldFuseDetections(a, b, tileMode, nmsIouThreshold, nmsIomThreshold)) {
+                        mergedList[i] = unionDetections(a, b, gsdMmPerPx)
+                        mergedList.removeAt(j)
+                        changed = true
+                        break@outer
+                    }
+                }
+            }
+        }
+
+        mergedList.sortByDescending { it.confidence }
+
+        // 3. Mute HARD_CONFUSER, disabled Prospect Matrix classes, and sub-20mm pebbles.
+        return mergedList.filter { det ->
             det.stoneClass.isUserAlertable &&
                 det.stoneClass in enabledClasses &&
                 det.estimatedDiameterMm >= minDiameterMm
         }
     }
 
+    /**
+     * Decides whether two detections of the same [StoneClass] represent the same physical object
+     * via `IoU`, `IoM`, or cross-tile `32 px` seam straddling (`.agents/rules/android-camera-ar.md §2`).
+     */
+    private fun shouldFuseDetections(
+        a: StripDetection,
+        b: StripDetection,
+        tileMode: SwathTileMode,
+        nmsIouThreshold: Float,
+        nmsIomThreshold: Float
+    ): Boolean {
+        if (a.stoneClass != b.stoneClass) return false
+        if (a.iouWith(b) >= nmsIouThreshold) return true
+        if (a.iomWith(b) >= nmsIomThreshold) return true
+
+        // Elongated objects (toothbrush, remote, petrified wood limb) spanning two tiles often have
+        // low 2D IoU/IoM because each tile only sees its half of the object, but both fragments
+        // terminate inside or straddle the shared 32 px seam band with matching vertical bounds.
+        if (a.sourceTileIndex != b.sourceTileIndex &&
+            a.verticalOverlapRatioWith(b) >= MIN_VERTICAL_OVERLAP_RATIO
+        ) {
+            val stripOffsets = tileMode.stripTileOffsets
+            for (seamIdx in 1 until tileMode.tileCount) {
+                val seamLeft = stripOffsets[seamIdx].toFloat()
+                val seamRight = seamLeft + StripRoiGeometry.TILE_OVERLAP_PX.toFloat()
+                val bandLeft = seamLeft - SEAM_STRADDLE_MARGIN_PX
+                val bandRight = seamRight + SEAM_STRADDLE_MARGIN_PX
+                val aTouchesSeam = a.rightPx >= bandLeft && a.leftPx <= bandRight
+                val bTouchesSeam = b.rightPx >= bandLeft && b.leftPx <= bandRight
+                if (aTouchesSeam && bTouchesSeam) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * Combines two overlapping or seam-adjacent [StripDetection] boxes into a single union box
+     * preserving the higher confidence score and recomputing physical diameter at [gsdMmPerPx].
+     */
+    private fun unionDetections(
+        a: StripDetection,
+        b: StripDetection,
+        gsdMmPerPx: Float
+    ): StripDetection {
+        val dominant = if (a.confidence >= b.confidence) a else b
+        val unionLeft = min(a.leftPx, b.leftPx)
+        val unionTop = min(a.topPx, b.topPx)
+        val unionRight = max(a.rightPx, b.rightPx)
+        val unionBottom = max(a.bottomPx, b.bottomPx)
+        val unionFrameLeft = min(a.frameLeftPx, b.frameLeftPx)
+        val unionFrameRight = max(a.frameRightPx, b.frameRightPx)
+        val unionWidth = (unionRight - unionLeft).coerceAtLeast(0f)
+        val unionHeight = (unionBottom - unionTop).coerceAtLeast(0f)
+
+        return StripDetection(
+            stoneClass = dominant.stoneClass,
+            confidence = max(a.confidence, b.confidence),
+            leftPx = unionLeft,
+            topPx = unionTop,
+            rightPx = unionRight,
+            bottomPx = unionBottom,
+            estimatedDiameterMm = max(unionWidth, unionHeight) * gsdMmPerPx,
+            sourceTileIndex = dominant.sourceTileIndex,
+            frameLeftPx = unionFrameLeft,
+            frameRightPx = unionFrameRight
+        )
+    }
+
     companion object {
         const val DEFAULT_NMS_IOU_THRESHOLD = 0.45f
+        const val DEFAULT_NMS_IOM_THRESHOLD = 0.65f
+        const val SEAM_STRADDLE_MARGIN_PX = 8.0f
+        const val MIN_VERTICAL_OVERLAP_RATIO = 0.60f
         const val DEFAULT_MIN_CONFIDENCE = 0.35f
         const val MIN_STONE_DIAMETER_MM = 20.0f
         const val DEFAULT_SLANT_RANGE_METERS = 1.50f
@@ -399,6 +575,10 @@ class PushBroomCropper(
         /**
          * Computes cross-track Ground Sample Distance (`mm/px`) from slant range [slantRangeMeters]
          * and active zoom (`2.0x` -> `0.59 mm/px` at `R = 1.50 m`; `1.0x` -> `1.18 mm/px`).
+         *
+         * @param slantRangeMeters Slant distance from camera optical center to ground patch in meters.
+         * @param zoomRatio Active digital/sensor crop zoom ratio (`>= 1.0f`).
+         * @return Ground sample distance in millimeters per pixel.
          */
         fun computeGsdMmPerPx(
             slantRangeMeters: Float,
