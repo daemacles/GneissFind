@@ -1,3 +1,10 @@
+/*
+ * Reusable 2360s LCARS geometric primitives, silent tactile pill buttons, detection-reticle color
+ * swatches, and strictly non-interactive telemetry readout blocks.
+ * Enforces visual affordance separation: interactive actuators use rounded pill geometry with an
+ * 80 ms silent white tap flash, whereas passive telemetry readouts use flat rectangular geometry
+ * with zero click handlers.
+ */
 package com.gneissfind.app.ui.lcars
 
 import androidx.compose.foundation.Canvas
@@ -17,7 +24,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -31,6 +37,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -38,7 +45,11 @@ import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
@@ -46,7 +57,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.gneissfind.app.ui.theme.LcarsColors
+import com.gneissfind.app.ui.theme.LcarsSemanticColors
 import com.gneissfind.app.ui.theme.LcarsTypography
+import com.gneissfind.app.ui.theme.LcarsValueLevel
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
@@ -66,28 +79,52 @@ enum class LcarsElbowOrientation {
     BottomRight
 }
 
+/**
+ * Corner geometry styles separating rounded interactive pills from flat rectangular readout bars.
+ */
 enum class LcarsPillEndStyle {
     Capsule,
     FlatLeftRoundRight,
     RoundLeftFlatRight,
+    CompactRoundedPill,
     FlatBlock;
 
     fun toShape(): Shape = when (this) {
         Capsule -> RoundedCornerShape(percent = 50)
         FlatLeftRoundRight -> RoundedCornerShape(
-            topStartPercent = 0,
-            bottomStartPercent = 0,
-            topEndPercent = 50,
-            bottomEndPercent = 50
+            topStart = 6.dp,
+            bottomStart = 6.dp,
+            topEnd = 999.dp,
+            bottomEnd = 999.dp
         )
         RoundLeftFlatRight -> RoundedCornerShape(
-            topStartPercent = 50,
-            bottomStartPercent = 50,
-            topEndPercent = 0,
-            bottomEndPercent = 0
+            topStart = 999.dp,
+            bottomStart = 999.dp,
+            topEnd = 6.dp,
+            bottomEnd = 6.dp
         )
+        CompactRoundedPill -> RoundedCornerShape(12.dp)
         FlatBlock -> RectangleShape
     }
+}
+
+/**
+ * Measures the exact rendered width of [maxPrototypeText] under [style] plus [horizontalPadding] so
+ * live telemetry bars can lock to their high-water-mark width without horizontal layout jitter.
+ */
+@Composable
+fun rememberHighWaterSegmentWidth(
+    maxPrototypeText: String,
+    style: TextStyle = LcarsTypography.TelemetryBar,
+    horizontalPadding: Dp = 22.dp
+): Dp {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val upper = remember(maxPrototypeText) { maxPrototypeText.uppercase(Locale.US) }
+    val widthPx = remember(measurer, upper, style, density) {
+        measurer.measure(text = upper, style = style, maxLines = 1, softWrap = false).size.width
+    }
+    return with(density) { widthPx.toDp() + horizontalPadding }
 }
 
 @Immutable
@@ -114,17 +151,14 @@ data class LcarsElbowMetricsPx(
             LcarsElbowOrientation.BottomLeft, LcarsElbowOrientation.BottomRight -> heightPx - y
         }
 
-        // Check outer top-left convex corner exclusion
         if (lx < outerRadiusPx && ly < outerRadiusPx) {
             val dx = lx - outerRadiusPx
             val dy = ly - outerRadiusPx
             if (dx * dx + dy * dy > outerRadiusPx * outerRadiusPx) return false
         }
 
-        // Inside vertical stem or horizontal top arm
         if (lx <= stemWidthPx || ly <= barHeightPx) return true
 
-        // Check concave inner crook fillet region: [stem, stem + rIn] x [bar, bar + rIn]
         if (lx <= stemWidthPx + innerRadiusPx && ly <= barHeightPx + innerRadiusPx) {
             val cx = stemWidthPx + innerRadiusPx
             val cy = barHeightPx + innerRadiusPx
@@ -419,11 +453,65 @@ fun LcarsElbow(
 }
 
 /**
- * Classic 2360s TNG LCARS actuator pill:
- * - Zero UI tap sound (no ripple audio, `indication = null`, root `isSoundEffectsEnabled = false`).
- * - Immediate `80 ms` pure `#FFFFFF` (`AlertWhite`) visual flash upon tap.
- * - Bold `#000000` right-aligned uppercase text on active color fill, or `#FFCC99` (`ApricotPeach`)
- *   on `MutedSlate` (`#555577`) when inactive.
+ * Prominent `24.dp` square swatch drawn inside mineral target pills that mirrors the exact
+ * four-corner detection reticle square rendered around stones in the camera viewport.
+ */
+@Composable
+fun LcarsDetectionReticleSwatch(
+    reticleColor: Color,
+    enabled: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Canvas(
+        modifier = modifier
+            .size(24.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(LcarsColors.CanvasBlack)
+    ) {
+        val pad = 3.dp.toPx()
+        val l = pad
+        val t = pad
+        val r = size.width - pad
+        val b = size.height - pad
+        val arm = 6.dp.toPx()
+        val stroke = 2.4.dp.toPx()
+        val bracketColor = if (enabled) reticleColor else reticleColor.copy(alpha = 0.48f)
+
+        val corners = arrayOf(
+            Offset(l, t) to Offset(l + arm, t),
+            Offset(l, t) to Offset(l, t + arm),
+            Offset(r, t) to Offset(r - arm, t),
+            Offset(r, t) to Offset(r, t + arm),
+            Offset(l, b) to Offset(l + arm, b),
+            Offset(l, b) to Offset(l, b - arm),
+            Offset(r, b) to Offset(r - arm, b),
+            Offset(r, b) to Offset(r, b - arm)
+        )
+        corners.forEach { (start, end) ->
+            drawLine(
+                color = bracketColor,
+                start = start,
+                end = end,
+                strokeWidth = stroke,
+                cap = StrokeCap.Square
+            )
+        }
+
+        // Bold inner mineral color core so hue association is unmistakable at arm's length
+        val coreSize = 9.dp.toPx()
+        val coreOffset = (size.width - coreSize) * 0.5f
+        drawRect(
+            color = if (enabled) reticleColor else reticleColor.copy(alpha = 0.25f),
+            topLeft = Offset(coreOffset, coreOffset),
+            size = Size(coreSize, coreSize)
+        )
+    }
+}
+
+/**
+ * Interactive LCARS pill button with rounded capsule geometry and silent `80 ms` `#FFFFFF` tap
+ * flash. Never used for passive sensor/state labels (see [LcarsHeaderSegment] and
+ * [LcarsTelemetryBlock]).
  */
 @Composable
 fun LcarsPillButton(
@@ -432,6 +520,7 @@ fun LcarsPillButton(
     activeColor: Color,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    inactiveColor: Color = LcarsColors.MutedSlate,
     prefixCode: String? = null,
     subLabel: String? = null,
     swatchColor: Color? = null,
@@ -455,31 +544,43 @@ fun LcarsPillButton(
     val containerColor = when {
         showWhiteFlash -> LcarsColors.AlertWhite
         active -> activeColor
-        else -> LcarsColors.MutedSlate
+        else -> inactiveColor
     }
     val contentColor = when {
         showWhiteFlash -> LcarsColors.CanvasBlack
         active && activeColor == LcarsColors.MarsRed -> LcarsColors.AlertWhite
         active -> LcarsColors.CanvasBlack
-        else -> LcarsColors.ApricotPeach
+        else -> LcarsColors.InactiveLabel
+    }
+
+    val resolvedEndStyle = if (compactStemMode && endStyle == LcarsPillEndStyle.FlatBlock) {
+        LcarsPillEndStyle.CompactRoundedPill
+    } else {
+        endStyle
     }
 
     val startPad = when {
-        compactStemMode -> 5.dp
-        endStyle == LcarsPillEndStyle.Capsule ||
-            endStyle == LcarsPillEndStyle.RoundLeftFlatRight -> 15.dp
+        compactStemMode -> 6.dp
+        swatchColor != null -> 12.dp
+        resolvedEndStyle == LcarsPillEndStyle.Capsule ||
+            resolvedEndStyle == LcarsPillEndStyle.RoundLeftFlatRight -> 14.dp
         else -> 10.dp
     }
     val endPad = when {
-        compactStemMode -> 6.dp
-        endStyle == LcarsPillEndStyle.Capsule ||
-            endStyle == LcarsPillEndStyle.FlatLeftRoundRight -> 16.dp
+        compactStemMode -> 7.dp
+        resolvedEndStyle == LcarsPillEndStyle.Capsule ||
+            resolvedEndStyle == LcarsPillEndStyle.FlatLeftRoundRight -> 15.dp
         else -> 10.dp
+    }
+    val verticalPad = when {
+        compactStemMode -> 3.dp
+        swatchColor != null -> 2.dp
+        else -> 4.dp
     }
 
     Box(
         modifier = modifier
-            .clip(endStyle.toShape())
+            .clip(resolvedEndStyle.toShape())
             .background(containerColor)
             .clickable(
                 interactionSource = interactionSource,
@@ -493,8 +594,8 @@ fun LcarsPillButton(
             .padding(
                 start = startPad,
                 end = endPad,
-                top = if (compactStemMode) 2.dp else 4.dp,
-                bottom = if (compactStemMode) 2.dp else 4.dp
+                top = verticalPad,
+                bottom = verticalPad
             )
     ) {
         if (compactStemMode) {
@@ -549,23 +650,13 @@ fun LcarsPillButton(
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
                     if (swatchColor != null) {
-                        Box(
-                            modifier = Modifier
-                                .size(11.dp)
-                                .clip(CircleShape)
-                                .background(LcarsColors.CanvasBlack)
-                                .padding(2.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .clip(CircleShape)
-                                    .background(swatchColor)
-                            )
-                        }
+                        LcarsDetectionReticleSwatch(
+                            reticleColor = swatchColor,
+                            enabled = active
+                        )
                     }
                     if (!prefixCode.isNullOrEmpty()) {
                         Text(
@@ -609,63 +700,28 @@ fun LcarsPillButton(
 }
 
 /**
- * `22.dp` horizontal LCARS telemetry rail block with tabular numerals (`tnum`).
- * Optionally interactive (with silent `80 ms` `#FFFFFF` flash) for inline actions such as `PITCH SYNC`.
+ * Passive non-interactive `22.dp` horizontal LCARS telemetry rail block with sharp rectangular
+ * edges and tabular numerals (`tnum`). Never clickable and never flashes on tap.
  */
 @Composable
 fun LcarsHeaderSegment(
     text: String,
     color: Color,
     modifier: Modifier = Modifier,
-    endStyle: LcarsPillEndStyle = LcarsPillEndStyle.FlatBlock,
     textColor: Color = LcarsColors.CanvasBlack,
-    alignEnd: Boolean = false,
-    onClick: (() -> Unit)? = null
+    alignEnd: Boolean = false
 ) {
-    val interactionSource = remember { MutableInteractionSource() }
-    val isPressed by interactionSource.collectIsPressedAsState()
-    var flashNonce by remember { mutableIntStateOf(0) }
-    var isFlashing by remember { mutableStateOf(false) }
-
-    LaunchedEffect(flashNonce) {
-        if (flashNonce > 0) {
-            isFlashing = true
-            delay(80L)
-            isFlashing = false
-        }
-    }
-
-    val flashing = onClick != null && (isPressed || isFlashing)
-    val bg = if (flashing) LcarsColors.AlertWhite else color
-    val fg = if (flashing) LcarsColors.CanvasBlack else textColor
-
-    val clickMod = if (onClick != null) {
-        Modifier.clickable(
-            interactionSource = interactionSource,
-            indication = null,
-            role = Role.Button,
-            onClick = {
-                flashNonce += 1
-                onClick()
-            }
-        )
-    } else {
-        Modifier
-    }
-
     Box(
         modifier = modifier
             .height(LcarsBarHeight)
-            .clip(endStyle.toShape())
-            .background(bg)
-            .then(clickMod)
+            .background(color)
             .padding(horizontal = 8.dp),
         contentAlignment = if (alignEnd) Alignment.CenterEnd else Alignment.Center
     ) {
         Text(
             text = text.uppercase(Locale.US),
             style = LcarsTypography.TelemetryBar,
-            color = fg,
+            color = textColor,
             maxLines = 1,
             overflow = TextOverflow.Clip
         )
@@ -673,8 +729,65 @@ fun LcarsHeaderSegment(
 }
 
 /**
- * Segmented LCARS bar-graph controller for Canopy Exposure Bias (`-2.0 .. +1.0 EV` in `0.5 EV` steps).
- * Uses strictly solid color blocks separated by `4.dp` `#000000` gutters—zero Material Slider tracks.
+ * Passive non-interactive multi-line rectangular telemetry block used in vertical stems and gauge
+ * headers (`FPS`, `LOG` frame count, `Y-PX`). Sharp corners and zero click handling distinguish it
+ * visually and behaviorally from rounded [LcarsPillButton] actuators.
+ */
+@Composable
+fun LcarsTelemetryBlock(
+    valueText: String,
+    color: Color,
+    modifier: Modifier = Modifier,
+    prefixCode: String? = null,
+    subText: String? = null,
+    textColor: Color = LcarsColors.CanvasBlack
+) {
+    Box(
+        modifier = modifier
+            .background(color)
+            .padding(horizontal = 5.dp, vertical = 3.dp)
+    ) {
+        if (!prefixCode.isNullOrEmpty()) {
+            Text(
+                text = prefixCode.uppercase(Locale.US),
+                style = LcarsTypography.MicroCode,
+                color = textColor,
+                maxLines = 1,
+                overflow = TextOverflow.Clip,
+                modifier = Modifier.align(Alignment.TopStart)
+            )
+        }
+        Column(
+            modifier = Modifier.align(Alignment.BottomEnd),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = valueText.uppercase(Locale.US),
+                style = LcarsTypography.TelemetryBar,
+                color = textColor,
+                textAlign = TextAlign.End,
+                maxLines = 1,
+                overflow = TextOverflow.Clip
+            )
+            if (!subText.isNullOrEmpty()) {
+                Text(
+                    text = subText.uppercase(Locale.US),
+                    style = LcarsTypography.MicroCode,
+                    color = textColor,
+                    textAlign = TextAlign.End,
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Segmented LCARS Canopy Exposure Bias controller (`-2.0 .. +1.0 EV` in `0.5 EV` steps).
+ * Flanks a strictly passive 7-segment rectangular EV readout bar with dedicated `−` and `+`
+ * rounded stepper actuators so each EV adjustment direction has a single button.
  */
 @Composable
 fun LcarsSegmentedEvBar(
@@ -683,6 +796,17 @@ fun LcarsSegmentedEvBar(
     modifier: Modifier = Modifier
 ) {
     val steps = remember { listOf(-2.0f, -1.5f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f) }
+    val valueCycle = remember {
+        listOf(
+            LcarsValueLevel.MINUS,
+            LcarsValueLevel.BASE,
+            LcarsValueLevel.PLUS,
+            LcarsValueLevel.MINUS,
+            LcarsValueLevel.BASE,
+            LcarsValueLevel.PLUS,
+            LcarsValueLevel.MINUS
+        )
+    }
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -696,12 +820,12 @@ fun LcarsSegmentedEvBar(
             Text(
                 text = "OPT-EV // CANOPY EXPOSURE BIAS",
                 style = LcarsTypography.MicroCode,
-                color = LcarsColors.ApricotPeach
+                color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.BASE)
             )
             Text(
                 text = String.format(Locale.US, "%+.1f EV", exposureBiasEv),
                 style = LcarsTypography.TelemetryBar,
-                color = if (abs(exposureBiasEv) < 0.05f) LcarsColors.IceBlue else LcarsColors.GoldenAmber
+                color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.PLUS)
             )
         }
 
@@ -714,18 +838,20 @@ fun LcarsSegmentedEvBar(
             LcarsPillButton(
                 label = "−",
                 active = exposureBiasEv > -1.95f,
-                activeColor = LcarsColors.WarmSand,
+                activeColor = LcarsSemanticColors.actionOrDrawerButton(LcarsValueLevel.MINUS),
+                inactiveColor = LcarsSemanticColors.toggleButton(false, LcarsValueLevel.MINUS),
                 endStyle = LcarsPillEndStyle.RoundLeftFlatRight,
                 onClick = {
                     val next = (exposureBiasEv - 0.5f).coerceIn(-2.0f, 1.0f)
                     onSelectEv(next)
                 },
                 modifier = Modifier
-                    .width(34.dp)
+                    .width(36.dp)
                     .fillMaxHeight()
             )
 
-            steps.forEach { stepEv ->
+            steps.forEachIndexed { idx, stepEv ->
+                val level = valueCycle[idx]
                 val isSelected = abs(exposureBiasEv - stepEv) < 0.15f
                 val isZeroRef = abs(stepEv) < 0.05f
                 val isLit = if (exposureBiasEv >= -0.05f) {
@@ -735,10 +861,14 @@ fun LcarsSegmentedEvBar(
                 }
 
                 val segColor = when {
-                    isSelected -> LcarsColors.GoldenAmber
-                    isZeroRef -> LcarsColors.IceBlue
-                    isLit -> LcarsColors.Lavender
-                    else -> LcarsColors.MutedSlate
+                    isSelected -> LcarsSemanticColors.staticStateLabel(LcarsValueLevel.PLUS)
+                    isLit || isZeroRef -> LcarsSemanticColors.staticStateLabel(level)
+                    else -> LcarsSemanticColors.toggleButton(false, level)
+                }
+                val segTextColor = if (isSelected || isLit || isZeroRef) {
+                    LcarsColors.CanvasBlack
+                } else {
+                    LcarsColors.InactiveLabel
                 }
                 val segLabel = when {
                     isZeroRef -> "0"
@@ -751,13 +881,7 @@ fun LcarsSegmentedEvBar(
                 LcarsHeaderSegment(
                     text = segLabel,
                     color = segColor,
-                    textColor = if (segColor == LcarsColors.MutedSlate) {
-                        LcarsColors.ApricotPeach
-                    } else {
-                        LcarsColors.CanvasBlack
-                    },
-                    endStyle = LcarsPillEndStyle.FlatBlock,
-                    onClick = { onSelectEv(stepEv) },
+                    textColor = segTextColor,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
@@ -767,14 +891,15 @@ fun LcarsSegmentedEvBar(
             LcarsPillButton(
                 label = "+",
                 active = exposureBiasEv < 0.95f,
-                activeColor = LcarsColors.WarmSand,
+                activeColor = LcarsSemanticColors.actionOrDrawerButton(LcarsValueLevel.PLUS),
+                inactiveColor = LcarsSemanticColors.toggleButton(false, LcarsValueLevel.PLUS),
                 endStyle = LcarsPillEndStyle.FlatLeftRoundRight,
                 onClick = {
                     val next = (exposureBiasEv + 0.5f).coerceIn(-2.0f, 1.0f)
                     onSelectEv(next)
                 },
                 modifier = Modifier
-                    .width(34.dp)
+                    .width(36.dp)
                     .fillMaxHeight()
             )
         }

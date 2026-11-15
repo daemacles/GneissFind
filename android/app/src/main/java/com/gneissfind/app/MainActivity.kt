@@ -1,3 +1,8 @@
+/*
+ * Single-activity Android entry point locked to reversible sensorLandscape orientation.
+ * Synchronizes display rotation across CameraX, IMU coordinate remapping, and ARCore, routes
+ * sonification volume to STREAM_MUSIC, silences UI tap effects, and hosts ScannerScreen.
+ */
 package com.gneissfind.app
 
 import android.Manifest
@@ -124,8 +129,7 @@ class MainActivity : ComponentActivity() {
                         viewModel.bindCamera(owner, previewView, currentSurfaceRotation())
                     },
                     onSelectMode = viewModel::setOperatingMode,
-                    onSelectBackend = viewModel::setDetectorBackend,
-                    onCycleScenario = viewModel::cycleScenarioPreset,
+                    onSelectSource = viewModel::selectSourceOption,
                     onToggleSwathTileMode = viewModel::toggleSwathTileMode,
                     onToggleEisLock = viewModel::setEisPitchLockEnabled,
                     onSyncPitch = viewModel::syncReferencePitch,

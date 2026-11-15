@@ -41,6 +41,59 @@ import kotlinx.coroutines.flow.update
 import kotlin.math.atan2
 import kotlin.math.roundToInt
 
+/**
+ * Selectable detection input sources presented inside the scrollable LCARS `SOURCE` drawer.
+ *
+ * @property code Short LCARS index prefix displayed on the drawer row (`S-01`..`S-05`).
+ * @property title Primary uppercase label shown on the drawer row and collapsed `SOURCE` button.
+ * @property subtitle Secondary description displayed inside the expanded selection drawer.
+ * @property backend Underlying [DetectorBackend] activated when this source is selected.
+ * @property syntheticProfile Optional [SyntheticTargetProfile] when [backend] is synthetic.
+ */
+enum class DetectorSourceOption(
+    val code: String,
+    val title: String,
+    val subtitle: String,
+    val backend: DetectorBackend,
+    val syntheticProfile: SyntheticTargetProfile?
+) {
+    LIVE_CAMERA_GPU(
+        code = "S-01",
+        title = "LIVE CAM (GPU FP16)",
+        subtitle = "RF-DETR NANO TWO-GRAPH • REALTIME CAMERA",
+        backend = DetectorBackend.RF_DETR_NANO_GPU,
+        syntheticProfile = null
+    ),
+    SIM_MIXED_GRAVEL(
+        code = "S-02",
+        title = "MIXED GRAVEL SIM",
+        subtitle = "MULTI-CLASS SYNTHETIC WALK STREAM",
+        backend = DetectorBackend.SYNTHETIC_DEMO,
+        syntheticProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK
+    ),
+    SIM_AGATE_20MM(
+        code = "S-03",
+        title = "20MM AGATE (780HZ)",
+        subtitle = "SMALL PEBBLE • HIGH-PITCH SONIFIER TEST",
+        backend = DetectorBackend.SYNTHETIC_DEMO,
+        syntheticProfile = SyntheticTargetProfile.PEBBLE_20MM_HIGH_PITCH
+    ),
+    SIM_JASPER_55MM(
+        code = "S-04",
+        title = "55MM JASPER (320HZ)",
+        subtitle = "LARGE COBBLE • LOW-PITCH SONIFIER TEST",
+        backend = DetectorBackend.SYNTHETIC_DEMO,
+        syntheticProfile = SyntheticTargetProfile.COBBLE_55MM_LOW_PITCH
+    ),
+    SIM_CONFUSER_MUTE(
+        code = "S-05",
+        title = "CONFUSER MUTE SIM",
+        subtitle = "BASALT / QUARTZITE • SILENT REJECTION",
+        backend = DetectorBackend.SYNTHETIC_DEMO,
+        syntheticProfile = SyntheticTargetProfile.QUIET_GRAVEL_CONFUSERS
+    )
+}
+
 data class ScannerUiState(
     val operatingMode: OperatingMode = OperatingMode.SCAN,
     val detectorBackend: DetectorBackend = DetectorBackend.SYNTHETIC_DEMO,
@@ -81,7 +134,16 @@ data class ScannerUiState(
     val audioCadenceHz: Float = 0f,
     val loggedFrameCount: Int = 0,
     val fieldLogDirectory: String = ""
-)
+) {
+    val activeSourceOption: DetectorSourceOption
+        get() = if (detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
+            DetectorSourceOption.LIVE_CAMERA_GPU
+        } else {
+            DetectorSourceOption.entries.firstOrNull {
+                it.backend == DetectorBackend.SYNTHETIC_DEMO && it.syntheticProfile == syntheticProfile
+            } ?: DetectorSourceOption.SIM_MIXED_GRAVEL
+        }
+}
 
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -224,31 +286,19 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Inline LCARS scenario cycler (`LIVE CAM (GPU)` -> `MIXED GRAVEL SIM` -> `21MM AGATE` ->
-     * `56MM JASPER` -> `CONFUSERS MUTED`) so testing never requires a modal sheet.
+     * Activates the chosen [DetectorSourceOption] from the scrollable LCARS `SOURCE` drawer and
+     * clears any prior spatial target tracks.
      */
-    fun cycleScenarioPreset() {
-        val cur = _uiState.value
+    fun selectSourceOption(option: DetectorSourceOption) {
         tracker.reset()
-        if (cur.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
-            syntheticDetector.profile = SyntheticTargetProfile.MIXED_GRAVEL_WALK
-            _uiState.update {
-                it.copy(
-                    detectorBackend = DetectorBackend.SYNTHETIC_DEMO,
-                    syntheticProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK
-                )
-            }
-            return
+        option.syntheticProfile?.let { profile ->
+            syntheticDetector.profile = profile
         }
-
-        val profiles = SyntheticTargetProfile.entries
-        val nextIdx = profiles.indexOf(cur.syntheticProfile) + 1
-        if (nextIdx < profiles.size) {
-            val nextProfile = profiles[nextIdx]
-            syntheticDetector.profile = nextProfile
-            _uiState.update { it.copy(syntheticProfile = nextProfile) }
-        } else {
-            _uiState.update { it.copy(detectorBackend = DetectorBackend.RF_DETR_NANO_GPU) }
+        _uiState.update { prev ->
+            prev.copy(
+                detectorBackend = option.backend,
+                syntheticProfile = option.syntheticProfile ?: prev.syntheticProfile
+            )
         }
     }
 
