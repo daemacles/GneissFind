@@ -36,3 +36,4 @@ sessions/
 *.ckpt
 *.safetensors
 *.tflite
+ml-pipeline/artifacts/

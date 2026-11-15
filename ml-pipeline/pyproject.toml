@@ -1,0 +1,28 @@
+[project]
+name = "gneissfind-ml-pipeline"
+version = "0.2.0"
+description = "RF-DETR-Nano LiteRT GPU export, COCO stand-in oracle, and parity test suite for GneissFind"
+readme = "README.md"
+authors = [
+    { name = "Jim Youngquist", email = "james.youngquist@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "ai-edge-litert>=2.3.0",
+    "ai-edge-torch>=0.7.2",
+    "numpy>=2.4.6",
+    "pillow>=13.0.0",
+    "pytest>=9.2.0",
+    "rfdetr>=1.12.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:`torch.jit.script` is deprecated:FutureWarning",
+    "ignore:OpenCV \\(`opencv-python`\\) is not installed:UserWarning",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"

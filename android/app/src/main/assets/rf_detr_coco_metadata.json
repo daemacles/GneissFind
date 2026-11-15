@@ -1,0 +1,96 @@
+{
+  "model_name": "rf_detr_nano_coco",
+  "rfdetr_version": "1.12.1",
+  "input_resolution": 384,
+  "input_layout": "NHWC_RGB_FLOAT32_0_TO_1",
+  "fused_normalization": {
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "batch_size": 5,
+  "topology": "two_graph",
+  "asset_files": {
+    "single_graph": "rf_detr_nano_coco.tflite",
+    "part1": "rf_detr_nano_part1_backbone_encoder.tflite",
+    "part2": "rf_detr_nano_part2_decoder_head.tflite"
+  },
+  "encoder_grid_hw": [
+    24,
+    24
+  ],
+  "num_encoder_tokens": 576,
+  "hidden_dim": 256,
+  "proposal_default_wh": 0.05,
+  "num_queries": 300,
+  "num_classes": 91,
+  "class_id_indexing": "coco_91_sparse",
+  "scores_are_probabilities": true,
+  "boxes_format": "cxcywh_normalized_0_to_1",
+  "score_threshold": 0.35,
+  "stand_in_map": {
+    "CHALCEDONY_AGATE": {
+      "coco_label": "cup",
+      "class_id": 47,
+      "stone_class_id": 0
+    },
+    "JASPER_RED_YELLOW": {
+      "coco_label": "apple",
+      "class_id": 53,
+      "stone_class_id": 1
+    },
+    "GREEN_GEM_ROCK": {
+      "coco_label": "toothbrush",
+      "class_id": 90,
+      "stone_class_id": 2
+    },
+    "PETRIFIED_WOOD": {
+      "coco_label": "remote",
+      "class_id": 75,
+      "stone_class_id": 3
+    }
+  },
+  "hard_confuser_stone_class_id": 4,
+  "unmapped_confident_to_hard_confuser": true,
+  "empirical_verification": {
+    "cup": {
+      "class_id": 47,
+      "pytorch_top_score": 0.962696,
+      "tflite_top_score": 0.962696,
+      "max_score_abs_diff": 2e-06,
+      "max_box_abs_diff": 0.0,
+      "top_box_iou": 1.0
+    },
+    "apple": {
+      "class_id": 53,
+      "pytorch_top_score": 0.958695,
+      "tflite_top_score": 0.958699,
+      "max_score_abs_diff": 0.008182,
+      "max_box_abs_diff": 1e-06,
+      "top_box_iou": 0.999998
+    },
+    "toothbrush": {
+      "class_id": 90,
+      "pytorch_top_score": 0.869334,
+      "tflite_top_score": 0.869333,
+      "max_score_abs_diff": 4e-06,
+      "max_box_abs_diff": 3e-06,
+      "top_box_iou": 0.999999
+    },
+    "remote": {
+      "class_id": 75,
+      "pytorch_top_score": 0.956245,
+      "tflite_top_score": 0.956245,
+      "max_score_abs_diff": 4e-06,
+      "max_box_abs_diff": 0.0,
+      "top_box_iou": 1.0
+    }
+  }
+}
