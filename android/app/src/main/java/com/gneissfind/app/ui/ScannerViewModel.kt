@@ -393,7 +393,24 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun setSimulatedWalkSpeedOverride(speedMps: Float?) {
         raycaster.simulatedWalkSpeedOverrideMps = speedMps
-        _uiState.update { it.copy(simulatedSpeedOverrideMps = speedMps) }
+        val immediateSpeedState = when {
+            speedMps == null -> ScanSpeedState.Normal(0f)
+            speedMps > TemporalTargetTracker.MAX_SWEEP_SPEED_MPS -> ScanSpeedState.SpeedWarning(speedMps)
+            else -> ScanSpeedState.Normal(speedMps)
+        }
+        sonifier.updateTargets(
+            confirmedTargets = _uiState.value.confirmedTargets,
+            speedState = immediateSpeedState
+        )
+        val audioTel = sonifier.latestTelemetry
+        _uiState.update {
+            it.copy(
+                simulatedSpeedOverrideMps = speedMps,
+                speedState = immediateSpeedState,
+                audioPitchHz = audioTel.currentPitchHz,
+                audioCadenceHz = audioTel.currentPingCadenceHz
+            )
+        }
     }
 
     fun toggleOverspeedTest() {

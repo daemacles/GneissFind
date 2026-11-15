@@ -217,8 +217,6 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
 
     private var currentCropYFloat: Float = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat()
     private var currentSwathMode: SwathTileMode = SwathTileMode.FIVE_TILE
-    private var lastMeasuredViewportW: Int = -1
-    private var lastMeasuredViewportH: Int = -1
 
     init {
         clipChildren = true
@@ -238,8 +236,12 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
     }
 
     fun updateStabilizationState(cropYFloat: Float, swathTileMode: SwathTileMode) {
+        val swathChanged = currentSwathMode != swathTileMode
         currentCropYFloat = cropYFloat
         currentSwathMode = swathTileMode
+        if (swathChanged) {
+            requestLayout()
+        }
         if (width > 0 && height > 0) {
             val t = computePanoramicViewportTransform(
                 viewportWidthPx = width.toFloat(),
@@ -252,6 +254,25 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         }
     }
 
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val vwInt = MeasureSpec.getSize(widthMeasureSpec).coerceAtLeast(1)
+        val vhInt = MeasureSpec.getSize(heightMeasureSpec).coerceAtLeast(1)
+        val t = computePanoramicViewportTransform(
+            viewportWidthPx = vwInt.toFloat(),
+            viewportHeightPx = vhInt.toFloat(),
+            cropYFloat = currentCropYFloat,
+            swathTileMode = currentSwathMode
+        )
+        val childW = t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
+        val childH = t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
+        // Always measure PreviewView so dynamically attached TextureView children size to non-zero bounds.
+        previewView.measure(
+            MeasureSpec.makeMeasureSpec(childW, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(childH, MeasureSpec.EXACTLY)
+        )
+        setMeasuredDimension(vwInt, vhInt)
+    }
+
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
         val vwInt = (right - left).coerceAtLeast(1)
         val vhInt = (bottom - top).coerceAtLeast(1)
@@ -261,18 +282,10 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
             cropYFloat = currentCropYFloat,
             swathTileMode = currentSwathMode
         )
-        if (vwInt != lastMeasuredViewportW || vhInt != lastMeasuredViewportH) {
-            lastMeasuredViewportW = vwInt
-            lastMeasuredViewportH = vhInt
-            val childLeft = t.frameLeftPx.roundToInt()
-            val childW = t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
-            val childH = t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
-            previewView.measure(
-                MeasureSpec.makeMeasureSpec(childW, MeasureSpec.EXACTLY),
-                MeasureSpec.makeMeasureSpec(childH, MeasureSpec.EXACTLY)
-            )
-            previewView.layout(childLeft, 0, childLeft + childW, childH)
-        }
+        val childLeft = t.frameLeftPx.roundToInt()
+        val childW = t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
+        val childH = t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
+        previewView.layout(childLeft, 0, childLeft + childW, childH)
         previewView.translationY = t.frameTopPx
     }
 }
@@ -1055,7 +1068,7 @@ private fun TacticalControlDeckZone(
         ) {
             LcarsPillButton(
                 label = if (isLogging) "LOG" else "SCAN",
-                subLabel = if (isLogging) "STOP REC" else "START LOG",
+                subLabel = if (isLogging) "TO SCAN" else "TO LOG",
                 prefixCode = "MOD",
                 active = true,
                 activeColor = if (isLogging) {

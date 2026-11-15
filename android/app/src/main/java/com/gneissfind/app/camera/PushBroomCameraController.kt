@@ -172,22 +172,10 @@ class PushBroomCameraController(
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
 
-        // Attach Camera2Interop session callback + default ON <= 1/500s shutter clamp
+        // Attach Camera2Interop session callback for per-frame exposure/ISO/intrinsics telemetry.
+        // Dynamic AE clamp options are driven exclusively via Camera2CameraControl so Extender's
+        // ALWAYS_OVERRIDE priority never shadows runtime EXP / EV toggle updates.
         val analysisExtender = Camera2Interop.Extender(analysisBuilder)
-        if (shutterClampEnabled) {
-            analysisExtender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_MODE,
-                CameraMetadata.CONTROL_AE_MODE_OFF
-            )
-            analysisExtender.setCaptureRequestOption(
-                CaptureRequest.SENSOR_EXPOSURE_TIME,
-                MAX_SHUTTER_EXPOSURE_NS
-            )
-            analysisExtender.setCaptureRequestOption(
-                CaptureRequest.SENSOR_SENSITIVITY,
-                clampedFloatingIso
-            )
-        }
 
         analysisExtender.setSessionCaptureCallback(
             object : CameraCaptureSession.CaptureCallback() {
@@ -306,7 +294,11 @@ class PushBroomCameraController(
         )
 
         val c2Control = Camera2CameraControl.from(camera.cameraControl)
+        val evState = camera.cameraInfo.exposureState
         if (shutterClampEnabled) {
+            if (evState.isExposureCompensationSupported && evState.exposureCompensationIndex != 0) {
+                camera.cameraControl.setExposureCompensationIndex(0)
+            }
             val clampedExpNs = MAX_SHUTTER_EXPOSURE_NS.coerceIn(
                 sensorExposureRangeNs.lower,
                 sensorExposureRangeNs.upper
@@ -332,15 +324,9 @@ class PushBroomCameraController(
                 .build()
             c2Control.setCaptureRequestOptions(options)
         } else {
-            val clearOptions = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AE_MODE,
-                    CameraMetadata.CONTROL_AE_MODE_ON
-                )
-                .build()
-            c2Control.setCaptureRequestOptions(clearOptions)
+            // Clear manual AE/shutter/ISO overrides so CameraX restores native CONTROL_AE_MODE_ON.
+            c2Control.clearCaptureRequestOptions()
 
-            val evState = camera.cameraInfo.exposureState
             if (evState.isExposureCompensationSupported) {
                 val step = evState.exposureCompensationStep.toFloat().coerceAtLeast(0.1f)
                 val index = (exposureBiasEv / step).roundToInt()
@@ -377,7 +363,9 @@ class PushBroomCameraController(
         }
         if (count == 0) return
         val meanLuma = lumaSum.toFloat() / count
-        val targetLuma = 118f
+        // Bias target Y-luma in gamma (~0.5) space so auto-ISO preserves user Canopy EV stops.
+        val targetLuma = (118f * 2.0.pow((exposureBiasEv * 0.5f).toDouble()).toFloat())
+            .coerceIn(42f, 210f)
         val ratio = (targetLuma / meanLuma.coerceAtLeast(12f)).coerceIn(0.65f, 1.55f)
         if (kotlin.math.abs(ratio - 1.0f) > 0.12f) {
             clampedFloatingIso = (clampedFloatingIso * ratio).roundToInt()
