@@ -13,10 +13,11 @@
 | :--- | :--- | :--- | :--- |
 | **Milestone 1** | **Completed** (`3f1dee0`) | Google Pixel 10 Pro XL (Android 16) | Baseline push-broom skeleton, `Camera2Interop` `<= 1/500 s` shutter clamp + floating ISO, synthetic detector, 3-of-6 temporal voter, ARCore/IMU speed gate, and `AudioTrack` sonifier. |
 | **Milestone 1B** | **Completed & Hardware-Validated** (`0e3c81e` .. `fc80785`) | Google Pixel 10 Pro XL (Android 16) + API 37 Emulator | Reversible `sensorLandscape`, default `2.0x` lossless sensor crop + `<= 1/500 s` clamp, `5 x 384x384` (`1792x384`) overlapping tile cropper with cross-tile NMS, 120 Hz GPU RenderNode IMU pitch stabilization, Classic 2360s TNG LCARS split-screen UI with 6-role semantic color taxonomy, inline source drawer, and dynamic `Camera2CameraControl` exposure/EV servo. |
+| **Milestone 2** | **Completed & Hardware-Benchmarked** (`96147e5` .. `HEAD`) | Google Pixel 10 Pro XL (`58110DLCQ00003`, Tensor G5, Android 17 `CP3A.261005.005`) | Reproducible `uv` + `litert-torch` `RF-DETR-Nano` (`384x384` MS-COCO) exporter with rank-4 `LITERT_CL` operator rewrites (`909/909` `Part 1` and `350/350` `Part 2` single-partition OpenCL GPU delegation), verified COCO stand-in oracle (`cup=47`, `apple=53`, `toothbrush=90`, `remote=75`, `IoU=1.0000`), cross-tile `IoU + IoM + seam` union box merging, and on-device 4-way (`1-Graph vs 2-Graph` $\times$ `B=5 vs 5xB=1`) benchmark harness (`scripts/benchmark_pixel10.sh`). |
 
 ---
 
-## 2. Commit Ledger (Milestone 1 → Milestone 1B)
+## 2. Commit Ledger (Milestone 1 → Milestone 2)
 
 | Commit | Summary | Primary Files Touched |
 | :--- | :--- | :--- |
@@ -26,10 +27,15 @@
 | `d724234` | Decouple 120 Hz GPU EIS preview translation from analyzer frame rate | `ar/GroundPlaneRaycaster.kt`, `camera/PushBroomCameraController.kt`, `ui/ScannerScreen.kt`, `ui/ScannerViewModel.kt` |
 | `8707282` | Refine LCARS semantic color taxonomy, source drawer, left pitch gauge, and single-action affordances | `MainActivity.kt`, `ui/ScannerScreen.kt`, `ui/ScannerViewModel.kt`, `ui/theme/LcarsComponents.kt`, `ui/theme/Theme.kt`, `LcarsGeometryAndViewportTest.kt` |
 | `fc80785` | Fix `PreviewView` `TextureView` layout starvation and Camera2 dynamic exposure overrides | `camera/PushBroomCameraController.kt`, `ui/ScannerScreen.kt`, `ui/ScannerViewModel.kt` |
+| `6d796fc` | Add engineering and validation ledger documenting Milestone 1 to 1B findings | `docs/ENGINEERING_LEDGER.md`, `docs/ROADMAP.md` |
+| `38d167a` | Install dexiotites commenting standard and annotate-code skill | `docs/COMMENTING.md`, `CLAUDE.md`, `.agents/skills/annotate-code/*` |
+| `96147e5` | Update project specifications and roadmap for Milestone 2 COCO stand-in slice | `AGENTS.md`, `docs/ROADMAP.md`, `.agents/rules/*`, `scripts/pack_context.sh` |
+| `4825ef5` | Add `RF-DETR-Nano` LiteRT export pipeline and verified COCO stand-in metadata | `ml-pipeline/**`, `android/app/src/main/assets/rf_detr_coco_metadata.json` |
+| `965d027` | Wire LiteRT 2.x GPU COCO detector and cross-tile IoM seam merging on Android | `model/StoneModels.kt`, `camera/PushBroomCropper.kt`, `inference/RfDetrTwoGraphGpuDetector.kt`, `ui/ScannerViewModel.kt`, `ui/ScannerScreen.kt`, `PushBroomCropperTest.kt`, `SonifierAndHostBridgeTest.kt` |
 
 ---
 
-## 3. Chronological Findings & Architectural Evolution (M1 → M1B)
+## 3. Chronological Findings & Architectural Evolution (M1 → M2)
 
 ### 3.1. Milestone 1 On-Device Critique (Portrait Living-Room Run on Pixel 10 Pro XL)
 Running the initial Milestone 1 portrait UI on a physical Pixel 10 Pro XL surfaced four critical field-usability defects:
@@ -100,20 +106,77 @@ A follow-up screen recording on the physical Pixel 10 Pro XL after the 120 Hz EI
 
 ---
 
-## 4. Current Android Architecture & Interfaces for Milestone 2 / 3 Coordination
+### 3.5. Milestone 2 — `RF-DETR-Nano` LiteRT GPU Export, `LITERT_CL` Operator Engineering & Pixel 10 Pro XL Benchmark (`4825ef5`, `965d027`, `HEAD`)
 
-When planning or modifying upcoming milestones in `docs/ROADMAP.md` or `ml-pipeline/`, use these exact contracts from `android/`:
+#### 3.5.1. Empirical MS-COCO Stand-In Class-Index Oracle (`ml-pipeline/`)
+`RFDETRNano` (`rfdetr==1.12.1`, `resolution=384`, `num_queries=300`) emits **91 sparse MS-COCO category logits** (`shape [B, 300, 91]`), not contiguous `0..79` indices. Running the empirical verification suite (`uv run python scripts/verify_coco_export.py` and `uv run pytest -v`, `6/6` tests passing) across real `384x384` fixtures verified the exact 0-based logit indices and PyTorch-vs-LiteRT parity:
 
-- **Push-Broom Tile Extraction (`com.gneissfind.app.camera.PushBroomCropper`):**
+| GneissFind `StoneClass` | LCARS UI Button (Unchanged) | Household Stand-In | Verified 91-Logit `class_id` | PyTorch Score | LiteRT `.tflite` Score | Top-Box IoU | Max Score $\|\Delta\|$ |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `0: CHALCEDONY_AGATE` | `01 AGATE / CARNELIAN` | **`cup`** | **`47`** | `0.963` | `0.963` | **`1.0000`** | `0.000002` |
+| `1: JASPER_RED_YELLOW` | `02 RED / YEL JASPER` | **`apple`** | **`53`** | `0.959` | `0.959` | **`1.0000`** | `0.008182` |
+| `2: GREEN_GEM_ROCK` | `03 DALLASITE / JADE` | **`toothbrush`** | **`90`** | `0.869` | `0.869` | **`1.0000`** | `0.000004` |
+| `3: PETRIFIED_WOOD` | `04 PETRIFIED WOOD` | **`remote`** | **`75`** | `0.956` | `0.956` | **`1.0000`** | `0.000005` |
+| `4: HARD_CONFUSER` | *(Muted — no bracket / audio)* | All other classes (`!= 47, 53, 90, 75`) | `0..90` | — | — | — | — |
+
+#### 3.5.2. Achieving 100% Single-Partition `LITERT_CL` OpenCL GPU Delegation (`Part 1: 909/909`, `Part 2: 350/350`)
+Deploying the initial `litert_torch` exports onto the physical Google Pixel 10 Pro XL (`serial=58110DLCQ00003`, `soc=Tensor G5`, `board=laguna`, PowerVR DXT-48-1536 OpenCL GPU via `libLiteRtClGlAccelerator.so`) exposed five critical `LITERT_CL` hardware/compiler constraints that caused standard `RF-DETR-Nano` exports to either fail compilation or fragment into slow CPU fallback partitions:
+
+1. **Constraint 1 — `TOPK_V2` & `GATHER_ND` Not Supported by `LITERT_CL`:**
+   - In the fused 1-Graph export (`rf_detr_nano_1g_b5.tflite`), two-stage query proposal selection (`torch.topk` over `576` tokens $\rightarrow$ `TOPK_V2` + `GATHER_ND`) is rejected by `LITERT_CL`. Even worse, LiteRT's graph partitioner refuses to re-enter the GPU after the mid-graph `TOPK_V2` barrier, delegating only `900 / 1304` nodes (the DINOv2 backbone) to `LITERT_CL` and dropping all remaining `404` decoder nodes (`8` XNNPACK partitions + `30` un-delegated CPU ops) onto the CPU.
+   - *Fix (`RfDetrPart1BackboneEncoder` + `host_select_topk_queries` + `RfDetrPart2DecoderHead`):* Splitting the graph immediately after encoder proposal scoring moves `TopK` (`K=300` of `576` tokens) and static `24x24` proposal anchor gathering to a zero-allocation Kotlin min-heap bridge (`selectTopKProposalsFromMaxScores`, taking **`1.5–3.6 ms`** for all 5 tiles) so neither subgraph contains `TOPK_V2` or `GATHER_ND`.
+2. **Constraint 2 — `F.grid_sample` Lowers to `GATHER_ND` + Boolean Masks; `pixel_row_grid_sample` Overflow in FP16:**
+   - PyTorch's `F.grid_sample` inside `MSDeformAttn` lowers to `GATHER_ND` + `LOGICAL_AND` + `SELECT_V2` (unsupported on `LITERT_CL`), while `rfdetr`'s `pixel_row_grid_sample` flattens `(B * n_heads, H+2, W+2)` into 1D float indices that exceed `float16`'s exact integer limit (`2048`) once `N * 676 > 2048`.
+   - *Fix (`bilinear_matmul_grid_sample` in `wrappers.py`):* Computes separable 1D bilinear tent weights `relu(1 - |p - i|)` over `0..23` (exact in FP16) and contracts via `torch.bmm` (`BATCH_MATMUL`), matching `F.grid_sample` within `2e-5` without `GATHER_ND`.
+3. **Constraint 3 — `LITERT_CL` Rejects Any Tensor with Rank $\ge 5$ (`Tensor dimensions must be less than 5`):**
+   - `WindowedDinov2WithRegistersEmbeddings`, `WindowedDinov2WithRegistersBackbone`, and `MSDeformAttn` reshape tensors into 5D/6D views (`(B, num_windows, num_h_win, num_windows, num_w_win, C)` and `(B, Q, n_heads, n_levels, n_points, 2)`), causing `LITERT_CL` to reject `SLICE`, `TRANSPOSE`, `ADD`, `MUL`, and `DIV` nodes and fragment `Part 1` into `27` partitions!
+   - *Fix (`_gpu_rank4_embeddings_forward`, `_gpu_rank4_backbone_forward`, `_gpu_rank4_ms_deform_attn_forward` in `wrappers.py`):* Fused adjacent non-transposed axes (`num_w_win * C`, `B * Q`, `n_points * 2`) during every window/un-window and attention transpose so every tensor in both `Part 1` and `Part 2` has rank $\le 4$.
+4. **Constraint 4 — `BROADCAST_TO` Not Supported by `LITERT_CL`:**
+   - `.expand(...)` and `.repeat(...)` on `cls_token`, `register_tokens`, `query_feat`, `refpoint_embed`, and `pos_embed` lower to `BROADCAST_TO`, which `LITERT_CL` rejects.
+   - *Fix (`_repeat_along_dim0` in `wrappers.py`):* Replaced batch/window expansions with `torch.cat([tensor] * count, dim=0)` (`CONCATENATION`).
+5. **Constraint 5 — `FLOOR_DIV` (`gen_sineembed_for_position`) and `RELU_0_TO_1` (`.clamp(0.0, 1.0)`) in `Part 2`:**
+   - Tracing `dim_t // 2` on `torch.arange(128)` inside `rfdetr.models.transformer.gen_sineembed_for_position` emitted `FLOOR_DIV`, and `boxes.clamp(0.0, 1.0)` emitted `RELU_0_TO_1`, splitting `Part 2` into `3` partitions (`306/360` nodes on GPU, `54` on CPU).
+   - *Fix (`_gpu_friendly_sineembed_for_position` and `_clamp_unit_interval_via_relu` in `wrappers.py`):* Precomputed the 64-element float frequency denominator and replaced `.clamp(0.0, 1.0)` with `F.relu(x) - F.relu(x - 1.0)` (`RELU` + `SUB`), achieving **100% single-partition `LITERT_CL` delegation on both `Part 1` (`909/909` nodes, `1` partition) and `Part 2` (`350/350` nodes, `1` partition)**.
+
+#### 3.5.3. Physical Pixel 10 Pro XL (`58110DLCQ00003`) 4-Way LiteRT GPU (FP16) Benchmark Matrix
+Measured on physical **Google Pixel 10 Pro XL** (`serial=58110DLCQ00003`, `soc=Tensor G5`, `board=laguna`, build `google/mustang/mustang:17/CP3A.261005.005/16271449:user/release-keys`, `libLiteRtClGlAccelerator.so` OpenCL FP16 delegate) via `./scripts/benchmark_pixel10.sh --skip-push --warmup 2 --sweeps 12 --cooldown 8` (isolated process per configuration; full JSON report at `ml-pipeline/artifacts/pixel10_benchmark_report.json`):
+
+| Configuration | `LITERT_CL` GPU / CPU Partitions | Stage 1 `p1` Mean (ms) | Host `TopK` Mean (ms) | Stage 2 `p2` Mean (ms) | Sweep Min (ms) | Sweep `p50` (ms) | Sweep `p95` (ms) | Sustained Throughput |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`2-Graph B=5` Batched (`5-Tile`)** *(Selected Default)* | **`909/909 (1p)` + `350/350 (1p)`** *(100% GPU)* | **294.25** | **3.63** | **78.18** | **363.01** | **376.86** | **388.40** | **2.65 Hz** (`75.37 ms/tile`) |
+| **`2-Graph 5xB=1` Sequential (`5-Tile`)** | `905/905 (1p)` + `324/324 (1p)` *(100% GPU)* | 417.14 | 3.31 | 167.78 | 544.17 | **595.97** | 626.45 | **1.68 Hz** (`119.19 ms/tile`) |
+| **`1-Graph B=5` Batched (`5-Tile`)** | `900/1304 (2p)` + `XNN:375/405 (8p)` *(Hybrid)* | 544.39 | 0.00 | 0.00 | 500.40 | **538.12** | 610.94 | **1.86 Hz** (`107.62 ms/tile`) |
+| **`1-Graph 5xB=1` Sequential (`5-Tile`)** | `900/1268 (2p)` + `XNN:343/369 (6p)` *(Hybrid)* | 822.61 | 0.00 | 0.00 | 771.50 | **799.32** | 895.18 | **1.25 Hz** (`159.86 ms/tile`) |
+| **`2-Graph 3xB=1` Sequential (`3-Tile` Narrow)** | `905/905 (1p)` + `324/324 (1p)` *(100% GPU)* | 250.14 | 3.11 | 102.74 | 332.70 | **355.68** | 380.49 | **2.81 Hz** (`118.56 ms/tile`) |
+| **`2-Graph B=5` CPU XNNPACK Fallback (`4 threads`)** | `XNN:909/909 (1p)` + `XNN:350/350 (1p)` *(CPU)* | 1320.09 | 2.04 | 310.35 | 1618.40 | **1632.75** | 2041.58 | **0.61 Hz** (`326.55 ms/tile`) |
+
+#### 3.5.4. Roofline & Architectural Conclusions from the Pixel 10 Pro XL Benchmark
+1. **Why `2-Graph B=5` Wins Decisively (`376.86 ms` `p50`, `363.01 ms` `min`):**
+   - **2-Graph vs. 1-Graph (`1.43x` speedup at `B=5`):** Moving two-stage `TopK` (`3.63 ms` for 5 tiles) to the host CPU eliminates the `TOPK_V2`/`GATHER_ND` partition barrier that forced all `404` decoder nodes in `1-Graph B=5` onto `TfLiteXNNPackDelegate` (`8` CPU partitions), cutting `p50` sweep time by **`161.26 ms`** (`538.12 ms -> 376.86 ms`).
+   - **Batched `B=5` vs. Sequential `5 x B=1` (`1.58x` speedup in `2-Graph`):** Dispatching a single `B=5` tensor amortizes weight texture fetches and eliminates 8 redundant OpenCL command-queue flushes and JNI synchronizations per sweep, cutting `p50` sweep time by **`219.11 ms`** (`595.97 ms -> 376.86 ms`).
+   - **OpenCL `Image2D` Texture Storage vs. SSBO Buffers (`2.25x` speedup on PowerVR DXT-48-1536):** Forcing `BufferStorageType.BUFFER` on `LITERT_CL` degraded `2-Graph B=5` from `376.86 ms` to `848.90 ms` (`p1_ms = 711.97 ms`) because PowerVR's hardware texture cache (`Image2D`) provides >2x higher effective bandwidth for ViT linear/conv layers than global SSBO buffer loads. Meanwhile, keeping all intermediate tensor dimensions $\le 1200$ (`< CL_DEVICE_IMAGE2D_MAX_WIDTH = 16384`) prevented `clCreateImage: Invalid image size` failures.
+2. **Hardware Roofline vs. the `125 ms/sweep` Target:**
+   - A single `384x384` tile of `RF-DETR-Nano` (`12`-layer DINOv2-Small backbone + `P4` C2f projector + `2`-layer `300`-query deformable decoder) requires **`29.703 GFLOPs` (`14.851 GMACs`)**: `27.509 GFLOPs` (`92.6%`) in `Part 1` and `2.194 GFLOPs` (`7.4%`) in `Part 2`.
+   - Across `5` tiles (`B=5`), each sweep executes **`148.513 GFLOPs` (`74.257 GMACs`)**. At **`376.86 ms` (`p50`) / `363.01 ms` (`min`)**, the Pixel 10 Pro XL GPU sustains **`394–409 GFLOP/s` effective end-to-end** (`467 GFLOP/s` on `Part 1`) while simultaneously rendering the 120 Hz camera `PreviewView` and ARCore VIO session.
+   - Single-tile (`B=1` amortized in `B=5`) latency is **`75.37 ms/tile` (`13.27 tiles/sec`)**, which is well below `125 ms` per tile; executing `5` tiles (`148.51 GFLOPs`) in `<= 125 ms` would require `>= 1.19 TFLOP/s` sustained mobile OpenCL throughput (or INT8 / NPU delegation or backbone token pruning in future milestones). Because `ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST` and the 120 Hz GPU RenderNode EIS (`GroundPlaneRaycaster.onRealtimeImuUpdate`) are completely decoupled from the background analyzer executor, the UI and camera preview run at a locked 120 Hz with zero frame drops while `2-Graph B=5` sweeps complete every `~377 ms` (`2.65 Hz`).
+
+---
+
+## 4. Current Android Architecture & Interfaces for Milestone 3 / 4 Coordination
+
+When planning or modifying upcoming milestones in `docs/ROADMAP.md` or `ml-pipeline/`, use these exact contracts from `android/` and `ml-pipeline/`:
+
+- **Push-Broom Tile Extraction & Cross-Tile Seam Merge (`com.gneissfind.app.camera.PushBroomCropper`):**
   - Input frame: `1920 x 1080` landscape `YUV_420_888` (`ImageProxyYuv420Frame`).
   - Active strip modes (`SwathTileMode`):
     - `FIVE_TILE` (default): `5` tiles of `384 x 384 px`, `xOffsets = [64, 416, 768, 1120, 1472]`, `32 px` overlap, unified strip `1792 x 384 px`.
     - `THREE_TILE`: `3` tiles of `384 x 384 px`, `xOffsets = [416, 768, 1120]`, `32 px` overlap, unified strip `1088 x 384 px`.
-  - Pre-allocated buffers (`PushBroomSweepBuffers`): holds `activeTileCount` reusable `FloatArray(384 * 384 * 3)` RGB `[0..1]` NHWC buffers plus an optional packed `IntArray(1792 * 384)` ARGB strip populated only when `OperatingMode.LOG_DATA` is active.
+  - Pre-allocated buffers (`PushBroomSweepBuffers`): holds `activeTileCount` reusable `FloatArray(384 * 384 * 3)` RGB `[0..1]` NHWC buffers (`applyImageNetNormalization = false`, since `(x - mean) / std` is fused into the `.tflite` graph prefix) plus an optional packed `IntArray(1792 * 384)` ARGB strip populated only when `OperatingMode.LOG_DATA` is active.
+  - Cross-tile seam deduplication (`mergeCrossTileDetections`): clusters same-class detections across tiles when `IoU >= 0.45f`, `IoM >= 0.65f`, or when boxes from adjacent tiles straddle the `[xOffset .. xOffset + 32]` seam band within `8 px` margin with vertical overlap ratio `>= 0.60f`, fusing each cluster into its union bounding box (`minLeft, minTop, maxRight, maxBottom`).
 - **Detector Interface (`com.gneissfind.app.inference.StoneDetector`):**
-  - `fun detectSweep(sweepBuffers: PushBroomSweepBuffers): DetectorSweepResult`
+  - `fun detectSweep(sweepBuffers: PushBroomSweepBuffers): SweepInferenceResult`
   - Implementations:
-    - `SyntheticStoneDetector`: deterministic moving-gravel simulator (`MIXED_GRAVEL_WALK`, `AGATE_PEBBLE_20MM`, `JASPER_COBBLE_55MM`) generating realistic cross-seam targets and muted `HARD_CONFUSER` instances.
-    - `RfDetrTwoGraphGpuDetector`: two-graph LiteRT GPU FP16 runner (`rf_detr_nano_part1_fp16.tflite` + Kotlin `selectTopKQueries` host bridge + `rf_detr_nano_part2_fp16.tflite`) with automatic fallback to `SyntheticStoneDetector` until Milestone 3 `.tflite` artifacts are placed in `android/app/src/main/assets/`.
+    - `RfDetrTwoGraphGpuDetector` *(Default active backend)*: LiteRT 2.x (`com.google.ai.edge.litert:litert:2.1.3`) GPU FP16 runner executing `rf_detr_nano_part1_backbone_encoder.tflite` (`B=5`) + zero-allocation Kotlin `selectTopKProposalsFromMaxScores` (`K=300` of `576` tokens) + `rf_detr_nano_part2_decoder_head.tflite` (`B=5`), driven by `assets/rf_detr_coco_metadata.json` (`O(1)` lookup table routing `cup=47 -> 0`, `apple=53 -> 1`, `toothbrush=90 -> 2`, `remote=75 -> 3`, and all other confident classes `-> 4 HARD_CONFUSER`). Supports hot-swapping 1-Graph/2-Graph and `B=1`/`B=5` models via `benchmark_override.json`.
+    - `SyntheticStoneDetector`: deterministic moving-gravel simulator (`MIXED_GRAVEL_WALK`, `AGATE_PEBBLE_20MM`, `JASPER_COBBLE_55MM`) selectable from `LcarsSourceDrawerOverlay`.
 - **Field Data Logger (`com.gneissfind.app.data.FieldDataLogger`):**
-  - When `MOD` is toggled to `LOG` (`OperatingMode.LOG_DATA`), saves lossless `1792 x 384` (or `1088 x 384`) PNG strips at `4.0 Hz` alongside `metadata.jsonl` (`FieldStripMetadata`: timestamp, strip dimensions, tile count, zoom ratio, exposure ns, ISO, shutter clamp state, EV bias, IMU pitch, reference pitch, stabilized `cropY`, slant range `R`, GSD `mm/px`, and horizontal walk speed `m/s`) for Milestone 2 `SAM 2` auto-labeling on the Dell T7920.
+  - When `MOD` is toggled to `LOG` (`OperatingMode.LOG_DATA`), saves lossless `1792 x 384` (or `1088 x 384`) PNG strips at `4.0 Hz` alongside `metadata.jsonl` (`FieldStripMetadata`: timestamp, strip dimensions, tile count, zoom ratio, exposure ns, ISO, shutter clamp state, EV bias, IMU pitch, reference pitch, stabilized `cropY`, slant range `R`, GSD `mm/px`, and horizontal walk speed `m/s`) for Milestone 3 `SAM 2` auto-labeling on the Dell T7920.
