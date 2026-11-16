@@ -1,0 +1,248 @@
+{
+  "strip_width_px": 1792,
+  "strip_height_px": 384,
+  "medium_targets": [
+    {
+      "target_id": "med_cup_t0",
+      "scale_band": "medium_120_200px",
+      "coco_label": "cup",
+      "coco_class_id": 47,
+      "stone_class_id": 0,
+      "minor_axis_px": 132,
+      "major_axis_px": 179,
+      "strip_xyxy_px": [
+        112.47,
+        102.07,
+        244.67,
+        281.48
+      ]
+    },
+    {
+      "target_id": "med_apple_seam01",
+      "scale_band": "medium_120_200px",
+      "coco_label": "apple",
+      "coco_class_id": 53,
+      "stone_class_id": 1,
+      "minor_axis_px": 148,
+      "major_axis_px": 151,
+      "strip_xyxy_px": [
+        294.09,
+        116.09,
+        442.35,
+        267.04
+      ]
+    },
+    {
+      "target_id": "med_toothbrush_t2",
+      "scale_band": "medium_120_200px",
+      "coco_label": "toothbrush",
+      "coco_class_id": 90,
+      "stone_class_id": 2,
+      "minor_axis_px": 92,
+      "major_axis_px": 199,
+      "strip_xyxy_px": [
+        849.71,
+        139.18,
+        941.68,
+        338.45
+      ]
+    },
+    {
+      "target_id": "med_remote_t4",
+      "scale_band": "medium_120_200px",
+      "coco_label": "remote",
+      "coco_class_id": 75,
+      "stone_class_id": 3,
+      "minor_axis_px": 96,
+      "major_axis_px": 262,
+      "strip_xyxy_px": [
+        1525.66,
+        56.25,
+        1621.55,
+        318.69
+      ]
+    }
+  ],
+  "small_targets": [
+    {
+      "target_id": "small45_cup",
+      "scale_band": "small_38_45px",
+      "coco_label": "cup",
+      "coco_class_id": 47,
+      "stone_class_id": 0,
+      "minor_axis_px": 45,
+      "major_axis_px": 61,
+      "strip_xyxy_px": [
+        87.46,
+        84.92,
+        132.38,
+        145.88
+      ]
+    },
+    {
+      "target_id": "small45_apple",
+      "scale_band": "small_38_45px",
+      "coco_label": "apple",
+      "coco_class_id": 53,
+      "stone_class_id": 1,
+      "minor_axis_px": 45,
+      "major_axis_px": 46,
+      "strip_xyxy_px": [
+        457.66,
+        92.66,
+        502.48,
+        138.29
+      ]
+    },
+    {
+      "target_id": "small45_toothbrush",
+      "scale_band": "small_38_45px",
+      "coco_label": "toothbrush",
+      "coco_class_id": 90,
+      "stone_class_id": 2,
+      "minor_axis_px": 45,
+      "major_axis_px": 98,
+      "strip_xyxy_px": [
+        807.25,
+        81.25,
+        852.25,
+        178.75
+      ]
+    },
+    {
+      "target_id": "small45_remote",
+      "scale_band": "small_38_45px",
+      "coco_label": "remote",
+      "coco_class_id": 75,
+      "stone_class_id": 3,
+      "minor_axis_px": 45,
+      "major_axis_px": 123,
+      "strip_xyxy_px": [
+        1167.25,
+        78.35,
+        1212.38,
+        201.85
+      ]
+    },
+    {
+      "target_id": "small38_cup",
+      "scale_band": "small_38_45px",
+      "coco_label": "cup",
+      "coco_class_id": 47,
+      "stone_class_id": 0,
+      "minor_axis_px": 38,
+      "major_axis_px": 51,
+      "strip_xyxy_px": [
+        231.14,
+        249.02,
+        268.91,
+        300.28
+      ]
+    },
+    {
+      "target_id": "small38_apple",
+      "scale_band": "small_38_45px",
+      "coco_label": "apple",
+      "coco_class_id": 53,
+      "stone_class_id": 1,
+      "minor_axis_px": 38,
+      "major_axis_px": 39,
+      "strip_xyxy_px": [
+        596.09,
+        256.09,
+        634.02,
+        294.71
+      ]
+    },
+    {
+      "target_id": "small38_toothbrush",
+      "scale_band": "small_38_45px",
+      "coco_label": "toothbrush",
+      "coco_class_id": 90,
+      "stone_class_id": 2,
+      "minor_axis_px": 38,
+      "major_axis_px": 82,
+      "strip_xyxy_px": [
+        961.21,
+        223.68,
+        999.18,
+        305.95
+      ]
+    },
+    {
+      "target_id": "small38_remote",
+      "scale_band": "small_38_45px",
+      "coco_label": "remote",
+      "coco_class_id": 75,
+      "stone_class_id": 3,
+      "minor_axis_px": 38,
+      "major_axis_px": 104,
+      "strip_xyxy_px": [
+        1321.0,
+        202.67,
+        1359.0,
+        306.67
+      ]
+    },
+    {
+      "target_id": "small32_cup",
+      "scale_band": "small_28_32px",
+      "coco_label": "cup",
+      "coco_class_id": 47,
+      "stone_class_id": 0,
+      "minor_axis_px": 32,
+      "major_axis_px": 44,
+      "strip_xyxy_px": [
+        1483.95,
+        88.53,
+        1516.11,
+        132.17
+      ]
+    },
+    {
+      "target_id": "small32_apple",
+      "scale_band": "small_28_32px",
+      "coco_label": "apple",
+      "coco_class_id": 53,
+      "stone_class_id": 1,
+      "minor_axis_px": 30,
+      "major_axis_px": 31,
+      "strip_xyxy_px": [
+        1664.46,
+        94.46,
+        1694.63,
+        125.18
+      ]
+    },
+    {
+      "target_id": "small32_toothbrush",
+      "scale_band": "small_28_32px",
+      "coco_label": "toothbrush",
+      "coco_class_id": 90,
+      "stone_class_id": 2,
+      "minor_axis_px": 32,
+      "major_axis_px": 69,
+      "strip_xyxy_px": [
+        1493.58,
+        240.64,
+        1525.64,
+        310.11
+      ]
+    },
+    {
+      "target_id": "small32_remote",
+      "scale_band": "small_28_32px",
+      "coco_label": "remote",
+      "coco_class_id": 75,
+      "stone_class_id": 3,
+      "minor_axis_px": 32,
+      "major_axis_px": 88,
+      "strip_xyxy_px": [
+        1668.62,
+        231.09,
+        1700.69,
+        318.84
+      ]
+    }
+  ]
+}
