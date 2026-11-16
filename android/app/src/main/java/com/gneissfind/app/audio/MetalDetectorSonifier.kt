@@ -1,3 +1,15 @@
+/*
+ * Real-time PCM16 AudioTrack metal-detector sonification engine for GneissFind.
+ *
+ * Consumes confirmed mineral targets (ConfirmedTarget) and walking speed gate state
+ * (ScanSpeedState) from ScannerViewModel, and synthesizes continuous low-latency PCM16
+ * audio bursts on a dedicated high-priority daemon thread, while publishing SonifierTelemetry
+ * back to the LCARS HUD.
+ *
+ * Main types:
+ * - MetalDetectorSonifier: stateful streaming AudioTrack synthesizer and pure pitch/cadence mapping functions.
+ * - MetalDetectorSonifier.SonifierTelemetry: immutable snapshot of active pitch, cadence, and warning buzz state.
+ */
 package com.gneissfind.app.audio
 
 import android.media.AudioAttributes
@@ -13,17 +25,36 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * Real-time `AudioTrack` metal-detector sonification engine for GneissFind:
- *  - **Pitch (`780..320 Hz`):** Inversely proportional to estimated metric stone diameter
- *    (`20 mm` pebble -> `780 Hz` bright high chirp; `60 mm` cobble -> `320 Hz` deep resonant ping).
- *  - **Ping Cadence (`2..14 Hz`):** Proportional to temporal vote / detection confidence.
- *  - **Speed Gate Warning Buzz:** Emits a distinct `145 Hz` low-frequency warning buzz whenever
- *    walking speed exceeds `1.10 m/s` (`SLOW SWEEP`).
+ * Real-time [AudioTrack] metal-detector sonification engine for GneissFind:
+ *  - **Pitch ([MAX_PITCH_HZ]..[MIN_PITCH_HZ]):** Inversely proportional to estimated metric stone diameter
+ *    ([MIN_DIAMETER_MM] pebble -> [MAX_PITCH_HZ] bright high chirp; [MAX_DIAMETER_MM] cobble -> [MIN_PITCH_HZ] deep resonant ping).
+ *  - **Ping Cadence ([MIN_PING_HZ]..[MAX_PING_HZ]):** Proportional to temporal vote / detection confidence.
+ *  - **Speed Gate Warning Buzz:** Emits a distinct [SPEED_WARNING_BUZZ_HZ] low-frequency warning buzz whenever
+ *    walking speed enters [ScanSpeedState.SpeedWarning] (`SLOW SWEEP`).
+ *
+ * Lifecycle:
+ * - Call [start] to spawn the background `GneissFind-Sonifier` synthesis thread.
+ * - Call [updateTargets] on each sweep/frame to update volatile synthesis targets.
+ * - Call [stop] or [close] to interrupt the synthesis thread and release the hardware [AudioTrack].
+ *
+ * Threading:
+ * - [updateTargets] and [isMuted] are safe to read/write from any thread via `@Volatile` fields.
+ * - PCM synthesis and blocking [AudioTrack.write] calls run exclusively on the internal `GneissFind-Sonifier` thread.
+ *
+ * @param sampleRateHz Output PCM sample rate in Hz (`> 0`, defaults to [DEFAULT_SAMPLE_RATE_HZ]).
  */
 class MetalDetectorSonifier(
     private val sampleRateHz: Int = DEFAULT_SAMPLE_RATE_HZ
 ) : AutoCloseable {
 
+    /**
+     * Immutable telemetry snapshot of the sonifier's current acoustic output for LCARS HUD display.
+     *
+     * @property isAudibleActive `true` when unmuted and emitting either a target ping or a speed warning buzz.
+     * @property currentPitchHz Active fundamental tone frequency in Hz (`0f` when silent).
+     * @property currentPingCadenceHz Active burst repetition rate in Hz (`0f` when silent).
+     * @property isSpeedWarningBuzzing `true` when the overspeed warning buzz is currently active.
+     */
     data class SonifierTelemetry(
         val isAudibleActive: Boolean = false,
         val currentPitchHz: Float = 0f,
@@ -31,30 +62,45 @@ class MetalDetectorSonifier(
         val isSpeedWarningBuzzing: Boolean = false
     )
 
+    /** Whether audio synthesis is globally muted by the user (`AUDIO ON` / `MUTED` HUD pill). */
     @Volatile
     var isMuted: Boolean = false
 
+    /** Target fundamental frequency in Hz (`[MIN_PITCH_HZ]..[MAX_PITCH_HZ]`, or `0f` when no alertable target is active). */
     @Volatile
     private var targetPitchHz: Float = 0f
 
+    /** Target ping repetition rate in Hz (`[MIN_PING_HZ]..[MAX_PING_HZ]`, or `0f` when no alertable target is active). */
     @Volatile
     private var targetCadenceHz: Float = 0f
 
+    /** `true` when [ScanSpeedState.SpeedWarning] is active on the most recent [updateTargets] call. */
     @Volatile
     private var speedGateWarningActive: Boolean = false
 
+    /** `true` when at least one user-alertable [ConfirmedTarget] is present and [isMuted] is `false`. */
     @Volatile
     private var hasActiveTarget: Boolean = false
 
+    /** Most recent [SonifierTelemetry] snapshot published by [updateTargets] for HUD readouts. */
     @Volatile
     var latestTelemetry: SonifierTelemetry = SonifierTelemetry()
         private set
 
+    /** Background daemon thread running [runAudioSynthesisLoop], or `null` when stopped. */
     private var audioThread: Thread? = null
 
+    /** Lifecycle flag controlling the `while (running)` loop inside [runAudioSynthesisLoop]. */
     @Volatile
     private var running: Boolean = false
 
+    /**
+     * Spawns and starts the high-priority daemon synthesis thread if not already running.
+     *
+     * Side effects:
+     * - Allocates and starts a new `GneissFind-Sonifier` [Thread] at [Thread.MAX_PRIORITY].
+     * - Idempotent if called while already [running].
+     */
     fun start() {
         if (running) return
         running = true
@@ -66,8 +112,15 @@ class MetalDetectorSonifier(
     }
 
     /**
-     * Updates real-time sonification parameters from the highest-priority [ConfirmedTarget]
-     * and current [ScanSpeedState]. Never emits audio for Class 4 (`hard_confuser`).
+     * Updates real-time sonification parameters from the highest-priority user-alertable [ConfirmedTarget]
+     * and current [ScanSpeedState]. Never emits target audio for Class 4 ([ com.gneissfind.app.model.StoneClass.HARD_CONFUSER ]).
+     *
+     * @param confirmedTargets Current list of confirmed targets ordered by priority from `TemporalTargetTracker`.
+     * @param speedState Current walking speed gate state; [ScanSpeedState.SpeedWarning] overrides target pings with a low buzz.
+     *
+     * Side effects:
+     * - Updates volatile synthesis parameters ([targetPitchHz], [targetCadenceHz], [speedGateWarningActive], [hasActiveTarget])
+     *   and publishes a new [latestTelemetry] snapshot.
      */
     fun updateTargets(
         confirmedTargets: List<ConfirmedTarget>,
@@ -90,7 +143,8 @@ class MetalDetectorSonifier(
             return
         }
 
-        // Combine smoothed neural confidence with N-of-M vote ratio so 3/6 -> moderate ping rate, 6/6 -> urgent 14 Hz
+        // Combine smoothed neural confidence with N-of-M vote ratio so 3/6 -> moderate ping rate, 6/6 -> urgent MAX_PING_HZ.
+        // RATIONALE-UNKNOWN: how were the 0.55f / 0.45f blend weights between smoothedConfidence and voteRatio chosen?
         val combinedConfidence = (primary.smoothedConfidence * 0.55f + primary.voteRatio * 0.45f)
             .coerceIn(0f, 1f)
         val pitch = diameterMmToPitchHz(primary.estimatedDiameterMm)
@@ -108,6 +162,12 @@ class MetalDetectorSonifier(
         )
     }
 
+    /**
+     * Signals the background synthesis loop to exit and interrupts [audioThread].
+     *
+     * Side effects:
+     * - Sets [running] to `false`, interrupts [audioThread], and clears the thread reference.
+     */
     fun stop() {
         running = false
         audioThread?.interrupt()
@@ -118,6 +178,14 @@ class MetalDetectorSonifier(
         stop()
     }
 
+    /**
+     * Main streaming synthesis loop executed on `GneissFind-Sonifier`.
+     *
+     * Allocates a mono 16-bit PCM [AudioTrack] with [CHUNK_DURATION_SEC] write slices and continuously
+     * synthesizes silence, the dual-harmonic overspeed warning buzz, or raised-cosine-enveloped
+     * mineral target pings until [running] becomes `false` or the thread is interrupted.
+     * If [AudioTrack] initialization fails (e.g. in headless JVM unit tests), logs a warning and returns cleanly.
+     */
     private fun runAudioSynthesisLoop() {
         val chunkFrames = (sampleRateHz * CHUNK_DURATION_SEC).roundToInt().coerceAtLeast(256)
         val minBufBytes = AudioTrack.getMinBufferSize(
@@ -233,25 +301,55 @@ class MetalDetectorSonifier(
 
     companion object {
         private const val TAG = "MetalDetectorSonifier"
+
+        /** Android [AudioAttributes] usage routing sonification through media volume controls (`USAGE_MEDIA`). */
         const val AUDIO_USAGE = AudioAttributes.USAGE_MEDIA
+
+        /** Android [AudioAttributes] content type for continuous synthesized tone bursts (`CONTENT_TYPE_MUSIC`). */
         const val AUDIO_CONTENT_TYPE = AudioAttributes.CONTENT_TYPE_MUSIC
+
+        /** Default mono PCM output sample rate (`44,100 Hz`). */
         const val DEFAULT_SAMPLE_RATE_HZ = 44_100
-        private const val CHUNK_DURATION_SEC = 0.020f // 20 ms low-latency streaming slices
-        private const val TONE_BURST_DURATION_SEC = 0.048f // 48 ms crisp metallic ping
 
+        /** Streaming write slice duration in seconds (`20 ms`) balancing low latency against scheduler jitter. */
+        private const val CHUNK_DURATION_SEC = 0.020f
+
+        /** Nominal duration of each metallic target ping burst in seconds (`48 ms`). */
+        // RATIONALE-UNKNOWN: why was 48 ms chosen as the nominal tone burst duration?
+        private const val TONE_BURST_DURATION_SEC = 0.048f
+
+        /** Minimum metric stone diameter (`20.0 mm`) clamped at the high-pitch ceiling ([MAX_PITCH_HZ]) per `AGENTS.md` §1. */
         const val MIN_DIAMETER_MM = 20.0f
-        const val MAX_DIAMETER_MM = 60.0f
-        const val MAX_PITCH_HZ = 780.0f // 20 mm pebble -> 780 Hz
-        const val MIN_PITCH_HZ = 320.0f // 60 mm+ cobble -> 320 Hz
 
+        /** Maximum metric stone diameter (`60.0 mm`) clamped at the low-pitch floor ([MIN_PITCH_HZ]) per `AGENTS.md` §1. */
+        const val MAX_DIAMETER_MM = 60.0f
+
+        /** Highest target ping frequency (`780.0 Hz`) corresponding to a [MIN_DIAMETER_MM] pebble. */
+        // RATIONALE-UNKNOWN: how were the exact 780 Hz ceiling and 320 Hz floor frequencies selected?
+        const val MAX_PITCH_HZ = 780.0f
+
+        /** Lowest target ping frequency (`320.0 Hz`) corresponding to a [MAX_DIAMETER_MM]+ cobble. */
+        const val MIN_PITCH_HZ = 320.0f
+
+        /** Minimum ping repetition rate (`2.0 Hz`) at threshold confidence (`0.0`). */
+        // RATIONALE-UNKNOWN: how were the 2.0..14.0 Hz ping cadence bounds selected?
         const val MIN_PING_HZ = 2.0f
+
+        /** Maximum ping repetition rate (`14.0 Hz`) at peak confidence (`1.0`). */
         const val MAX_PING_HZ = 14.0f
 
+        /** Fundamental frequency (`145.0 Hz`) of the overspeed gate warning buzz (`SLOW SWEEP`), well below [MIN_PITCH_HZ]. */
         const val SPEED_WARNING_BUZZ_HZ = 145.0f
+
+        /** Burst repetition rate (`4.5 Hz`) of the overspeed gate warning buzz. */
         const val SPEED_WARNING_CADENCE_HZ = 4.5f
 
         /**
-         * Maps metric stone diameter `20..60 mm` inversely to pitch `780..320 Hz`.
+         * Maps metric stone diameter `[MIN_DIAMETER_MM]..[MAX_DIAMETER_MM]` inversely and linearly
+         * to pitch `[MAX_PITCH_HZ]..[MIN_PITCH_HZ]`.
+         *
+         * @param diameterMm Estimated stone diameter in millimeters; values outside `[MIN_DIAMETER_MM]..[MAX_DIAMETER_MM]` are clamped.
+         * @return Target ping fundamental frequency in Hz within `[MIN_PITCH_HZ]..[MAX_PITCH_HZ]`.
          */
         fun diameterMmToPitchHz(diameterMm: Float): Float {
             val clamped = diameterMm.coerceIn(MIN_DIAMETER_MM, MAX_DIAMETER_MM)
@@ -260,7 +358,10 @@ class MetalDetectorSonifier(
         }
 
         /**
-         * Maps normalized temporal vote / detection confidence `0..1` linearly to `2..14 Hz` ping rate.
+         * Maps normalized temporal vote / detection confidence `0..1` linearly to `[MIN_PING_HZ]..[MAX_PING_HZ]` ping rate.
+         *
+         * @param confidence Combined confidence score in `[0.0, 1.0]` (clamped if outside range).
+         * @return Target ping cadence in Hz within `[MIN_PING_HZ]..[MAX_PING_HZ]`.
          */
         fun confidenceToPingCadenceHz(confidence: Float): Float {
             val clamped = confidence.coerceIn(0.0f, 1.0f)
@@ -268,7 +369,12 @@ class MetalDetectorSonifier(
         }
 
         /**
-         * Click-free raised-cosine attack + smooth cosine release envelope for each tone burst.
+         * Click-free raised-cosine attack (`15%` of burst, minimum `8` samples) plus smooth cosine
+         * release (`85%` of burst) amplitude envelope for each tone burst.
+         *
+         * @param sampleIndex Zero-based sample offset within the current tone burst.
+         * @param burstLengthSamples Total number of samples in the tone burst.
+         * @return Normalized envelope gain in `[0.0, 1.0]`, or `0.0` if [sampleIndex] is outside `0 until burstLengthSamples`.
          */
         fun computeSmoothBurstEnvelope(sampleIndex: Int, burstLengthSamples: Int): Double {
             if (burstLengthSamples <= 0 || sampleIndex !in 0 until burstLengthSamples) return 0.0
@@ -284,6 +390,11 @@ class MetalDetectorSonifier(
 
         /**
          * Synthesizes a deterministic single PCM16 tone burst buffer for offline / unit-test verification.
+         *
+         * @param diameterMm Estimated stone diameter in millimeters mapped via [diameterMmToPitchHz].
+         * @param sampleRateHz Sample rate in Hz (defaults to [DEFAULT_SAMPLE_RATE_HZ]).
+         * @param durationMs Burst duration in milliseconds (defaults to `48 ms`, minimum `16` samples).
+         * @return Newly allocated [ShortArray] containing the windowed mono PCM16 waveform.
          */
         fun synthesizeSinglePingBurstPcm16(
             diameterMm: Float,

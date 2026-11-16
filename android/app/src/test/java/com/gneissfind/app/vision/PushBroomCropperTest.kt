@@ -1,6 +1,17 @@
 /*
- * Unit tests for PushBroomCropper covering reversible landscape 5-tile/3-tile ROI extraction,
- * 32 px seam pixel identity, and cross-tile IoU + IoM + seam-straddle union box merging.
+ * Unit test suite for [PushBroomCropper] and [PushBroomSweepBuffers].
+ *
+ * Covers the optical and geometric invariants of the push-broom vision front-end
+ * (`AGENTS.md`, `.agents/rules/android-camera-ar.md`):
+ * - Reversible landscape (`ROTATION_90` and `ROTATION_270`) 5-tile (`1792x384`) and 3-tile
+ *   (`1088x384`) ROI extraction from `1920x1080` `YUV_420_888` frames.
+ * - Bit-exact `32 px` overlap seam identity across adjacent `384x384` tiles and raw `[0..1]`
+ *   float32 RGB output range.
+ * - Cross-tile seam fusion via `IoU >= 0.45`, `IoM >= 0.65`, and adjacent-seam straddle union box
+ *   merging, `>= 20 mm` physical diameter gating at `0.59 mm/px` GSD, and `HARD_CONFUSER` muting.
+ *
+ * Main types:
+ * - [PushBroomCropperTest]: JUnit4 test suite and deterministic `YUV_420_888` frame fixture.
  */
 package com.gneissfind.app.vision
 
@@ -14,6 +25,10 @@ import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
 import java.nio.ByteBuffer
 
+/**
+ * Verifies [PushBroomCropper] tile extraction, reversible landscape orientation normalization,
+ * `32 px` seam pixel identity, and cross-tile union box deduplication.
+ */
 @RunWith(JUnit4::class)
 class PushBroomCropperTest {
 

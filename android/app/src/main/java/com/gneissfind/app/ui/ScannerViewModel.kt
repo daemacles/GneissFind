@@ -1,8 +1,14 @@
 /*
  * AndroidViewModel coordinating the live push-broom camera stream, 120 Hz IMU pitch stabilization,
  * tile cropping, stone detection, 3D temporal voting, audio sonification, and field strip logging.
- * Exposes immutable ScannerUiState to Compose while decoupling display-rate EIS translation from
- * analyzer-rate inference sweeps.
+ *
+ * Exposes immutable ScannerUiState to Compose while decoupling display-rate EIS translation and
+ * 120 Hz world-ray reticle reprojection from analyzer-rate inference sweeps.
+ *
+ * Main types:
+ * - DetectorSourceOption: selectable live GPU and synthetic simulation sources in the LCARS SOURCE drawer.
+ * - ScannerUiState: immutable UI state snapshot observed by ScannerScreen.
+ * - ScannerViewModel: lifecycle-aware coordinator owning camera, detector, raycaster, tracker, sonifier, and logger.
  */
 package com.gneissfind.app.ui
 
@@ -94,6 +100,49 @@ enum class DetectorSourceOption(
     )
 }
 
+/**
+ * Immutable snapshot of the scanner's complete state consumed by `ScannerScreen`.
+ *
+ * @property operatingMode Active operating mode ([OperatingMode.SCAN] or [OperatingMode.LOG_DATA]).
+ * @property detectorBackend Active inference backend ([DetectorBackend.RF_DETR_NANO_GPU] default).
+ * @property syntheticProfile Active simulation scenario when [detectorBackend] is [DetectorBackend.SYNTHETIC_DEMO].
+ * @property detectorStatus Human-readable backend status string rendered in the LCARS `SOURCE` drawer.
+ * @property enabledClasses Subset of user-alertable [StoneClass]es (`01..04`) currently enabled in the left rail.
+ * @property swathTileMode Active horizontal tile swath ([SwathTileMode.FIVE_TILE] `1792x384` or [SwathTileMode.THREE_TILE] `1088x384`).
+ * @property shutterClampEnabled Whether manual `<= 1/500 s` shutter clamping (`EXP CLAMP`) is enabled.
+ * @property twoXCropEnabled Whether `2.0x` lossless center sensor crop (`2X CROP`) is enabled.
+ * @property eisPitchLockEnabled Whether IMU software EIS pitch stabilization (`EIS LOCK`) is enabled.
+ * @property exposureBiasEv Active canopy exposure compensation bias in EV stops (`-2.0..+1.0 EV`).
+ * @property isAudioMuted Whether `MetalDetectorSonifier` audio output is muted.
+ * @property simulatedSpeedOverrideMps Non-null when the synthetic overspeed test (`OVERSPEED SIM`) is active.
+ * @property displaySurfaceRotation Active reversible-landscape [Surface] rotation ([Surface.ROTATION_90] or [Surface.ROTATION_270]).
+ * @property stripGeometry Active push-broom strip ROI geometry inside the `1920x1080` camera frame.
+ * @property rawStripDetections Unconfirmed single-sweep detections in unified strip pixel coordinates.
+ * @property confirmedTargets Confirmed targets (with 120 Hz ego-motion-reprojected strip coordinates and visibility flags).
+ * @property speedState Current walking speed state ([ScanSpeedState.Normal] or [ScanSpeedState.SpeedWarning]).
+ * @property imuPitchDeg Smoothed downward optical pitch in degrees (`0` = horizon, `45` = nominal, `90` = nadir).
+ * @property rollDeg Smoothed landscape screen roll angle in degrees.
+ * @property referencePitchDeg Active EIS pitch setpoint in degrees (`45.0 deg` default).
+ * @property cropY Quantized integer top Y offset (`0..696 px`) of the stabilized `384 px` strip on the `1080p` frame.
+ * @property displayCropYFloat Continuous sub-pixel top Y offset (`0f..696f px`) driving 120 Hz GPU `PreviewView.translationY`.
+ * @property isPitchClamped `true` when [displayCropYFloat] hits `0` or [StripRoiGeometry.MAX_CROP_Y_PX] (`PITCH LIMIT`).
+ * @property verticalFocalLengthPx Calibrated vertical focal length $f_y$ in `1080p` stream pixels.
+ * @property slantRangeMeters Estimated optical slant range $R$ in meters along the strip center.
+ * @property gsdMmPerPx Estimated ground sample distance in millimeters per pixel (`0.59 mm/px` nominal).
+ * @property sweepLatencyMs Wall-clock latency of the most recent inference sweep in milliseconds.
+ * @property rollingLatencyMs Exponential moving average of sweep latency in milliseconds.
+ * @property sweepHz Smoothed camera analyzer sweep rate in Hz.
+ * @property part1LatencyMs Latency of Part 1 (backbone + encoder) in milliseconds.
+ * @property bridgeLatencyMs Latency of the Host CPU Top-K query bridge in milliseconds.
+ * @property part2LatencyMs Latency of Part 2 (decoder + head) in milliseconds.
+ * @property exposureTimeNs Current sensor exposure time in nanoseconds.
+ * @property sensorIso Current sensor sensitivity in ISO units.
+ * @property activeZoomRatio Current CameraX zoom ratio (`2.0f` or `1.0f`).
+ * @property audioPitchHz Current `MetalDetectorSonifier` tone frequency in Hz (`0f` when silent).
+ * @property audioCadenceHz Current `MetalDetectorSonifier` ping repetition rate in Hz (`0f` when silent).
+ * @property loggedFrameCount Number of lossless PNG strip frames saved in the current `LOG DATA` session.
+ * @property fieldLogDirectory Absolute filesystem path of the active (or base) `LOG DATA` session directory.
+ */
 data class ScannerUiState(
     val operatingMode: OperatingMode = OperatingMode.SCAN,
     val detectorBackend: DetectorBackend = DetectorBackend.RF_DETR_NANO_GPU,
@@ -135,6 +184,7 @@ data class ScannerUiState(
     val loggedFrameCount: Int = 0,
     val fieldLogDirectory: String = ""
 ) {
+    /** Resolves the currently active [DetectorSourceOption] from [detectorBackend] and [syntheticProfile]. */
     val activeSourceOption: DetectorSourceOption
         get() = if (detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
             DetectorSourceOption.LIVE_CAMERA_GPU
@@ -145,6 +195,18 @@ data class ScannerUiState(
         }
 }
 
+/**
+ * Primary [AndroidViewModel] orchestrating the GneissFind perception, tracking, sonification, and logging pipeline.
+ *
+ * Threading & Decoupled Cadence:
+ * - **120 Hz IMU Display Loop (Main Thread):** [GroundPlaneRaycaster.onRealtimeImuPitchListener] updates
+ *   [ScannerUiState.displayCropYFloat] and reprojects [ScannerUiState.confirmedTargets] through the live `3x3`
+ *   rotation matrix so the GPU `PreviewView` and target reticles remain ego-motion-locked at display refresh rate.
+ * - **Analyzer Sweep Loop (`GneissFind-Analyzer` Thread):** [processCameraFrameOnAnalyzerThread] extracts the
+ *   stabilized YUV strip into [sweepBuffers], runs [RfDetrTwoGraphGpuDetector] or [SyntheticStoneDetector],
+ *   merges cross-tile boxes via [PushBroomCropper], back-projects 3D world rays at the frame's capture timestamp,
+ *   updates [TemporalTargetTracker], and drives [MetalDetectorSonifier].
+ */
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appContext = application.applicationContext
@@ -174,6 +236,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             fieldLogDirectory = FieldDataLogger.resolveBaseSessionsDir(appContext).absolutePath
         )
     )
+
+    /** Hot state stream of [ScannerUiState] collected by `ScannerScreen`. */
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
 
     init {
@@ -233,6 +297,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Binds the CameraX preview and `YUV_420_888` analyzer stream to [lifecycleOwner] and [previewView]. */
     fun bindCamera(
         lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
@@ -243,7 +308,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Synchronizes CameraX `targetRotation`, ARCore `setDisplayGeometry`, and IMU `remapCoordinateSystem`
-     * whenever reversible `sensorLandscape` flips between `Surface.ROTATION_90` and `Surface.ROTATION_270`.
+     * whenever reversible `sensorLandscape` flips between [Surface.ROTATION_90] and [Surface.ROTATION_270].
      */
     fun onDisplayGeometryChanged(
         surfaceRotation: Int,
@@ -260,17 +325,24 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(displaySurfaceRotation = normalized) }
     }
 
+    /** Starts the 125 Hz IMU listener and the background `AudioTrack` sonification thread on Activity `ON_RESUME`. */
     fun onResumeSensorsAndAudio() {
         raycaster.startImuListening()
         sonifier.start()
     }
 
+    /** Silences and stops the `AudioTrack` sonification thread and unregisters IMU listeners on Activity `ON_PAUSE`. */
     fun onPauseSensorsAndAudio() {
         sonifier.updateTargets(emptyList(), ScanSpeedState.Normal(0f))
         sonifier.stop()
         raycaster.stopImuListening()
     }
 
+    /**
+     * Switches between [OperatingMode.SCAN] and [OperatingMode.LOG_DATA].
+     * Entering [OperatingMode.LOG_DATA] automatically enables the shutter clamp and opens a new [FieldDataLogger] session;
+     * returning to [OperatingMode.SCAN] closes the active logging session.
+     */
     fun setOperatingMode(mode: OperatingMode) {
         if (mode == OperatingMode.LOG_DATA) {
             cameraController.setShutterClamp(true)
@@ -294,11 +366,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Switches the active [DetectorBackend] and resets [TemporalTargetTracker] tracks. */
     fun setDetectorBackend(backend: DetectorBackend) {
         tracker.reset()
         _uiState.update { it.copy(detectorBackend = backend) }
     }
 
+    /** Selects a [SyntheticTargetProfile], switches to [DetectorBackend.SYNTHETIC_DEMO], and resets tracks. */
     fun setSyntheticProfile(profile: SyntheticTargetProfile) {
         syntheticDetector.profile = profile
         tracker.reset()
@@ -327,6 +401,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Toggles between 5-tile (`1792x384`) and 3-tile (`1088x384`) swath geometry and resets active tracks. */
     fun toggleSwathTileMode() {
         val next = _uiState.value.swathTileMode.toggled()
         tracker.reset()
@@ -342,6 +417,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Enables or disables IMU software EIS pitch stabilization (`EIS LOCK` / `EIS FREE`). */
     fun setEisPitchLockEnabled(enabled: Boolean) {
         raycaster.eisPitchLockEnabled = enabled
         _uiState.update { prev ->
@@ -361,6 +437,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Locks the current IMU inclination as the new EIS reference pitch (`SYNC PITCH`) and recenters `cropY` to `348`. */
     fun syncReferencePitch() {
         val synced = raycaster.syncReferencePitch()
         _uiState.update {
@@ -374,6 +451,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Toggles whether a user-alertable [StoneClass] (`01..04`) is enabled in the left mineral rail. */
     fun toggleStoneClass(stoneClass: StoneClass) {
         if (!stoneClass.isUserAlertable) return
         _uiState.update { state ->
@@ -385,11 +463,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Enables or disables the Camera2 `<= 1/500 s` shutter clamp (`EXP CLAMP` / `EXP AUTO`). */
     fun setShutterClampEnabled(enabled: Boolean) {
         cameraController.setShutterClamp(enabled)
         _uiState.update { it.copy(shutterClampEnabled = enabled) }
     }
 
+    /** Enables or disables the `2.0x` lossless center sensor crop (`2X CROP` / `1X WIDE`). */
     fun setTwoXCropEnabled(enabled: Boolean) {
         cameraController.setTwoXSensorCrop(enabled)
         val zoom = if (enabled) 2.0f else 1.0f
@@ -402,6 +482,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Updates the canopy exposure compensation bias (`CANOPY EV`) in EV stops. */
     fun setExposureBiasEv(ev: Float) {
         val clamped = ev.coerceIn(
             PushBroomCameraController.MIN_CANOPY_EV_BIAS,
@@ -411,11 +492,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(exposureBiasEv = clamped) }
     }
 
+    /** Mutes or unmutes `MetalDetectorSonifier` audio output (`AUDIO ON` / `MUTED`). */
     fun setAudioMuted(muted: Boolean) {
         sonifier.isMuted = muted
         _uiState.update { it.copy(isAudioMuted = muted) }
     }
 
+    /** Sets or clears a simulated walking speed override (`m/s`) to test the `> 1.10 m/s` overspeed gate. */
     fun setSimulatedWalkSpeedOverride(speedMps: Float?) {
         raycaster.simulatedWalkSpeedOverrideMps = speedMps
         val immediateSpeedState = when {
@@ -438,11 +521,16 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Toggles the `1.38 m/s` simulated overspeed test (`OVERSPEED SIM`) in the LCARS `SOURCE` drawer. */
     fun toggleOverspeedTest() {
         val next = if (_uiState.value.simulatedSpeedOverrideMps != null) null else 1.38f
         setSimulatedWalkSpeedOverride(next)
     }
 
+    /**
+     * Executes one full perception-and-tracking sweep on the single-threaded `GneissFind-Analyzer` worker
+     * for each incoming `1920x1080` `YUV_420_888` [imageProxy] and always closes [imageProxy] in `finally`.
+     */
     private fun processCameraFrameOnAnalyzerThread(
         imageProxy: ImageProxy,
         exposureTelemetry: CameraExposureTelemetry

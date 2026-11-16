@@ -1,9 +1,17 @@
 /*
  * Reusable 2360s LCARS geometric primitives, silent tactile pill buttons, detection-reticle color
  * swatches, and strictly non-interactive telemetry readout blocks.
- * Enforces visual affordance separation: interactive actuators use rounded pill geometry with an
- * 80 ms silent white tap flash, whereas passive telemetry readouts use flat rectangular geometry
- * with zero click handlers.
+ *
+ * Enforces visual affordance separation (.agents/rules/lcars-ui.md): interactive actuators use
+ * rounded pill geometry with an 80 ms silent white tap flash, whereas passive telemetry readouts
+ * use flat rectangular geometry with zero click handlers. Consumed by ScannerScreen.kt.
+ *
+ * Main types:
+ * - LcarsElbowOrientation / LcarsElbowMetricsPx / LcarsElbowShape / LcarsElbow: swept 2360s TNG elbow geometry and composable.
+ * - LcarsPillEndStyle / LcarsPillButton: interactive pill button with 80 ms white tap flash.
+ * - LcarsDetectionReticleSwatch: 24.dp mineral reticle swatch rendered inside class toggle pills.
+ * - LcarsHeaderSegment / LcarsTelemetryBlock: passive non-interactive rectangular readout bars.
+ * - LcarsSegmentedEvBar: 7-segment canopy exposure bias indicator flanked by -/+ pill steppers.
  */
 package com.gneissfind.app.ui.lcars
 
@@ -66,12 +74,24 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.delay
 
+/** Standard `4.dp` OLED `#000000` gap separating adjacent LCARS rail segments and pill buttons (`.agents/rules/lcars-ui.md` §1). */
 val LcarsGutter = 4.dp
+
+/** Default vertical stem width (`68.dp`) of a swept LCARS elbow. */
 val LcarsStemWidth = 68.dp
+
+/** Standard horizontal bar height (`22.dp`) of a swept LCARS elbow and [LcarsHeaderSegment]. */
 val LcarsBarHeight = 22.dp
+
+/** Default convex outer corner radius (`32.dp`) of a swept LCARS elbow (`.agents/rules/lcars-ui.md` §1). */
 val LcarsOuterRadius = 32.dp
+
+/** Default concave inner crook fillet radius (`14.dp`) of a swept LCARS elbow (`.agents/rules/lcars-ui.md` §1). */
 val LcarsInnerRadius = 14.dp
 
+/**
+ * Quadrant orientation of a swept 2360s TNG LCARS elbow (`LcarsElbow`).
+ */
 enum class LcarsElbowOrientation {
     TopLeft,
     BottomLeft,
@@ -83,12 +103,22 @@ enum class LcarsElbowOrientation {
  * Corner geometry styles separating rounded interactive pills from flat rectangular readout bars.
  */
 enum class LcarsPillEndStyle {
+    /** Full `50%` semicylindrical capsule ends on both left and right sides. */
     Capsule,
+
+    /** `6.dp` left corners and `999.dp` semicircular right cap (e.g. `+` stepper button). */
     FlatLeftRoundRight,
+
+    /** `999.dp` semicircular left cap and `6.dp` right corners (e.g. `−` stepper button). */
     RoundLeftFlatRight,
+
+    /** `12.dp` rounded corners for compact stem actuators (`54.dp..68.dp` wide). */
     CompactRoundedPill,
+
+    /** Sharp `0.dp` rectangular corners reserved for passive telemetry blocks. */
     FlatBlock;
 
+    /** Converts this [LcarsPillEndStyle] into its Compose [Shape]. */
     fun toShape(): Shape = when (this) {
         Capsule -> RoundedCornerShape(percent = 50)
         FlatLeftRoundRight -> RoundedCornerShape(
@@ -111,6 +141,11 @@ enum class LcarsPillEndStyle {
 /**
  * Measures the exact rendered width of [maxPrototypeText] under [style] plus [horizontalPadding] so
  * live telemetry bars can lock to their high-water-mark width without horizontal layout jitter.
+ *
+ * @param maxPrototypeText Longest possible string for the telemetry field (e.g. `"SWEEP 000.0MS (00.0HZ)"`).
+ * @param style Typography style used to render the telemetry string ([LcarsTypography.TelemetryBar] default).
+ * @param horizontalPadding Total horizontal padding added to the measured text width (`22.dp` default).
+ * @return High-water-mark [Dp] width sufficient to render [maxPrototypeText] on a single line without clipping.
  */
 @Composable
 fun rememberHighWaterSegmentWidth(
@@ -127,6 +162,16 @@ fun rememberHighWaterSegmentWidth(
     return with(density) { widthPx.toDp() + horizontalPadding }
 }
 
+/**
+ * Clamped pixel dimensions of a swept LCARS elbow used for path construction and analytic hit-testing.
+ *
+ * @property widthPx Total bounding width of the elbow in pixels.
+ * @property heightPx Total bounding height of the elbow in pixels.
+ * @property stemWidthPx Vertical stem width in pixels (`<= widthPx`).
+ * @property barHeightPx Horizontal bar height in pixels (`<= heightPx`).
+ * @property outerRadiusPx Convex outer corner radius in pixels (`<= min(widthPx, heightPx)`).
+ * @property innerRadiusPx Concave inner crook fillet radius in pixels (`<= min(widthPx - stemWidthPx, heightPx - barHeightPx)`).
+ */
 @Immutable
 data class LcarsElbowMetricsPx(
     val widthPx: Float,
@@ -138,7 +183,12 @@ data class LcarsElbowMetricsPx(
 ) {
     /**
      * Analytic test of whether `(x, y)` lies inside the swept L-shaped elbow with outer convex
-     * radius `outerRadiusPx` and concave inner crook fillet `innerRadiusPx`.
+     * radius [outerRadiusPx] and concave inner crook fillet [innerRadiusPx].
+     *
+     * @param x Horizontal coordinate in local elbow pixels (`0..widthPx`).
+     * @param y Vertical coordinate in local elbow pixels (`0..heightPx`).
+     * @param orientation Quadrant orientation of the elbow.
+     * @return `true` if `(x, y)` is inside the filled elbow region (including the concave inner fillet), `false` otherwise.
      */
     fun containsPoint(x: Float, y: Float, orientation: LcarsElbowOrientation): Boolean {
         if (x < 0f || x > widthPx || y < 0f || y > heightPx) return false
@@ -171,6 +221,10 @@ data class LcarsElbowMetricsPx(
     }
 }
 
+/**
+ * Clamps raw elbow dimensions and radii into a geometrically valid [LcarsElbowMetricsPx] soneither
+ * [outerRadiusPx] nor [innerRadiusPx] can self-intersect on small viewports.
+ */
 fun resolveLcarsElbowMetricsPx(
     widthPx: Float,
     heightPx: Float,
@@ -197,7 +251,16 @@ fun resolveLcarsElbowMetricsPx(
 
 /**
  * Builds the Classic 2360s TNG swept LCARS elbow [Path] with smooth convex outer corner
- * (`outerRadiusPx`) and concave inner crook fillet (`innerRadiusPx`).
+ * ([outerRadiusPx]) and concave inner crook fillet ([innerRadiusPx]).
+ *
+ * @param widthPx Total bounding width in pixels.
+ * @param heightPx Total bounding height in pixels.
+ * @param orientation Quadrant orientation of the elbow.
+ * @param stemWidthPx Vertical stem width in pixels.
+ * @param barHeightPx Horizontal bar height in pixels.
+ * @param outerRadiusPx Convex outer corner radius in pixels.
+ * @param innerRadiusPx Concave inner crook fillet radius in pixels.
+ * @return Closed [Path] representing the swept L-shaped elbow.
  */
 fun buildLcarsElbowPath(
     widthPx: Float,
@@ -350,6 +413,9 @@ fun buildLcarsElbowPath(
     }
 }
 
+/**
+ * Compose [Shape] wrapper around [buildLcarsElbowPath] for clipping or outlining LCARS elbow containers.
+ */
 class LcarsElbowShape(
     private val orientation: LcarsElbowOrientation,
     private val stemWidth: Dp = LcarsStemWidth,
@@ -376,6 +442,9 @@ class LcarsElbowShape(
     }
 }
 
+/**
+ * Non-interactive structural 2360s LCARS swept elbow composable with optional [armLabel] and [stemCode].
+ */
 @Composable
 fun LcarsElbow(
     orientation: LcarsElbowOrientation,
@@ -700,8 +769,8 @@ fun LcarsPillButton(
 }
 
 /**
- * Passive non-interactive `22.dp` horizontal LCARS telemetry rail block with sharp rectangular
- * edges and tabular numerals (`tnum`). Never clickable and never flashes on tap.
+ * Passive non-interactive [LcarsBarHeight] (`22.dp`) horizontal LCARS telemetry rail block with sharp
+ * rectangular edges and tabular numerals (`tnum`). Never clickable and never flashes on tap.
  */
 @Composable
 fun LcarsHeaderSegment(

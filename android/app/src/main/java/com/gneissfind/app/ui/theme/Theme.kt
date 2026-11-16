@@ -1,7 +1,16 @@
 /*
  * LCARS color taxonomy, parameterized HSV value stepping, and bundled offline typography.
+ *
  * Assigns each functional UI element category a distinct hue/saturation family while stepping
  * adjacent peers across three HSV brightness values (base and +-LCARS_ADJACENT_VALUE_STEP).
+ * Consumed by LcarsComponents.kt and ScannerScreen.kt.
+ *
+ * Main types:
+ * - LcarsValueLevel: discrete -1 / 0 / +1 brightness step tiers.
+ * - LcarsColors: base 2360s LCARS sRGB palette and anti-camouflage reticle colors.
+ * - LcarsSemanticColors: semantic color resolvers for toggles, multi-state pills, actions, readouts, chrome, and alerts.
+ * - LcarsTypography: offline Antonio and Barlow Condensed (tnum) text styles.
+ * - GneissFindTheme: root Material3 dark theme wrapper.
  */
 package com.gneissfind.app.ui.theme
 
@@ -41,13 +50,21 @@ const val LCARS_ADJACENT_VALUE_STEP: Float = 0.05f
  * @property step Signed multiplier (`-1`, `0`, `+1`) applied to [LCARS_ADJACENT_VALUE_STEP].
  */
 enum class LcarsValueLevel(val step: Int) {
+    /** Shifts HSV Value down by `-1 * stepFraction`. */
     MINUS(-1),
+
+    /** Retains the category's base HSV Value. */
     BASE(0),
+
+    /** Shifts HSV Value up by `+1 * stepFraction`. */
     PLUS(1)
 }
 
 /**
  * Converts an sRGB [Color] into `[hueDegrees (0..360), saturation (0..1), value (0..1)]`.
+ *
+ * @param color Input sRGB [Color].
+ * @return 3-element `FloatArray` `[hueDegrees, saturation, value]`.
  */
 internal fun colorToHsv(color: Color): FloatArray {
     val r = color.red.coerceIn(0f, 1f)
@@ -70,6 +87,12 @@ internal fun colorToHsv(color: Color): FloatArray {
 /**
  * Converts HSV components (`hueDegrees in [0, 360)`, `saturation in [0, 1]`, `value in [0, 1]`)
  * back into an sRGB [Color].
+ *
+ * @param hueDegrees Hue angle in degrees (wrapped modulo `360f`).
+ * @param saturation Saturation in `[0, 1]`.
+ * @param value Brightness value in `[0, 1]`.
+ * @param alpha Opacity in `[0, 1]` (defaults to `1f`).
+ * @return Reconstructed sRGB [Color].
  */
 internal fun hsvToColor(hueDegrees: Float, saturation: Float, value: Float, alpha: Float = 1f): Color {
     val h = hueDegrees.mod(360f)
@@ -102,6 +125,10 @@ internal fun hsvToColor(hueDegrees: Float, saturation: Float, value: Float, alph
  * If the base color's HSV Value lies within `stepFraction` of `0.0` or `1.0`, the center value is
  * nudged inward by only the amount needed so all three steps (`-1`, `0`, `+1`) remain strictly
  * distinct by `stepFraction`.
+ *
+ * @param step Signed step tier (`-1`, `0`, or `+1`).
+ * @param stepFraction Fractional HSV Value offset per step (defaults to [LCARS_ADJACENT_VALUE_STEP]).
+ * @return Brightness-shifted sRGB [Color] preserving original hue, saturation, and alpha.
  */
 fun Color.withValueStep(
     step: Int,
@@ -124,6 +151,10 @@ fun Color.withValueStep(
 
 /**
  * Convenience overload of [withValueStep] accepting a named [LcarsValueLevel].
+ *
+ * @param level Discrete brightness tier ([LcarsValueLevel.MINUS], [LcarsValueLevel.BASE], or [LcarsValueLevel.PLUS]).
+ * @param stepFraction Fractional HSV Value offset per step (defaults to [LCARS_ADJACENT_VALUE_STEP]).
+ * @return Brightness-shifted sRGB [Color].
  */
 fun Color.withValueLevel(
     level: LcarsValueLevel,
@@ -131,8 +162,8 @@ fun Color.withValueLevel(
 ): Color = withValueStep(step = level.step, stepFraction = stepFraction)
 
 /**
- * Base 2360s LCARS palette (`lcars-ui.md` §2) calibrated at `V ≈ 0.90` on primary fills so
- * `+-LCARS_ADJACENT_VALUE_STEP` produces three crisp, non-clamped brightness levels on OLED panels.
+ * Base 2360s LCARS palette (`.agents/rules/lcars-ui.md` §2) calibrated at `V ≈ 0.90` on primary fills so
+ * `+-`[LCARS_ADJACENT_VALUE_STEP] produces three crisp, non-clamped brightness levels on OLED panels.
  */
 @Immutable
 object LcarsColors {
@@ -180,6 +211,7 @@ object LcarsColors {
  */
 @Immutable
 object LcarsSemanticColors {
+    /** Returns the fill [Color] for a binary ON/OFF toggle pill at brightness tier [level]. */
     fun toggleButton(
         enabled: Boolean,
         level: LcarsValueLevel = LcarsValueLevel.BASE,
@@ -189,36 +221,42 @@ object LcarsSemanticColors {
         return base.withValueLevel(level, stepFraction)
     }
 
+    /** Returns the fill [Color] for a multi-state mode/swath selector pill at brightness tier [level]. */
     fun multiStateButton(
         level: LcarsValueLevel = LcarsValueLevel.BASE,
         stepFraction: Float = LCARS_ADJACENT_VALUE_STEP
     ): Color = LcarsColors.Periwinkle.withValueLevel(level, stepFraction)
 
+    /** Returns the fill [Color] for a momentary action trigger or drawer button at brightness tier [level]. */
     fun actionOrDrawerButton(
         level: LcarsValueLevel = LcarsValueLevel.BASE,
         stepFraction: Float = LCARS_ADJACENT_VALUE_STEP
     ): Color = LcarsColors.Lavender.withValueLevel(level, stepFraction)
 
+    /** Returns the fill [Color] for a passive real-time sensor/telemetry bar at brightness tier [level]. */
     fun realtimeDataLabel(
         level: LcarsValueLevel = LcarsValueLevel.BASE,
         stepFraction: Float = LCARS_ADJACENT_VALUE_STEP
     ): Color = LcarsColors.IceBlue.withValueLevel(level, stepFraction)
 
+    /** Returns the fill [Color] for a passive static-configuration readout bar at brightness tier [level]. */
     fun staticStateLabel(
         level: LcarsValueLevel = LcarsValueLevel.BASE,
         stepFraction: Float = LCARS_ADJACENT_VALUE_STEP
     ): Color = LcarsColors.ApricotPeach.withValueLevel(level, stepFraction)
 
+    /** Returns the fill [Color] for non-interactive LCARS structural chrome elbows at brightness tier [level]. */
     fun structuralChrome(
         level: LcarsValueLevel = LcarsValueLevel.BASE,
         stepFraction: Float = LCARS_ADJACENT_VALUE_STEP
     ): Color = LcarsColors.CopperTerracotta.withValueLevel(level, stepFraction)
 
+    /** Critical alert fill [Color] ([LcarsColors.MarsRed]) for overspeed warnings, pitch limits, and active recording. */
     val criticalAlert: Color = LcarsColors.MarsRed
 }
 
 /**
- * Bundled 100% offline LCARS typefaces:
+ * Bundled 100% offline LCARS typefaces (`.agents/rules/lcars-ui.md` §3):
  * - [LcarsDisplayFontFamily]: `Antonio` (ultra-compressed 2360s LCARS structural chrome & labels).
  * - [LcarsTabularFontFamily]: `Barlow Condensed` (contains OpenType `tnum` GSUB metrics so live
  *   numeric telemetry never shifts digit advance width).
@@ -229,6 +267,7 @@ val LcarsDisplayFontFamily = FontFamily(
     Font(resId = R.font.antonio_bold, weight = FontWeight.Bold)
 )
 
+/** Bundled offline `Barlow Condensed` font family with OpenType `tnum` tabular numerals. */
 val LcarsTabularFontFamily = FontFamily(
     Font(resId = R.font.barlow_condensed_semibold, weight = FontWeight.SemiBold),
     Font(resId = R.font.barlow_condensed_bold, weight = FontWeight.Bold)
@@ -236,6 +275,10 @@ val LcarsTabularFontFamily = FontFamily(
 
 private val TightPlatformStyle = PlatformTextStyle(includeFontPadding = false)
 
+/**
+ * Pre-configured LCARS [TextStyle] presets enforcing `includeFontPadding = false`, `0.06.em` tracking,
+ * and `fontFeatureSettings = "tnum"` (`.agents/rules/lcars-ui.md` §3).
+ */
 @Immutable
 object LcarsTypography {
     val ElbowCode = TextStyle(
@@ -335,6 +378,10 @@ private val GneissLcarsMaterialTypography = Typography(
     labelSmall = LcarsTypography.MicroCode
 )
 
+/**
+ * Root Compose theme applying [GneissLcarsColorScheme], [GneissLcarsMaterialTypography], and a default
+ * [LcarsColors.ApricotPeach] content color over an OLED `#000000` background.
+ */
 @Composable
 fun GneissFindTheme(content: @Composable () -> Unit) {
     MaterialTheme(

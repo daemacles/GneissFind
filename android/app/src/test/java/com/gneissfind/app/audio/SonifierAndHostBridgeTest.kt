@@ -1,7 +1,20 @@
 /*
- * Unit tests for MetalDetectorSonifier acoustic curves, RfDetrTwoGraphGpuDetector Host Top-K
- * proposal bridge and COCO stand-in metadata mapping, reversible landscape IMU coordinate
- * remapping, and 120 Hz EIS cropY stabilization.
+ * Cross-subsystem unit test suite verifying acoustic sonification curves, LiteRT Host Top-K
+ * proposal bridge operations, reversible landscape IMU coordinate remapping, 120 Hz EIS `cropY`
+ * stabilization, and JSONL field telemetry serialization.
+ *
+ * Covers invariants from `AGENTS.md`, `.agents/rules/android-camera-ar.md`, and
+ * `.agents/rules/litert-inference.md` across:
+ * - [MetalDetectorSonifier]: inverse size-to-pitch (`20..60 mm -> 780..320 Hz`), confidence-to-ping
+ *   cadence (`2..14 Hz`), Hann-windowed PCM16 synthesis, and media stream attributes.
+ * - [RfDetrTwoGraphGpuDetector]: Host Top-100/Top-300 query gather and `rf_detr_coco_metadata.json`
+ *   91-logit COCO stand-in class mapping.
+ * - [GroundPlaneRaycaster]: `ROTATION_90`/`ROTATION_270` rotation matrix remapping, IMU pitch-to-`cropY`
+ *   stabilization and clamping, and `1.50 m` / `0.59 mm/px` slant-range raycasting.
+ * - [FieldDataLogger]: `metadata.jsonl` schema formatting.
+ *
+ * Main types:
+ * - [SonifierAndHostBridgeTest]: JUnit4 test suite.
  */
 package com.gneissfind.app.audio
 
@@ -25,6 +38,10 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
+/**
+ * Verifies [MetalDetectorSonifier], [RfDetrTwoGraphGpuDetector] host bridge helpers,
+ * [GroundPlaneRaycaster] IMU stabilization, and [FieldDataLogger] JSONL serialization.
+ */
 @RunWith(JUnit4::class)
 class SonifierAndHostBridgeTest {
 

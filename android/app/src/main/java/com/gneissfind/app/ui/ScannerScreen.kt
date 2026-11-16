@@ -1,9 +1,19 @@
 /*
- * Split-screen landscape LCARS scanner interface (`lcars-ui.md`).
- * Upper half hosts the hardware-clipped panoramic camera viewport, 120 Hz GPU EIS translation,
- * left-side pitch/cropY travel gauge, and high-contrast stone reticles; lower half hosts the
- * non-occluding tactical control deck with semantic color families, deduplicated single-purpose
- * buttons, and an animated scrollable source-selection drawer.
+ * Split-screen landscape LCARS scanner interface (`.agents/rules/lcars-ui.md`).
+ *
+ * Consumes immutable [ScannerUiState] snapshots from [ScannerViewModel] and renders a non-occluding
+ * two-zone tactical layout:
+ * - Upper ~50%: [GeologicalViewportZone] hosting the hardware-clipped [PreviewView] inside
+ *   [ClippingCameraViewportContainer] with 120 Hz GPU RenderNode `translationY` pitch stabilization,
+ *   the left-side [PitchTravelGaugeColumn], and [PushBroomTripwireOverlay] for `384 px` strip rails
+ *   and `#000000`-halo stone reticles.
+ * - Lower ~50%: [TacticalControlDeckZone] hosting single-purpose LCARS pill controls in
+ *   [OpticsAndEisColumn] and [ProspectMatrixColumn], plus the animated [SourceSelectionDrawer].
+ *
+ * Main types and entry points:
+ * - [PanoramicViewportTransform] / [computePanoramicViewportTransform]: optical coordinate mapping
+ *   from the canonical `1920x1080` landscape frame into the viewport slot.
+ * - [ScannerScreen]: top-level composable bound by `MainActivity`.
  */
 package com.gneissfind.app.ui
 
@@ -115,9 +125,23 @@ private val ScanSpeedState.speedMps: Float
     }
 
 /**
- * Exact optical mapping from `1920x1080` landscape sensor coordinates into the panoramic
- * LCARS viewport slot so `cropY in [0..696]` moves smoothly while keeping the entire `384 px`
- * push-broom strip visible and 1:1 pixel-registered with [PreviewView].
+ * Exact optical mapping from canonical [StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX] x
+ * [StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX] landscape sensor coordinates into the panoramic
+ * LCARS viewport slot so `cropY in [0..MAX_CROP_Y_PX]` moves smoothly while keeping the entire
+ * [StripRoiGeometry.STRIP_HEIGHT_PX] push-broom strip visible and 1:1 pixel-registered with
+ * [PreviewView].
+ *
+ * @property scale Uniform scale factor (`viewportPx / sensorPx`) applied to the canonical
+ *   landscape frame.
+ * @property frameLeftPx Horizontal offset in viewport pixels of the scaled `1920 px` sensor frame.
+ * @property frameTopPx Vertical offset in viewport pixels of the scaled `1080 px` sensor frame
+ *   (driven at 120 Hz via `PreviewView.translationY`).
+ * @property renderedFrameWidthPx Width in viewport pixels of the scaled `1920 px` sensor frame.
+ * @property renderedFrameHeightPx Height in viewport pixels of the scaled `1080 px` sensor frame.
+ * @property stripLeftPx Left edge in viewport pixels of the active push-broom strip ROI.
+ * @property stripTopPx Top edge in viewport pixels of the active push-broom strip ROI.
+ * @property stripWidthPx Width in viewport pixels of the active push-broom strip ROI.
+ * @property stripHeightPx Height in viewport pixels of the active push-broom strip ROI.
  */
 @Immutable
 data class PanoramicViewportTransform(
@@ -132,6 +156,15 @@ data class PanoramicViewportTransform(
     val stripHeightPx: Float
 )
 
+/**
+ * Integer-[cropY] overload of [computePanoramicViewportTransform].
+ *
+ * @param viewportWidthPx Width of the viewport container in screen pixels (clamped to `>= 1f`).
+ * @param viewportHeightPx Height of the viewport container in screen pixels (clamped to `>= 1f`).
+ * @param cropY Integer vertical top offset of the `384 px` strip in `[0, MAX_CROP_Y_PX]`.
+ * @param swathTileMode Active horizontal tile geometry ([SwathTileMode.FIVE_TILE] or [SwathTileMode.THREE_TILE]).
+ * @return [PanoramicViewportTransform] aligning the camera preview and HUD overlay.
+ */
 fun computePanoramicViewportTransform(
     viewportWidthPx: Float,
     viewportHeightPx: Float,
@@ -145,9 +178,15 @@ fun computePanoramicViewportTransform(
 )
 
 /**
- * Computes continuous sub-pixel optical mapping from `1920x1080` landscape sensor coordinates into
- * the panoramic LCARS viewport slot so 120 Hz GPU `PreviewView.translationY` and the Compose strip
- * overlay stay registered without integer quantization jumps.
+ * Computes continuous sub-pixel optical mapping from canonical `1920x1080` landscape sensor
+ * coordinates into the panoramic LCARS viewport slot so 120 Hz GPU `PreviewView.translationY` and
+ * the Compose strip overlay stay registered without integer quantization jumps.
+ *
+ * @param viewportWidthPx Width of the viewport container in screen pixels (clamped to `>= 1f`).
+ * @param viewportHeightPx Height of the viewport container in screen pixels (clamped to `>= 1f`).
+ * @param cropYFloat Sub-pixel vertical top offset of the `384 px` strip in `[0f, MAX_CROP_Y_PX]`.
+ * @param swathTileMode Active horizontal tile geometry ([SwathTileMode.FIVE_TILE] or [SwathTileMode.THREE_TILE]).
+ * @return [PanoramicViewportTransform] aligning the camera preview and HUD overlay.
  */
 fun computePanoramicViewportTransform(
     viewportWidthPx: Float,
@@ -235,6 +274,14 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         )
     }
 
+    /**
+     * Updates the sub-pixel vertical crop offset and swath tile mode, applying the resulting
+     * vertical frame shift directly to `previewView.translationY` on the UI thread without a
+     * full measure/layout pass unless [swathTileMode] changed.
+     *
+     * @param cropYFloat Continuous 120 Hz stabilized `cropY` in `[0f, MAX_CROP_Y_PX]`.
+     * @param swathTileMode Active swath tile mode.
+     */
     fun updateStabilizationState(cropYFloat: Float, swathTileMode: SwathTileMode) {
         val swathChanged = currentSwathMode != swathTileMode
         currentCropYFloat = cropYFloat
@@ -290,6 +337,31 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
     }
 }
 
+/**
+ * Top-level split-screen landscape LCARS Geological Tricorder screen.
+ *
+ * Splits the safe-drawing canvas evenly (`0.50f` / `0.50f`) between [GeologicalViewportZone] on top
+ * and [TacticalControlDeckZone] on the bottom so interactive buttons never occlude the live camera
+ * swath or target reticles (`.agents/rules/lcars-ui.md`).
+ *
+ * @param uiState Immutable UI and telemetry snapshot emitted by [ScannerViewModel.uiState].
+ * @param hasCameraPermission Whether `Manifest.permission.CAMERA` is currently granted.
+ * @param onRequestCameraPermission Callback invoked when the operator taps the permission prompt pill.
+ * @param onBindPreview Callback invoked once the underlying [PreviewView] is inflated and ready to
+ *   bind to CameraX.
+ * @param onSelectMode Callback invoked to switch between [OperatingMode.SCAN] and [OperatingMode.LOG_DATA].
+ * @param onSelectSource Callback invoked when a [DetectorSourceOption] is selected in the source drawer.
+ * @param onToggleSwathTileMode Callback invoked to toggle between 5-tile and 3-tile swath widths.
+ * @param onToggleEisLock Callback invoked to enable or disable IMU pitch-lock EIS stabilization.
+ * @param onSyncPitch Callback invoked to re-center the reference pitch to the current device pitch.
+ * @param onToggleStoneClass Callback invoked to mute or unmute a specific [StoneClass] filter.
+ * @param onToggleShutterClamp Callback invoked to toggle the `<= 2.0 ms` (`1/500 s`) manual shutter clamp.
+ * @param onToggleTwoXCrop Callback invoked to toggle the `2.0x` lossless sensor crop mode.
+ * @param onChangeExposureBias Callback invoked when the operator steps exposure bias in EV.
+ * @param onToggleAudioMute Callback invoked to mute or unmute the acoustic sonifier.
+ * @param onToggleOverspeedTest Callback invoked to toggle simulated overspeed alert verification.
+ * @param initialSourceDrawerOpen Whether the scrollable source drawer starts open (used by Compose Previews).
+ */
 @Composable
 fun ScannerScreen(
     uiState: ScannerUiState,
@@ -350,6 +422,11 @@ fun ScannerScreen(
     }
 }
 
+/**
+ * Upper ~50% LCARS frame hosting the `GEO-47` top-left elbow, high-water-mark passive telemetry
+ * header segments (`PITCH`, `RANGE/RESOLUTION`, `VEL`, `OPTICS/SHUTTER/ISO`), the left stem (`FPS`
+ * readout and sole `AUDIO` mute pill), the [PitchTravelGaugeColumn], and [PanoramicCameraViewport].
+ */
 @Composable
 private fun GeologicalViewportZone(
     uiState: ScannerUiState,
@@ -541,6 +618,11 @@ private fun GeologicalViewportZone(
     }
 }
 
+/**
+ * Hardware-clipped camera viewport container pairing [ClippingCameraViewportContainer] (when camera
+ * permission is granted in a live session) or a dark diagnostic grid (in Compose Previews / before
+ * permission grant) with [PushBroomTripwireOverlay].
+ */
 @Composable
 private fun PanoramicCameraViewport(
     uiState: ScannerUiState,
@@ -624,6 +706,14 @@ private fun PanoramicCameraViewport(
     }
 }
 
+/**
+ * Compose [Canvas] overlay drawn directly atop [PanoramicCameraViewport] in 1:1 optical
+ * registration with [computePanoramicViewportTransform].
+ *
+ * Renders the semi-transparent letterbox veil outside the `384 px` strip, `#000000`-keylined top
+ * and bottom strip rails, `32 px` inter-tile overlap tick marks, high-contrast stone target corner
+ * reticles with `2.dp` `#000000` halos, and the overspeed warning banner.
+ */
 @Composable
 private fun PushBroomTripwireOverlay(
     uiState: ScannerUiState,
@@ -1040,6 +1130,12 @@ private fun PitchTravelGaugeColumn(
     }
 }
 
+/**
+ * Lower ~50% LCARS frame hosting the left mode/recording stem (`SCAN`/`LOG` toggle and `REC` frame
+ * counter), the `SYS-01` bottom-left elbow, the bottom telemetry footer rail (`SWEEP` latency
+ * breakdown and `PING` sonifier readout), and the two-column control deck ([OpticsAndEisColumn] and
+ * [ProspectMatrixColumn]).
+ */
 @Composable
 private fun TacticalControlDeckZone(
     uiState: ScannerUiState,
@@ -1206,6 +1302,11 @@ private fun TacticalControlDeckZone(
     }
 }
 
+/**
+ * Left column (`weight(0.47f)`) of the lower tactical control deck housing optics and stabilization
+ * controls: `2.0X CROP`, `1/500S` shutter clamp, `EIS LOCK`, `SYNC` pitch calibration, `5/3-TILE`
+ * swath selector, and the 7-segment [LcarsSegmentedEvBar].
+ */
 @Composable
 private fun OpticsAndEisColumn(
     uiState: ScannerUiState,
@@ -1351,6 +1452,11 @@ private fun OpticsAndEisColumn(
     }
 }
 
+/**
+ * Right column (`weight(0.53f)`) of the lower tactical control deck housing the 2x2 mineral class
+ * filter matrix (which smoothly transitions into [SourceSelectionDrawer] when `SRC` is tapped) and
+ * the bottom `SRC` drawer trigger + `SPEED SIM` gate test toggle row.
+ */
 @Composable
 private fun ProspectMatrixColumn(
     uiState: ScannerUiState,
@@ -1621,6 +1727,11 @@ private fun SourceSelectionDrawer(
     }
 }
 
+/**
+ * Capsule LCARS toggle pill for an individual alertable [StoneClass] in the 2x2 prospect matrix,
+ * displaying the class [StoneClass.codePrefix], mineral color swatch, and `ACTIVE`/`MUTED` reticle
+ * status.
+ */
 @Composable
 private fun MineralTargetPill(
     stoneClass: StoneClass,
@@ -1644,6 +1755,13 @@ private fun MineralTargetPill(
     )
 }
 
+/**
+ * Formats a Camera2 sensor exposure duration in nanoseconds as a human-readable reciprocal shutter
+ * fraction string (e.g., `2_000_000L -> "1/500S"`).
+ *
+ * @param exposureNs Sensor exposure duration in nanoseconds; values `<= 0L` default to `"1/500S"`.
+ * @return Reciprocal shutter speed string in `"1/<denom>S"` format.
+ */
 private fun formatShutterFraction(exposureNs: Long): String {
     if (exposureNs <= 0L) return "1/500S"
     val denom = (1_000_000_000.0 / exposureNs.toDouble()).roundToInt().coerceAtLeast(1)

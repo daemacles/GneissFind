@@ -7,6 +7,13 @@
  * landscape rotation matrices for display reprojection, timestamp-matched integer cropY offsets for
  * YUV strip extraction, and rotation-invariant 3D world rays and ground coordinates for
  * TemporalTargetTracker.
+ *
+ * Main types:
+ * - RaycastResult: 3D ground intersection point, slant range, GSD, and 3D world bearing ray for a detection.
+ * - PitchStabilizationFloatState / PitchStabilizationState: continuous and integer-quantized EIS cropY states.
+ * - MotionPoseSnapshot: synchronized per-frame camera/IMU pose, rotation matrix, and ground speed snapshot.
+ * - ReprojectedStripBox: 120 Hz ego-motion-reprojected strip bounding box and visibility flag.
+ * - GroundPlaneRaycaster: SensorEventListener, 128-entry rotation matrix ring buffer, and pinhole raycaster.
  */
 package com.gneissfind.app.tracking
 
@@ -84,6 +91,13 @@ data class PitchStabilizationFloatState(
 /**
  * Integer-quantized IMU-stabilized vertical strip position inside the landscape camera frame for
  * YUV row slicing in [PushBroomCropper].
+ *
+ * @property rawCropY Unclamped integer top row offset (px) before `[0, MAX_CROP_Y_PX]` clamping.
+ * @property clampedCropY Clamped integer top row offset (px) in `[0, MAX_CROP_Y_PX]`.
+ * @property isPitchClamped `true` when [rawCropY] exceeded `[0, MAX_CROP_Y_PX]` (`PITCH LIMIT`).
+ * @property matchedPitchDeg Timestamp-matched downward optical pitch (degrees, `0` = horizon, `90` = nadir).
+ * @property referencePitchDeg Active EIS pitch setpoint (degrees).
+ * @property verticalFocalLengthPx Stream-scaled vertical focal length (px) used for `fy * tan(delta)`.
  */
 data class PitchStabilizationState(
     val rawCropY: Int,
@@ -97,6 +111,20 @@ data class PitchStabilizationState(
 /**
  * Snapshot of current sensor/VIO pose, remapped landscape pitch/roll, 3x3 landscape rotation matrix,
  * stabilized `cropY`, calibrated vertical focal length, slant range `R`, and ground speed.
+ *
+ * @property cameraWorldPosition Estimated 3D camera optical center in world coordinates (meters; `yMeters` is height above ground).
+ * @property forwardPitchDeg Low-pass smoothed downward optical pitch in degrees for HUD display.
+ * @property rawPitchDeg Timestamp-matched unsmoothed downward optical pitch in degrees at [timestampNs].
+ * @property rollDeg Smoothed landscape screen roll angle in degrees.
+ * @property referencePitchDeg Active EIS reference pitch setpoint in degrees (`45.0 deg` default).
+ * @property cropY Stabilized integer top Y offset (`0..696 px`) of the `384 px` strip on the `1920x1080` frame.
+ * @property isPitchClamped `true` when [cropY] is clamped at `0` or [StripRoiGeometry.MAX_CROP_Y_PX].
+ * @property centerSlantRangeMeters Slant range $R$ in meters along the center of the stabilized strip.
+ * @property horizontalSpeedMps Estimated horizontal ground speed $v_{xy}$ in meters per second.
+ * @property arPlaneLocked `true` when an upward-facing horizontal ARCore [Plane] is actively tracked.
+ * @property timestampNs Frame sensor timestamp in nanoseconds.
+ * @property verticalFocalLengthPx Calibrated vertical focal length $f_y$ in `1080p` stream pixels.
+ * @property rotationMatrix 9-element row-major `3x3` rotation matrix (`R_world_from_scr`) matched to [timestampNs].
  */
 data class MotionPoseSnapshot(
     val cameraWorldPosition: WorldPoint3D,
@@ -140,14 +168,22 @@ data class ReprojectedStripBox(
  * Reversible-landscape IMU pitch stabilizer (`Sensor.TYPE_GAME_ROTATION_VECTOR`), ARCore display
  * geometry synchronizer, 3D world-ray projector, and ground-plane raycaster:
  *  - Uses magnetometer-free `Sensor.TYPE_GAME_ROTATION_VECTOR` (`SENSOR_DELAY_GAME`) so magnetite
- *    in Pacific Northwest basalt cobbles never causes yaw/pitch drift.
+ *    in Pacific Northwest basalt cobbles never causes yaw/pitch drift (`.agents/rules/android-camera-ar.md` §2).
  *  - Remaps IMU axes for `Surface.ROTATION_90` (`AXIS_Y, AXIS_MINUS_X`) and `Surface.ROTATION_270`
  *    (`AXIS_MINUS_Y, AXIS_X`) so downward pitch (`0 deg` = horizon, `45 deg` = forward slant,
  *    `90 deg` = straight down nadir), roll, and 3x3 world rotation matrices stay identical across
  *    180-degree landscape flips.
- *  - Maintains a 128-entry timestamped ring buffer (~1.0 s at 125 Hz) of full 3x3 landscape
+ *  - Maintains a [IMU_RING_CAPACITY]-entry timestamped ring buffer (~1.0 s at 125 Hz) of full 3x3 landscape
  *    rotation matrices so detections from a ~390 ms GPU sweep are back-projected using the exact
  *    camera orientation at `imageProxy.imageInfo.timestamp` and forward-reprojected at 120 Hz.
+ *
+ * Lifecycle & Threading:
+ * - Call [startImuListening] to register sensor listeners on the main sensor looper and [stopImuListening] / [close] to unregister.
+ * - Ring buffer reads ([lookupPitchAtTimestampNs], [lookupRotationMatrixAtTimestampNs], [copyLatestRotationMatrix])
+ *   and writes ([onSensorChanged], [recordSyntheticOrientationSample]) are synchronized on [imuRingLock].
+ *
+ * @param context Optional Android [Context] used to resolve [SensorManager] (`null` in pure JVM unit tests).
+ * @param waistHeightMeters Assumed vertical height of the handheld phone above the gravel bar in meters ([DEFAULT_WAIST_HEIGHT_METERS]).
  */
 class GroundPlaneRaycaster(
     context: Context? = null,
@@ -239,6 +275,10 @@ class GroundPlaneRaycaster(
     private var lastArPoseTimestampNs = 0L
     private var smoothedArSpeedMps = 0f
 
+    /**
+     * Registers listeners for `Sensor.TYPE_GAME_ROTATION_VECTOR` (at [TARGET_IMU_SAMPLING_PERIOD_US],
+     * falling back to `SENSOR_DELAY_GAME`) and `Sensor.TYPE_LINEAR_ACCELERATION`. No-op if [sensorManager] is `null`.
+     */
     fun startImuListening() {
         val sm = sensorManager ?: return
         gameRotationSensor?.let { sensor ->
@@ -254,6 +294,9 @@ class GroundPlaneRaycaster(
         linearAccelSensor?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     }
 
+    /**
+     * Unregisters all IMU sensor listeners and resets live-stream tracking flags.
+     */
     fun stopImuListening() {
         sensorManager?.unregisterListener(this)
         hasLiveImuStream = false
@@ -265,8 +308,13 @@ class GroundPlaneRaycaster(
     }
 
     /**
-     * Synchronizes reversible-landscape display rotation (`ROTATION_90` vs `ROTATION_270`) for both
+     * Synchronizes reversible-landscape display rotation ([Surface.ROTATION_90] vs [Surface.ROTATION_270]) for both
      * IMU coordinate remapping and any active ARCore [Session].
+     *
+     * @param surfaceRotation Android [Surface] rotation constant.
+     * @param viewportWidthPx Optional viewport width in pixels passed to `arSession.setDisplayGeometry`.
+     * @param viewportHeightPx Optional viewport height in pixels passed to `arSession.setDisplayGeometry`.
+     * @param arSession Optional active ARCore [Session] to synchronize with the display rotation.
      */
     fun updateDisplayGeometry(
         surfaceRotation: Int,
@@ -290,6 +338,8 @@ class GroundPlaneRaycaster(
     /**
      * Captures the user's current handheld downward tilt as the active EIS `thetaRef` setpoint
      * (`SYNC PITCH` actuator) and snaps the smoothed display pitch to avoid transient slew.
+     *
+     * @return Newly locked [referencePitchDeg] in degrees, clamped to `[12.0, 85.0]`.
      */
     fun syncReferencePitch(): Float {
         val synced = (simulatedPitchOverrideDeg ?: latestRawPitchDeg).coerceIn(12.0f, 85.0f)
@@ -298,6 +348,9 @@ class GroundPlaneRaycaster(
         return synced
     }
 
+    /**
+     * Explicitly sets [referencePitchDeg] in degrees (clamped to `[12.0, 85.0]`).
+     */
     fun setReferencePitchDegrees(pitchDeg: Float) {
         referencePitchDeg = pitchDeg.coerceIn(12.0f, 85.0f)
     }
@@ -306,6 +359,11 @@ class GroundPlaneRaycaster(
      * Records a synthetic 3D orientation sample `(pitchDeg, rollDeg, yawDeg)` at [timestampNs] into
      * the IMU ring buffer and updates the live orientation state. Used by deterministic JVM unit
      * tests and synthetic simulation harnesses.
+     *
+     * @param timestampNs Synthetic frame/sensor timestamp in nanoseconds.
+     * @param pitchDeg Downward optical pitch in degrees (`0` = horizon, `90` = nadir).
+     * @param rollDeg Screen roll in degrees (`0` = level).
+     * @param yawDeg Clockwise horizontal azimuth in degrees (`0` = North `+Y_w`, `90` = East `+X_w`).
      */
     fun recordSyntheticOrientationSample(
         timestampNs: Long,
@@ -334,8 +392,11 @@ class GroundPlaneRaycaster(
     }
 
     /**
-     * Copies the most recent 3x3 landscape rotation matrix (`R_world_from_scr`) for 120 Hz display
-     * reticle reprojection.
+     * Copies the most recent 3x3 landscape rotation matrix (`R_world_from_scr`) into [outMatrix]
+     * for 120 Hz display reticle reprojection.
+     *
+     * @param outMatrix Destination 9-element row-major array (allocated if omitted).
+     * @return [outMatrix] populated with the latest `R_world_from_scr` entries.
      */
     fun copyLatestRotationMatrix(outMatrix: FloatArray = FloatArray(9)): FloatArray {
         val overridePitch = simulatedPitchOverrideDeg
@@ -434,6 +495,9 @@ class GroundPlaneRaycaster(
     /**
      * Looks up the raw IMU pitch sample closest in timestamp to [targetTimestampNs] for zero-lag
      * software EIS `cropY` computation.
+     *
+     * @param targetTimestampNs Camera frame sensor timestamp (`ns`) to match against the IMU ring buffer.
+     * @return Nearest recorded downward optical pitch in degrees (or [simulatedPitchOverrideDeg] if set).
      */
     fun lookupPitchAtTimestampNs(targetTimestampNs: Long): Float {
         simulatedPitchOverrideDeg?.let { return it }
@@ -456,6 +520,10 @@ class GroundPlaneRaycaster(
      * Looks up the 3x3 landscape rotation matrix (`R_world_from_scr`) closest in timestamp to
      * [targetTimestampNs] so a detection from a camera frame is back-projected using the exact
      * orientation at frame exposure time.
+     *
+     * @param targetTimestampNs Camera frame sensor timestamp (`ns`) to match against the IMU ring buffer.
+     * @param outMatrix Destination 9-element row-major array (allocated if omitted).
+     * @return [outMatrix] populated with the nearest historical `R_world_from_scr` matrix.
      */
     fun lookupRotationMatrixAtTimestampNs(
         targetTimestampNs: Long,
@@ -491,6 +559,11 @@ class GroundPlaneRaycaster(
     /**
      * Captures the synchronized pose, timestamp-matched `cropY` stabilization state, 3x3 rotation
      * matrix at [fallbackTimestampNs], slant range `R`, and horizontal ground velocity `v_xy`.
+     *
+     * @param arFrame Optional active ARCore [Frame] when 6DoF VIO plane tracking is used.
+     * @param fallbackTimestampNs Camera `ImageProxy` sensor timestamp (`ns`) used when [arFrame] is `null`.
+     * @param verticalFocalLengthPx Calibrated vertical focal length $f_y$ in `1080p` stream pixels.
+     * @return Synchronized [MotionPoseSnapshot] for the frame.
      */
     fun capturePoseSnapshot(
         arFrame: Frame? = null,
@@ -585,6 +658,13 @@ class GroundPlaneRaycaster(
      * Raycasts a [StripDetection] onto the horizontal ground plane and computes its 3D unit bearing
      * ray in the `TYPE_GAME_ROTATION_VECTOR` world frame using the capture-timestamp rotation matrix
      * and calibrated focal length.
+     *
+     * @param detection Merged 2D detection in unified push-broom strip coordinates.
+     * @param geometry Active push-broom strip geometry (`1792x384` or `1088x384`).
+     * @param poseSnapshot Synchronized camera/IMU pose snapshot at the frame's capture timestamp.
+     * @param zoomRatio Active digital zoom ratio (`2.0f` default).
+     * @param arFrame Optional ARCore [Frame] for horizontal plane hit-testing before falling back to waist-height ray intersection.
+     * @return [RaycastResult] containing the 3D ground point, slant range, GSD, and 3D world bearing ray.
      */
     fun raycastStripDetection(
         detection: StripDetection,
@@ -655,8 +735,15 @@ class GroundPlaneRaycaster(
     }
 
     /**
-     * Reprojects a list of [ConfirmedTarget]s into the current camera orientation and strip `cropYFloat`
+     * Reprojects a list of [ConfirmedTarget]s into the current camera orientation and strip [currentCropYFloat]
      * at 120 Hz so reticles stay locked to physical objects in the live viewport.
+     *
+     * @param targets Confirmed targets from `TemporalTargetTracker`.
+     * @param stripGeometry Active push-broom strip geometry.
+     * @param currentCropYFloat Current continuous EIS `cropY` offset on the `1080p` frame.
+     * @param currentFocalLengthPx Current calibrated vertical focal length $f_y$ in pixels.
+     * @param currentRotationMatrix Current 9-element row-major `R_world_from_scr` rotation matrix.
+     * @return List of [ConfirmedTarget]s with updated strip coordinates and [ConfirmedTarget.isVisibleInStrip] flags.
      */
     fun reprojectConfirmedTargetsToCurrentPose(
         targets: List<ConfirmedTarget>,
@@ -676,13 +763,24 @@ class GroundPlaneRaycaster(
     }
 
     companion object {
+        /** Default handheld waist height above the gravel bar in meters (`1.06 m`, yielding `R = 1.50 m` at `45 deg` pitch). */
         const val DEFAULT_WAIST_HEIGHT_METERS = 1.06f
+
+        /** Default downward optical pitch angle in degrees (`45.0 deg`, `AGENTS.md` §3). */
         const val DEFAULT_PITCH_DEGREES = 45.0f
-        private const val TARGET_IMU_SAMPLING_PERIOD_US = 8_000 // 125 Hz (<= 200 Hz Android 12 unprivileged cap)
-        private const val MIN_DISPLAY_UPDATE_INTERVAL_NS = 8_000_000L // ~125 Hz max UI/GPU translation cadence
-        private const val IMU_RING_CAPACITY = 128 // ~1.02 s history at 125 Hz
-        // Vertical angular span of the 384 px tall 2x-cropped push-broom strip (~7.4 deg on 1080p)
+
+        /** Requested IMU sampling period in microseconds (`8,000 us` = `125 Hz`, within Android 12's `<= 200 Hz` unprivileged cap). */
+        private const val TARGET_IMU_SAMPLING_PERIOD_US = 8_000
+
+        /** Minimum interval between main-thread display/reticle reprojection callbacks (`8,000,000 ns` = `~125 Hz`). */
+        private const val MIN_DISPLAY_UPDATE_INTERVAL_NS = 8_000_000L
+
+        /** Capacity of the timestamp-indexed IMU orientation ring buffer (`128` samples = `~1.02 s` at `125 Hz`). */
+        private const val IMU_RING_CAPACITY = 128
+
+        /** Vertical angular span of the `384 px` tall `2x`-cropped push-broom strip (`~7.36 deg` on `1080p`). */
         private const val STRIP_VERTICAL_FOV_2X_DEG = 7.36f
+
         private val MIN_DOWNWARD_SIN = sin(Math.toRadians(10.0)).toFloat()
         private val MAX_DOWNWARD_SIN = sin(Math.toRadians(88.0)).toFloat()
 
@@ -693,6 +791,12 @@ class GroundPlaneRaycaster(
          *
          * Columns of `outMatrix` represent Screen Right (`+x_scr`), Screen Up (`+y_scr`), and
          * Screen Out (`+z_scr`, opposite the camera optical axis `-z_scr`) in ENU world coordinates.
+         *
+         * @param pitchDeg Downward optical pitch in degrees (`0` = horizon, `90` = nadir).
+         * @param rollDeg Screen roll in degrees (`0` = level).
+         * @param yawDeg Clockwise horizontal azimuth in degrees (`0` = North `+Y_w`, `90` = East `+X_w`).
+         * @param outMatrix Destination 9-element row-major array (allocated if omitted).
+         * @return [outMatrix] containing the orthonormal `3x3` `R_world_from_scr` rotation matrix.
          */
         fun buildLandscapeRotationMatrix(
             pitchDeg: Float,
@@ -744,6 +848,14 @@ class GroundPlaneRaycaster(
          * Back-projects a pixel `(frameXPx, frameYPx)` in the upright `1920x1080` landscape camera
          * frame into a unit 3D ray in the `TYPE_GAME_ROTATION_VECTOR` ENU world frame using
          * [rotationMatrix] (`R_world_from_scr`) and [focalLengthPx].
+         *
+         * @param frameXPx Horizontal pixel coordinate on the upright `1920x1080` frame (`0` = left).
+         * @param frameYPx Vertical pixel coordinate on the upright `1920x1080` frame (`0` = top).
+         * @param focalLengthPx Calibrated vertical pinhole focal length $f_y$ in frame pixels.
+         * @param rotationMatrix 9-element row-major `R_world_from_scr` rotation matrix at capture time.
+         * @param frameWidthPx Upright frame width in pixels ([StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX]).
+         * @param frameHeightPx Upright frame height in pixels ([StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX]).
+         * @return Normalized [WorldRay3D] pointing from the camera through `(frameXPx, frameYPx)` in world coordinates.
          */
         fun pixelToWorldRay(
             frameXPx: Float,
@@ -777,6 +889,15 @@ class GroundPlaneRaycaster(
          * `(angularWidthRad, angularHeightRad)` through the transpose of [currentRotationMatrix]
          * (`R_scr_from_world`) into strip-local coordinates relative to [stripGeometry] and
          * [currentCropYFloat].
+         *
+         * @param worldRay Unit 3D bearing vector in the ENU world frame.
+         * @param angularWidthRad Horizontal angular span of the target box in radians.
+         * @param angularHeightRad Vertical angular span of the target box in radians.
+         * @param currentRotationMatrix Current 9-element row-major `R_world_from_scr` rotation matrix.
+         * @param currentFocalLengthPx Current calibrated vertical focal length $f_y$ in frame pixels.
+         * @param currentCropYFloat Current continuous EIS `cropY` top offset on the `1080p` frame.
+         * @param stripGeometry Active push-broom strip geometry.
+         * @return [ReprojectedStripBox] with updated strip coordinates and [ReprojectedStripBox.isVisibleInStrip] flag.
          */
         fun reprojectWorldRayToStripBox(
             worldRay: WorldRay3D,
@@ -856,7 +977,7 @@ class GroundPlaneRaycaster(
         /**
          * Reprojects every [ConfirmedTarget] that carries a [ConfirmedTarget.worldRay] into the
          * current camera orientation [currentRotationMatrix] and [currentCropYFloat]. Targets
-         * without a [worldRay] (e.g., synthetic tests) are returned unchanged.
+         * without a [ConfirmedTarget.worldRay] (e.g., synthetic tests) are returned unchanged.
          */
         fun reprojectTargetsWithMatrix(
             targets: List<ConfirmedTarget>,
@@ -889,10 +1010,14 @@ class GroundPlaneRaycaster(
 
         /**
          * Remaps raw Android device rotation matrix [rawR] into landscape screen coordinates:
-         *  - `Surface.ROTATION_90`: `(AXIS_Y, AXIS_MINUS_X)`
-         *  - `Surface.ROTATION_270`: `(AXIS_MINUS_Y, AXIS_X)`
+         *  - [Surface.ROTATION_90]: `(AXIS_Y, AXIS_MINUS_X)`
+         *  - [Surface.ROTATION_270]: `(AXIS_MINUS_Y, AXIS_X)`
          * Includes exact orthogonal column-permutation fallback when `SensorManager.remapCoordinateSystem`
          * is stubbed in host-side JVM unit tests.
+         *
+         * @param rawR 9-element row-major device rotation matrix from `SensorManager.getRotationMatrixFromVector`.
+         * @param surfaceRotation Active display rotation ([Surface.ROTATION_90] or [Surface.ROTATION_270]).
+         * @param outRemappedR Destination 9-element row-major array receiving the remapped landscape rotation matrix.
          */
         fun remapLandscapeRotationMatrix(
             rawR: FloatArray,
@@ -928,6 +1053,9 @@ class GroundPlaneRaycaster(
         /**
          * Extracts downward optical pitch (`0 deg` = horizon, `45 deg` = forward rockhounding slant,
          * `90 deg` = straight down nadir) and screen roll (`deg`) from [remappedR].
+         *
+         * @param remappedR 9-element row-major landscape rotation matrix from [remapLandscapeRotationMatrix].
+         * @return Pair of `(pitchDeg, rollDeg)` in degrees.
          */
         fun computePitchAndRollDegrees(remappedR: FloatArray): Pair<Float, Float> {
             // World ENU Up vector is Row 2 of remappedR: (R[6], R[7], R[8]) = (Up·X_scr, Up·Y_scr, Up·Z_scr)
@@ -945,6 +1073,12 @@ class GroundPlaneRaycaster(
         /**
          * Computes continuous sub-pixel stabilized `cropY` inside `[0f..MAX_CROP_Y_PX]` on the
          * `1920x1080` landscape stream for 120 Hz GPU preview translation (`PreviewView.translationY`).
+         *
+         * @param currentPitchDeg Current downward optical pitch in degrees.
+         * @param referencePitchDeg Active EIS reference pitch setpoint in degrees ([DEFAULT_PITCH_DEGREES]).
+         * @param verticalFocalLengthPx Calibrated vertical focal length $f_y$ in `1080p` stream pixels.
+         * @param eisEnabled Whether software EIS pitch stabilization is enabled.
+         * @return [PitchStabilizationFloatState] containing unclamped and clamped sub-pixel `cropY` offsets.
          */
         fun computeStabilizedCropYFloat(
             currentPitchDeg: Float,
@@ -989,7 +1123,13 @@ class GroundPlaneRaycaster(
          *  - When user pitches DOWN (`currentPitchDeg > referencePitchDeg`), the ground patch moves
          *    UP toward the top of the sensor frame (`cropY` decreases toward `0`).
          *  - When user pitches UP (`currentPitchDeg < referencePitchDeg`), the ground patch moves
-         *    DOWN toward the bottom of the sensor frame (`cropY` increases toward `696`).
+         *    DOWN toward the bottom of the sensor frame (`cropY` increases toward [StripRoiGeometry.MAX_CROP_Y_PX]).
+         *
+         * @param currentPitchDeg Timestamp-matched downward optical pitch in degrees.
+         * @param referencePitchDeg Active EIS reference pitch setpoint in degrees ([DEFAULT_PITCH_DEGREES]).
+         * @param verticalFocalLengthPx Calibrated vertical focal length $f_y$ in `1080p` stream pixels.
+         * @param eisEnabled Whether software EIS pitch stabilization is enabled.
+         * @return [PitchStabilizationState] containing unclamped and clamped integer `cropY` offsets.
          */
         fun computeStabilizedCropY(
             currentPitchDeg: Float,
@@ -1017,6 +1157,10 @@ class GroundPlaneRaycaster(
             )
         }
 
+        /**
+         * Computes line-of-sight slant range $R = h / \sin(\theta)$ in meters (clamped to `[0.40, 6.50] m`)
+         * for camera height [waistHeightMeters] and depression angle [forwardPitchDeg].
+         */
         fun computeSlantRangeForPitch(
             waistHeightMeters: Float = DEFAULT_WAIST_HEIGHT_METERS,
             forwardPitchDeg: Float = DEFAULT_PITCH_DEGREES
@@ -1026,8 +1170,17 @@ class GroundPlaneRaycaster(
         }
 
         /**
-         * Pure trigonometric ground-plane projection from waist height `h` at depression angle
-         * `forwardPitchDeg` (`45 deg` -> `R = 1.50 m`, `Z_ahead = 1.06 m`, `GSD = 0.59 mm/px` @ `2.0x`).
+         * Pure trigonometric ground-plane projection from waist height [waistHeightMeters] at depression angle
+         * [forwardPitchDeg] (`45 deg` -> `R = 1.50 m`, `Z_ahead = 1.06 m`, `GSD = 0.59 mm/px` @ `2.0x`).
+         *
+         * @param stripCenterXPx Horizontal target center in unified strip pixels (`0..stripWidthPx`).
+         * @param stripCenterYPx Vertical target center in unified strip pixels (`0..384`).
+         * @param stripWidthPx Width of the active push-broom strip in pixels (`1792` or `1088`).
+         * @param cameraWorldPos Camera optical center in world coordinates (meters).
+         * @param forwardPitchDeg Downward optical pitch in degrees (`45.0 deg` default).
+         * @param waistHeightMeters Vertical height of the camera above the ground plane in meters ([DEFAULT_WAIST_HEIGHT_METERS]).
+         * @param zoomRatio Active digital zoom ratio (`2.0f` default).
+         * @return [RaycastResult] with projected 3D ground coordinates, slant range, and GSD.
          */
         fun raycastTrigonometric(
             stripCenterXPx: Float,

@@ -1,6 +1,17 @@
 /*
- * Unit tests for LCARS swept elbow geometry, continuous sub-pixel EIS viewport transforms, and
- * semantic HSV value stepping across adjacent UI elements.
+ * Unit test suite for LCARS geometric primitives, continuous sub-pixel EIS viewport transforms,
+ * and semantic HSV value stepping (`.agents/rules/lcars-ui.md`).
+ *
+ * Covers:
+ * - [com.gneissfind.app.ui.lcars.LcarsElbowMetricsPx.containsPoint]: outer convex curve and inner
+ *   concave crook fillet hit-testing for `TopLeft` and `BottomLeft` orientations.
+ * - [computePanoramicViewportTransform]: full `384 px` strip visibility across `cropY in [0..696]`
+ *   and monotonic sub-pixel `frameTopPx` translation during `0.01 deg` pitch increments.
+ * - [withValueLevel]: HSV hue/saturation invariance and `+-5%` (`LCARS_ADJACENT_VALUE_STEP`) value
+ *   tier separation across all LCARS semantic palette families.
+ *
+ * Main types:
+ * - [LcarsGeometryAndViewportTest]: JUnit4 test suite.
  */
 package com.gneissfind.app.ui
 
@@ -17,6 +28,10 @@ import com.gneissfind.app.ui.theme.withValueLevel
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test
 
+/**
+ * Verifies LCARS elbow fillet geometry, panoramic viewport coordinate transforms, and HSV value
+ * stepping invariants.
+ */
 class LcarsGeometryAndViewportTest {
 
     @Test

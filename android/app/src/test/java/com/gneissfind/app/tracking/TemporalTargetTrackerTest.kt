@@ -1,7 +1,19 @@
 /*
- * Unit tests for TemporalTargetTracker spatial voting, confirmation hysteresis, 2-sweep
- * consecutive high-confidence acquisition, 3D IMU world-ray track association across handheld
- * pitch/yaw motion, and 120 Hz ego-motion reticle reprojection.
+ * Unit test suite for [TemporalTargetTracker] and [GroundPlaneRaycaster] 3D world-ray AR tracking.
+ *
+ * Covers the spatial-temporal tracking and ego-motion reprojection invariants
+ * (`.agents/rules/android-camera-ar.md`, `docs/ENGINEERING_LEDGER.md`):
+ * - `3-of-6` sliding-window spatial voting within a `40 mm` ground-plane radius.
+ * - Rapid 2-sweep consecutive high-confidence (`>= 0.72`) acquisition and confirmation hysteresis
+ *   (retaining confirmed lock down to `>= 2` hits in the last 6 sweeps).
+ * - Rotation-invariant 3D IMU world-ray (`<= 3.8 deg` cone) track association across handheld
+ *   camera pitch, roll, and yaw rotation.
+ * - 120 Hz ego-motion reticle reprojection compensating for GPU inference latency and suppressing
+ *   off-strip ghost reticles (`isVisibleInStrip = false`).
+ * - Walking speed gate alerting above `1.10 m/s` ([ScanSpeedState.SpeedWarning]).
+ *
+ * Main types:
+ * - [TemporalTargetTrackerTest]: JUnit4 test suite.
  */
 package com.gneissfind.app.tracking
 
@@ -16,9 +28,17 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
 
+/**
+ * Verifies [TemporalTargetTracker] 3-of-6 spatial voting, 2-sweep high-confidence acquisition,
+ * 3D IMU world-ray association, 120 Hz ego-motion reprojection, and walking-speed gate alerts.
+ */
 @RunWith(JUnit4::class)
 class TemporalTargetTrackerTest {
 
+    /**
+     * Builds a synthetic [ProjectedCandidate] anchored at ground-plane coordinates
+     * `([xMeters], 0, [zMeters])` for flat ground-plane voting tests.
+     */
     private fun candidateAt(
         xMeters: Float,
         zMeters: Float,

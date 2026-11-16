@@ -4,6 +4,10 @@
  * Consumes pre-allocated NHWC RGB [0..1] float tiles from PushBroomSweepBuffers and class-index
  * routing rules from assets/rf_detr_coco_metadata.json; produces tile-local TileDetection lists
  * and stage latency telemetry for ScannerViewModel.
+ *
+ * Main types:
+ * - CocoStandInMetadata: parsed runtime configuration and MS-COCO-to-StoneClass routing table.
+ * - RfDetrTwoGraphGpuDetector: zero-allocation 2-Graph/1-Graph LiteRT GPU FP16 detector and host Top-K proposal bridge.
  */
 package com.gneissfind.app.inference
 
@@ -97,6 +101,9 @@ data class CocoStandInMetadata(
          *  - `90` (`toothbrush`) -> `2` ([StoneClass.GREEN_GEM_ROCK])
          *  - `75` (`remote`) -> `3` ([StoneClass.PETRIFIED_WOOD])
          *  - All other indices -> `4` ([StoneClass.HARD_CONFUSER])
+         *
+         * @param numClasses Number of output class slots in the model head (defaults to [DEFAULT_COCO_NUM_CLASSES]).
+         * @return Integer lookup table of length `max(numClasses + 1, 128)` mapping COCO class ID to [StoneClass.id].
          */
         fun buildDefaultCocoToStoneClassLut(numClasses: Int = DEFAULT_COCO_NUM_CLASSES): IntArray {
             val lutSize = maxOf(numClasses + 1, 128)
@@ -229,6 +236,10 @@ class RfDetrTwoGraphGpuDetector(
         }
     }
 
+    /**
+     * Resolves an optional `benchmark_override.json` file in external or internal app storage,
+     * returning `null` if neither exists.
+     */
     private fun resolveBenchmarkOverrideFile(): File? {
         val extDir = appContext.getExternalFilesDir(null)
         if (extDir != null) {
@@ -371,6 +382,10 @@ class RfDetrTwoGraphGpuDetector(
         }
     }
 
+    /**
+     * Builds LiteRT [CompiledModel.Options] targeting `Accelerator.GPU` (FP16 precision, serialized
+     * OpenCL shader cache under `codeCacheDir`) with `Accelerator.CPU` XNNPACK fallback.
+     */
     private fun buildGpuOptions(cacheKey: String): CompiledModel.Options {
         val cacheDir = appContext.codeCacheDir.absolutePath
         val xnnCache = File(appContext.codeCacheDir, "xnnpack_${cacheKey}.cache").absolutePath
@@ -392,6 +407,7 @@ class RfDetrTwoGraphGpuDetector(
         }
     }
 
+    /** Builds 4-thread XNNPACK CPU fallback [CompiledModel.Options] when the GPU delegate fails to compile. */
     private fun buildCpuFallbackOptions(): CompiledModel.Options {
         val cacheFile = File(appContext.codeCacheDir, "xnnpack_weights.cache").absolutePath
         return CompiledModel.Options(Accelerator.CPU).apply {
@@ -402,6 +418,10 @@ class RfDetrTwoGraphGpuDetector(
         }
     }
 
+    /**
+     * Compiles Part 1 and Part 2 `.tflite` models for 2-Graph execution on GPU FP16, falling back
+     * to 4-thread CPU XNNPACK if GPU compilation fails.
+     */
     private fun loadTwoGraphModels(
         env: Environment,
         part1FilePath: String?,
@@ -438,6 +458,10 @@ class RfDetrTwoGraphGpuDetector(
         }
     }
 
+    /**
+     * Compiles the monolithic 1-Graph `.tflite` model on GPU FP16, falling back to 4-thread CPU XNNPACK
+     * if GPU compilation fails (e.g. due to dynamic `Gather`/`TopKV2` ops).
+     */
     private fun loadSingleGraphModel(
         env: Environment,
         singleFilePath: String?
@@ -717,6 +741,7 @@ class RfDetrTwoGraphGpuDetector(
         )
     }
 
+    /** Closes all native LiteRT [TensorBuffer], [CompiledModel], and [Environment] handles. */
     private fun releaseModelsOnly() {
         singleInputs.forEach { runCatching { it.close() } }
         singleOutputs.forEach { runCatching { it.close() } }
@@ -856,6 +881,11 @@ class RfDetrTwoGraphGpuDetector(
         /**
          * Precomputes the static `[gridH * gridW, 4]` normalized `[cx, cy, w, h]` proposal anchor
          * grid matching `RFDETRNano`'s $24 \times 24$ ($576$-token) encoder grid.
+         *
+         * @param gridH Spatial height of the encoder grid (`24` default).
+         * @param gridW Spatial width of the encoder grid (`24` default).
+         * @param defaultWh Normalized initial proposal width and height (`0.05f` default).
+         * @return Flat `FloatArray` of length `gridH * gridW * 4` in row-major `[cx, cy, w, h]` order.
          */
         fun buildNormalizedProposalGrid(
             gridH: Int = CocoStandInMetadata.DEFAULT_ENCODER_GRID_SIZE,
@@ -885,6 +915,20 @@ class RfDetrTwoGraphGpuDetector(
          * with highest `encMaxScores[b, token]` (breaking ties by smaller token index to match
          * `torch.topk(..., sorted=True)`) and gathers both their `outputMemoryPrenorm` vectors
          * (`[topK, hiddenDim]`) and their normalized `baseProposals` (`[topK, 4]`).
+         *
+         * @param encMaxScores Flattened `[batchSize, numTokens]` max-class proposal scores from Part 1 output 2.
+         * @param outputMemoryPrenorm Flattened `[batchSize, numTokens, hiddenDim]` pre-normalized encoder memory from Part 1 output 1.
+         * @param baseProposals Flattened `[numTokens, 4]` static proposal grid from [buildNormalizedProposalGrid].
+         * @param batchSize Compiled batch size of the Part 1 / Part 2 tensors (`5` or `1`).
+         * @param activeBatchItems Number of active tiles in the current sweep (`1..batchSize`); trailing batch slots are zero-filled.
+         * @param numTokens Total spatial encoder tokens per tile (`576`).
+         * @param hiddenDim Feature embedding dimension (`256`).
+         * @param topK Number of top-scoring queries to select per tile (`300`).
+         * @param outSelectedPrenorm Pre-allocated destination buffer of size `batchSize * topK * hiddenDim`.
+         * @param outSelectedProposals Pre-allocated destination buffer of size `batchSize * topK * 4`.
+         * @param outSelectedIndices Pre-allocated destination buffer of size `batchSize * topK` receiving selected token indices.
+         * @param scratchHeapScores Pre-allocated min-heap score scratchpad of length [topK].
+         * @param scratchHeapIndices Pre-allocated min-heap index scratchpad of length [topK].
          */
         fun selectTopKProposalsFromMaxScores(
             encMaxScores: FloatArray,
@@ -975,6 +1019,7 @@ class RfDetrTwoGraphGpuDetector(
             }
         }
 
+        /** Restores the min-heap invariant at [startIdx] using [isWorseCandidate] tie-breaking. */
         private fun siftDownMinHeapTieAware(
             heapScores: FloatArray,
             heapIndices: IntArray,
@@ -1018,6 +1063,7 @@ class RfDetrTwoGraphGpuDetector(
             }
         }
 
+        /** Returns `true` when candidate A has a strictly lower score than B, or equal score with a larger token index. */
         private fun isWorseCandidate(scoreA: Float, idxA: Int, scoreB: Float, idxB: Int): Boolean {
             return scoreA < scoreB || (scoreA == scoreB && idxA > idxB)
         }
@@ -1026,6 +1072,13 @@ class RfDetrTwoGraphGpuDetector(
          * Decodes batched (`[B, numQueries, 4]` and `[B, numQueries, numClasses]`) COCO stand-in
          * predictions across `0 until activeTileCount` into [TileDetection] instances using the
          * class routing table in [metadata].
+         *
+         * @param activeTileCount Number of active tiles in the sweep (`1..5`).
+         * @param boxesCxCyWhNorm Flattened `[B, numQueries, 4]` normalized `[cx, cy, w, h]` box predictions in `[0, 1]`.
+         * @param classScores Flattened `[B, numQueries, numClasses]` class probabilities (or raw logits when `!metadata.scoresAreProbabilities`).
+         * @param metadata Parsed [CocoStandInMetadata] routing configuration.
+         * @param confidenceThreshold Minimum class probability required to emit a [TileDetection].
+         * @param outDetections Destination list to which decoded [TileDetection]s are appended.
          */
         fun decodeCocoBatchPredictions(
             activeTileCount: Int,
@@ -1051,6 +1104,14 @@ class RfDetrTwoGraphGpuDetector(
         /**
          * Decodes a single tile's `[numQueries, 4]` normalized `[cx, cy, w, h]` boxes and
          * `[numQueries, numClasses]` probabilities/logits at [batchElementIndex] into [outDetections].
+         *
+         * @param tileIndex Logical push-broom tile index (`0..4`) stamped onto emitted [TileDetection]s.
+         * @param batchElementIndex Batch slice offset (`0` for `B=1` sequential dispatch, or `tileIndex` for `B=5` batched dispatch).
+         * @param boxesCxCyWhNorm Flattened `[B, numQueries, 4]` normalized `[cx, cy, w, h]` box tensor.
+         * @param classScores Flattened `[B, numQueries, numClasses]` score tensor.
+         * @param metadata Parsed [CocoStandInMetadata] routing configuration.
+         * @param confidenceThreshold Minimum class probability required to emit a [TileDetection].
+         * @param outDetections Destination list to which decoded [TileDetection]s are appended.
          */
         fun decodeCocoSingleTilePredictions(
             tileIndex: Int,
@@ -1127,6 +1188,15 @@ class RfDetrTwoGraphGpuDetector(
          * Host CPU Top-K ($K=100$) object query selection bridge for raw `[numAnchors, numClasses]`
          * encoder logits. Selects the [topK] anchor positions with highest max-class logit and
          * gathers their feature vectors contiguously into [outQueryFeatures].
+         *
+         * @param encoderLogits Flattened `[numAnchors, numClasses]` raw class logits.
+         * @param encoderFeatures Flattened `[numAnchors, hiddenDim]` encoder feature embeddings.
+         * @param numAnchors Number of spatial anchor tokens (`900` default).
+         * @param numClasses Number of classes per anchor (`5` default).
+         * @param hiddenDim Embedding dimension per anchor (`256` default).
+         * @param topK Number of top-scoring anchors to select (`100` default).
+         * @param outQueryFeatures Destination array of length `topK * hiddenDim`.
+         * @param outSelectedIndices Destination array of length `topK` receiving selected anchor indices.
          */
         fun selectTopKQueriesOnHost(
             encoderLogits: FloatArray,
@@ -1188,6 +1258,7 @@ class RfDetrTwoGraphGpuDetector(
             }
         }
 
+        /** Restores the min-heap invariant at [startIdx] for [selectTopKQueriesOnHost]. */
         private fun siftDownMinHeap(
             heapScores: FloatArray,
             heapIndices: IntArray,
@@ -1220,6 +1291,12 @@ class RfDetrTwoGraphGpuDetector(
         /**
          * Decodes normalized `[cx, cy, w, h]` boxes and raw 5-class logits into [TileDetection]
          * instances in `[0, 384]` tile pixel coordinates.
+         *
+         * @param tileIndex Push-broom tile index (`0..4`).
+         * @param boxesCxCyWhNorm Flattened `[numQueries, 4]` normalized `[cx, cy, w, h]` boxes.
+         * @param classLogits Flattened `[numQueries, NUM_CLASSES]` raw class logits (sigmoid applied internally).
+         * @param confidenceThreshold Minimum sigmoid probability required to retain a detection.
+         * @param outDetections Destination list to which decoded [TileDetection]s are appended.
          */
         fun decodeTilePredictions(
             tileIndex: Int,

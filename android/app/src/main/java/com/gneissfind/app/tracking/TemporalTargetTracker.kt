@@ -23,13 +23,13 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * One detection from the current sweep after [GroundPlaneRaycaster] has placed it in the world.
+ * One detection from the current sweep after [com.gneissfind.app.vision.GroundPlaneRaycaster] has placed it in the world.
  * This is the tracker's unit of input.
  *
  * @property stripDetection The detection in push-broom strip pixel coordinates, with class and
  *   confidence. Its box is passed through to [ConfirmedTarget] so the UI can draw it.
  * @property worldPosition Where the detection's ray meets the ground, in world coordinates
- *   (meters; y is vertical, as in [GroundPlaneRaycaster]).
+ *   (meters; y is vertical, as in [com.gneissfind.app.vision.GroundPlaneRaycaster]).
  * @property slantRangeMeters Straight-line camera-to-stone distance, in meters.
  * @property refinedDiameterMm Stone size estimate in millimeters: the detection box's longer side
  *   (px) times the ground sample distance (mm/px) at this stone's range (see ScannerViewModel).
@@ -68,7 +68,7 @@ data class TrackerSweepOutput(
 /**
  * Turns noisy per-sweep detections into confirmed stone targets by requiring each stone to be
  * re-detected at the same world bearing / ground location across recent sweeps ("N-of-M voting",
- * AGENTS.md §5). Also classifies the user's walking speed against the over-speed limit that
+ * `AGENTS.md` §5). Also classifies the user's walking speed against the over-speed limit that
  * drives the "SLOW SWEEP" warning.
  *
  * State: a list of tracks, one per suspected stone. Each track remembers its smoothed world
@@ -78,16 +78,16 @@ data class TrackerSweepOutput(
  *
  * Thread safety: [updateSweep] and [reset] are synchronized on this instance.
  *
- * @param minVotesToConfirm N: hits within the window needed for a track to promote to confirmed.
- * @param rollingWindowSweeps M: how many of the most recent sweeps count toward votes.
+ * @param minVotesToConfirm N: hits within the window needed for a track to promote to confirmed ([DEFAULT_MIN_VOTES]).
+ * @param rollingWindowSweeps M: how many of the most recent sweeps count toward votes ([DEFAULT_WINDOW_SWEEPS]).
  * @param clusterRadiusMeters Baseline 3D world-space distance (m) at which a detection and an
- *   existing track are treated as the same stone.
+ *   existing track are treated as the same stone ([DEFAULT_CLUSTER_RADIUS_METERS]).
  * @param maxWalkSpeedMps Horizontal speed (m/s) above which [updateSweep] reports
- *   [ScanSpeedState.SpeedWarning].
+ *   [ScanSpeedState.SpeedWarning] ([MAX_SWEEP_SPEED_MPS]).
  * @param maxAngularDistanceDeg Maximum world-frame angular separation (degrees) between two
- *   [WorldRay3D] vectors to associate them as the same physical target across camera rotations.
- * @param enableFastConsecutiveLock When true, a world-ray-anchored target detected on 2 consecutive
- *   sweeps (`sweepId - 1` and `sweepId`) with smoothed confidence `>= FAST_LOCK_MIN_CONFIDENCE`
+ *   [WorldRay3D] vectors to associate them as the same physical target across camera rotations ([DEFAULT_MAX_ANGULAR_DISTANCE_DEG]).
+ * @param enableFastConsecutiveLock When true, a world-ray-anchored target detected on [FAST_LOCK_CONSECUTIVE_HITS]
+ *   consecutive sweeps (`sweepId - 1` and `sweepId`) with smoothed confidence `>=` [FAST_LOCK_MIN_CONFIDENCE]
  *   promotes immediately so ~2.2 Hz GPU sweeps lock in ~0.4 s instead of ~1.2 s while still
  *   rejecting single-frame false positives.
  */
@@ -106,8 +106,8 @@ class TemporalTargetTracker(
      * - [worldPosition], [worldRay], [angularWidthRad], [angularHeightRad], [smoothedConfidence],
      *   and [smoothedDiameterMm] are exponential moving averages over the track's hits.
      * - [isConfirmedLatch] provides confirmation hysteresis: once a track promotes (at
-     *   `>= minVotesToConfirm` or via 2 consecutive high-confidence world-ray hits), it stays
-     *   confirmed as long as it retains at least `minVotesToMaintain` (`2`) hits in the window.
+     *   `>= minVotesToConfirm` or via [FAST_LOCK_CONSECUTIVE_HITS] consecutive high-confidence world-ray hits), it stays
+     *   confirmed as long as it retains at least `minVotesToMaintain` ([DEFAULT_MIN_VOTES_TO_MAINTAIN]) hits in the window.
      * - [hitSweepIds] holds the sweep numbers in which this track was matched, oldest first, at
      *   most one per sweep. Its size is the track's vote count.
      */
@@ -358,6 +358,7 @@ class TemporalTargetTracker(
         )
     }
 
+    /** Returns `true` when the two most recent sweep IDs in [hitSweepIds] are `currentSweepId - 1` and [currentSweepId]. */
     private fun hasTwoConsecutiveRecentHits(hitSweepIds: ArrayDeque<Long>, currentSweepId: Long): Boolean {
         if (hitSweepIds.size < 2) return false
         val last = hitSweepIds.last()
@@ -409,25 +410,25 @@ class TemporalTargetTracker(
     }
 
     companion object {
-        /** Default N for N-of-M voting (AGENTS.md §5: default 3 of 6 sweeps). */
+        /** Default N for N-of-M voting (`AGENTS.md` §5: default 3 of 6 sweeps). */
         const val DEFAULT_MIN_VOTES = 3
 
         /** Minimum votes in the rolling window required to maintain an already-confirmed lock. */
         const val DEFAULT_MIN_VOTES_TO_MAINTAIN = 2
 
-        /** Default M for N-of-M voting (AGENTS.md §5). */
+        /** Default M for N-of-M voting (`AGENTS.md` §5). */
         const val DEFAULT_WINDOW_SWEEPS = 6
 
-        /** Baseline association radius in meters in 3D world space (AGENTS.md §5: 40 mm). */
+        /** Baseline association radius in meters in 3D world space (`AGENTS.md` §5: `40 mm`). */
         const val DEFAULT_CLUSTER_RADIUS_METERS = 0.040f
 
         /**
          * Maximum world-frame angular separation (degrees) between two 3D bearing rays to associate
-         * them as the same target across handheld pitch/yaw/roll movements.
+         * them as the same target across handheld pitch/yaw/roll movements (`docs/ENGINEERING_LEDGER.md` Milestone 2 post-video fix).
          */
         const val DEFAULT_MAX_ANGULAR_DISTANCE_DEG = 4.5f
 
-        /** Range-proportional ground association ratio (`0.08 * R`, e.g., 120 mm at 1.5 m). */
+        /** Range-proportional ground association ratio (`0.08 * R`, e.g., `120 mm` at `1.5 m`). */
         private const val RANGE_SCALED_CLUSTER_RATIO = 0.08f
 
         /** EMA blend weight applied to a new hit's world-frame unit ray (`65%` new, `35%` prior). */
@@ -439,7 +440,7 @@ class TemporalTargetTracker(
         /** Minimum smoothed confidence required for 2-sweep consecutive fast lock. */
         const val FAST_LOCK_MIN_CONFIDENCE = 0.60f
 
-        /** Walking speed (m/s) above which the "SLOW SWEEP" warning is raised (AGENTS.md §5). */
+        /** Walking speed (m/s) above which the "SLOW SWEEP" warning is raised (`AGENTS.md` §5). */
         const val MAX_SWEEP_SPEED_MPS = 1.10f
     }
 }

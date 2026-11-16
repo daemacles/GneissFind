@@ -1,7 +1,12 @@
 /*
  * Single-activity Android entry point locked to reversible sensorLandscape orientation.
+ *
  * Synchronizes display rotation across CameraX, IMU coordinate remapping, and ARCore, routes
- * sonification volume to STREAM_MUSIC, silences UI tap effects, and hosts ScannerScreen.
+ * sonification volume to STREAM_MUSIC, silences UI tap effects, manages CAMERA runtime permissions,
+ * and hosts ScannerScreen bound to ScannerViewModel.
+ *
+ * Main types:
+ * - MainActivity: root ComponentActivity hosting the GneissFind Compose UI and lifecycle observers.
  */
 package com.gneissfind.app
 
@@ -37,6 +42,18 @@ import com.gneissfind.app.ui.ScannerScreen
 import com.gneissfind.app.ui.ScannerViewModel
 import com.gneissfind.app.ui.theme.GneissFindTheme
 
+/**
+ * Single-activity entry point for the GneissFind geological tricorder.
+ *
+ * Responsibilities:
+ * - Enforces [ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE] and registers a [DisplayManager.DisplayListener]
+ *   so 180-degree flips between [Surface.ROTATION_90] and [Surface.ROTATION_270] update [ScannerViewModel]
+ *   even when Android suppresses Activity recreation.
+ * - Keeps the display awake (`FLAG_KEEP_SCREEN_ON`), routes hardware volume keys to [AudioManager.STREAM_MUSIC],
+ *   and disables view tap sound effects (`isSoundEffectsEnabled = false`) so the audio channel stays
+ *   strictly reserved for `MetalDetectorSonifier` stone pings and overspeed warnings (`.agents/rules/lcars-ui.md` §5).
+ * - Starts and pauses IMU sensor listeners and the `AudioTrack` sonifier on `ON_RESUME` / `ON_PAUSE`.
+ */
 class MainActivity : ComponentActivity() {
 
     private val viewModel: ScannerViewModel by viewModels()
@@ -144,10 +161,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Returns the current display [Surface] rotation, defaulting to [Surface.ROTATION_90] if unavailable. */
     private fun currentSurfaceRotation(): Int {
         return display?.rotation ?: Surface.ROTATION_90
     }
 
+    /** Queries current window bounds and display rotation and forwards them to [ScannerViewModel.onDisplayGeometryChanged]. */
     private fun syncCurrentDisplayGeometry() {
         val bounds = windowManager.currentWindowMetrics.bounds
         viewModel.onDisplayGeometryChanged(
