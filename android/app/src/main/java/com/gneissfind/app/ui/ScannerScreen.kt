@@ -804,13 +804,20 @@ private fun PushBroomTripwireOverlay(
         if (uiState.operatingMode == OperatingMode.SCAN) {
             labelPaint.textSize = 11.dp.toPx()
             uiState.confirmedTargets.forEach { target ->
+                if (!target.isVisibleInStrip) return@forEach
                 if (!target.stoneClass.isUserAlertable) return@forEach
                 if (!uiState.enabledClasses.contains(target.stoneClass)) return@forEach
 
-                val left = stripLeft + target.stripLeftPx * transform.scale
-                val top = stripTop + target.stripTopPx * transform.scale
-                val right = stripLeft + target.stripRightPx * transform.scale
-                val bottom = stripTop + target.stripBottomPx * transform.scale
+                val rawLeft = stripLeft + target.stripLeftPx * transform.scale
+                val rawTop = stripTop + target.stripTopPx * transform.scale
+                val rawRight = stripLeft + target.stripRightPx * transform.scale
+                val rawBottom = stripTop + target.stripBottomPx * transform.scale
+
+                val left = rawLeft.coerceIn(stripLeft, stripRight)
+                val top = rawTop.coerceIn(visibleStripTop, visibleStripBottom)
+                val right = rawRight.coerceIn(stripLeft, stripRight)
+                val bottom = rawBottom.coerceIn(visibleStripTop, visibleStripBottom)
+                if (right - left < 6f || bottom - top < 6f) return@forEach
 
                 val reticleColor = Color(target.stoneClass.primaryHexColor)
                 drawHighContrastCornerBrackets(

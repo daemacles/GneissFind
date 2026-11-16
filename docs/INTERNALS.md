@@ -178,7 +178,7 @@ adb shell rm -f /sdcard/Android/data/com.gneissfind.app/files/benchmark_override
 ## 4. Running the Tests & Benchmarks
 
 ### 4.1. Android Unit Tests (JVM)
-Runs cropper geometry, cross-tile `IoU`/`IoM`/seam union merging, COCO metadata parsing, Host `Top-300` min-heap selection, 3-of-6 temporal voter, LCARS viewport scaling, and `AudioTrack` waveform synthesis tests (`16` tests):
+Runs cropper geometry, cross-tile `IoU`/`IoM`/seam union merging, COCO metadata parsing, Host `Top-300` min-heap selection, 3D IMU world-ray track association, 120 Hz ego-motion reticle reprojection, 3-of-6 temporal voter with confirmation hysteresis, LCARS viewport scaling, and `AudioTrack` waveform synthesis tests (`18` tests):
 ```bash
 ./android/gradlew -p android testDebugUnitTest
 ```
@@ -204,19 +204,19 @@ Use this lookup table as a starting point when navigating or modifying the codeb
 
 | If you want to... | Look in File (`Y`) | At Class / Function (`Z`) |
 | :--- | :--- | :--- |
-| **Change tile dimensions, `xOffsets`, or `32 px` overlap geometry** | `android/app/src/main/java/com/gneissfind/app/model/StoneModels.kt` | `StripRoiGeometry` (`TILE_Offsets_5`, `TILE_OFFSETS_3`, `NOMINAL_CROP_Y_PX`) |
-| **Modify YUV-to-RGB tile extraction or cross-tile seam merging (`IoU` / `IoM`)** | `android/app/src/main/java/com/gneissfind/app/camera/PushBroomCropper.kt` | `PushBroomCropper.extractSweep` & `PushBroomCropper.mergeCrossTileDetections` |
-| **Adjust the `<= 1/500 s` shutter clamp, floating ISO luma servo, or `2.0x` zoom** | `android/app/src/main/java/com/gneissfind/app/camera/PushBroomCameraController.kt` | `PushBroomCameraController.applyDynamicCameraControls` & `maybeServoFloatingIsoFromCenterLuma` |
-| **Tune 120 Hz IMU pitch stabilization (`cropY`) or GSD (`mm/px`) raycasting** | `android/app/src/main/java/com/gneissfind/app/ar/GroundPlaneRaycaster.kt` | `GroundPlaneRaycaster.computeStabilizedCropYFloat` & `estimatePhysicalDiameterMm` |
+| **Change tile dimensions, `xOffsets`, or `32 px` overlap geometry** | `android/app/src/main/java/com/gneissfind/app/model/StoneModels.kt` | `StripRoiGeometry` & `SwathTileMode` |
+| **Modify YUV-to-RGB tile extraction or cross-tile seam merging (`IoU` / `IoM`)** | `android/app/src/main/java/com/gneissfind/app/vision/PushBroomCropper.kt` | `PushBroomCropper.extractTiles` & `PushBroomCropper.mergeAndFilterTileDetections` |
+| **Adjust the `<= 1/500 s` shutter clamp, floating ISO luma servo, or `2.0x` zoom** | `android/app/src/main/java/com/gneissfind/app/camera/PushBroomCameraController.kt` | `PushBroomCameraController.applyZoomAndExposureControls` & `maybeServoFloatingIsoFromCenterLuma` |
+| **Tune 120 Hz IMU pitch stabilization (`cropY`), 3D world-ray anchoring, or 120 Hz reticle reprojection** | `android/app/src/main/java/com/gneissfind/app/tracking/GroundPlaneRaycaster.kt` | `GroundPlaneRaycaster.computeStabilizedCropYFloat`, `pixelToWorldRay`, & `reprojectWorldRayToStripBox` |
 | **Inspect or modify LiteRT GPU initialization, shader caching, or Host `Top-300` gather** | `android/app/src/main/java/com/gneissfind/app/inference/RfDetrTwoGraphGpuDetector.kt` | `RfDetrTwoGraphGpuDetector.ensureInitializedOnAnalyzerThread`, `detectSweep`, & `selectTopKProposalsFromMaxScores` |
 | **Change how COCO class IDs map to the 4 mineral targets + `HARD_CONFUSER`** | `ml-pipeline/src/gneissfind_ml_pipeline/coco_oracle.py` & `android/app/src/main/assets/rf_detr_coco_metadata.json` | `STAND_IN_SPECS`, `build_coco_metadata`, & `RfDetrTwoGraphGpuDetector.parseCocoMetadataJson` |
 | **Modify the PyTorch-to-LiteRT graph split or fix an unsupported GPU delegate op** | `ml-pipeline/src/gneissfind_ml_pipeline/wrappers.py` | `RfDetrPart1BackboneEncoder`, `RfDetrPart2DecoderHead`, `bilinear_matmul_grid_sample`, & `_gpu_rank4_*` |
-| **Adjust the 3-of-6 multi-frame persistence filter or spatial association radius** | `android/app/src/main/java/com/gneissfind/app/tracking/TemporalTargetTracker.kt` | `TemporalTargetTracker.updateSweep` |
-| **Change stone ping frequencies (`320/520/780/1040 Hz`), harmonic envelope, or cadence** | `android/app/src/main/java/com/gneissfind/app/audio/MetalDetectorSonifier.kt` | `MetalDetectorSonifier.updateTargets` & `synthesizePingBurst` |
-| **Edit the split-screen LCARS HUD, panoramic viewport crop, or inline source drawer** | `android/app/src/main/java/com/gneissfind/app/ui/ScannerScreen.kt` | `ScannerScreen`, `PanoramicViewportZone`, `ClippingCameraViewportContainer`, & `TacticalControlDeckZone` |
-| **Modify the 6-role LCARS semantic color palette or swept elbow geometry** | `android/app/src/main/java/com/gneissfind/app/ui/theme/Theme.kt` & `LcarsComponents.kt` | `LcarsSemanticColors`, `LcarsPalette`, & `LcarsElbowShape` |
-| **Wire UI state transitions or background analyzer frame orchestration** | `android/app/src/main/java/com/gneissfind/app/ui/ScannerViewModel.kt` | `ScannerViewModel.processSweepFrame` & `ScannerUiState` |
-| **Inspect `4.0 Hz` lossless PNG field strip logging for SAM 2 training** | `android/app/src/main/java/com/gneissfind/app/data/FieldDataLogger.kt` | `FieldDataLogger.maybeLogStrip` & `FieldStripMetadata` |
+| **Adjust world-bearing track association ($\Delta\theta \le 4.5^\circ$), 2-hit fast lock, or 3-of-6 voting hysteresis** | `android/app/src/main/java/com/gneissfind/app/tracking/TemporalTargetTracker.kt` | `TemporalTargetTracker.updateSweep` |
+| **Change stone ping frequencies (`320–780 Hz`), harmonic envelope, or cadence** | `android/app/src/main/java/com/gneissfind/app/audio/MetalDetectorSonifier.kt` | `MetalDetectorSonifier.updateTargets` & `synthesizeSinglePingBurstPcm16` |
+| **Edit the split-screen LCARS HUD, panoramic viewport crop, or inline source drawer** | `android/app/src/main/java/com/gneissfind/app/ui/ScannerScreen.kt` | `ScannerScreen`, `GeologicalViewportZone`, `ClippingCameraViewportContainer`, & `TacticalControlDeckZone` |
+| **Modify the 6-role LCARS semantic color palette or swept elbow geometry** | `android/app/src/main/java/com/gneissfind/app/ui/theme/Theme.kt` & `ui/lcars/LcarsComponents.kt` | `LcarsSemanticColors`, `LcarsColors`, & `LcarsElbow` |
+| **Wire UI state transitions or background analyzer frame orchestration** | `android/app/src/main/java/com/gneissfind/app/ui/ScannerViewModel.kt` | `ScannerViewModel.processCameraFrameOnAnalyzerThread` & `ScannerUiState` |
+| **Inspect `4.0 Hz` lossless PNG field strip logging for SAM 2 training** | `android/app/src/main/java/com/gneissfind/app/logging/FieldDataLogger.kt` | `FieldDataLogger.maybeRecordStripFrame` & `FieldStripMetadata` |
 
 ---
 

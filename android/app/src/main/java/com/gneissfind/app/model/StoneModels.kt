@@ -1,14 +1,16 @@
 /*
  * Core domain models for target taxonomy, push-broom strip ROI geometry, per-tile and unified
- * strip bounding-box detections, 3D world-space track points, and operating modes.
+ * strip bounding-box detections, 3D world-space track points and unit bearing rays, and operating modes.
  *
  * Produced by PushBroomCropper, StoneDetector, GroundPlaneRaycaster, and TemporalTargetTracker;
- * consumed by ScannerViewModel, SpatialAudioSonifier, FieldDataLogger, and ScannerScreen.
+ * consumed by ScannerViewModel, MetalDetectorSonifier, FieldDataLogger, and ScannerScreen.
  */
 package com.gneissfind.app.model
 
+import kotlin.math.acos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * Target taxonomy classifying geological targets and hard visual confusers, paired with high-contrast
@@ -305,9 +307,9 @@ data class StripDetection(
 /**
  * 3D point in local world coordinates (meters) produced by [com.gneissfind.app.tracking.GroundPlaneRaycaster].
  *
- * @property xMeters Cross-track horizontal position in meters.
+ * @property xMeters Cross-track (East) horizontal position in meters.
  * @property yMeters Vertical position in meters (`0.0` on the estimated ground plane).
- * @property zMeters Along-track forward position in meters.
+ * @property zMeters Along-track (North) forward position in meters.
  */
 data class WorldPoint3D(
     val xMeters: Float,
@@ -319,7 +321,65 @@ data class WorldPoint3D(
         val dx = xMeters - other.xMeters
         val dy = yMeters - other.yMeters
         val dz = zMeters - other.zMeters
-        return kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+}
+
+/**
+ * Unit 3D bearing vector in the magnetometer-free `TYPE_GAME_ROTATION_VECTOR` ENU world frame.
+ *
+ * Anchoring each detection's line-of-sight ray in the IMU world frame (`R_world_from_scr(t_capture) * d_scr`)
+ * makes track association invariant to handheld pitch, yaw, and roll between sweeps, and allows
+ * 120 Hz ego-motion reprojection (`R_world_from_scr(t_now)^T * d_world`) so target reticles stay
+ * locked onto physical objects during inference latency and camera motion.
+ *
+ * @property eastX World East (`+X_w`) unit component.
+ * @property northY World North (`+Y_w`) unit component.
+ * @property upZ World Up (`+Z_w`, skyward) unit component (`< 0` for downward ground-pointing rays).
+ */
+data class WorldRay3D(
+    val eastX: Float,
+    val northY: Float,
+    val upZ: Float
+) {
+    /** Returns a unit-length copy of this ray. */
+    fun normalized(): WorldRay3D {
+        val norm = sqrt(eastX * eastX + northY * northY + upZ * upZ)
+        return if (norm > 1e-6f) {
+            val inv = 1.0f / norm
+            WorldRay3D(eastX * inv, northY * inv, upZ * inv)
+        } else {
+            WorldRay3D(0f, 0.70710677f, -0.70710677f)
+        }
+    }
+
+    /** Returns the dot product with [other]. */
+    fun dot(other: WorldRay3D): Float =
+        eastX * other.eastX + northY * other.northY + upZ * other.upZ
+
+    /**
+     * Returns the great-circle angular separation in degrees (`[0.0, 180.0]`) between `this` ray
+     * and [other].
+     */
+    fun angularDistanceDegTo(other: WorldRay3D): Float {
+        val a = normalized()
+        val b = other.normalized()
+        val cosAngle = a.dot(b).coerceIn(-1.0f, 1.0f)
+        return Math.toDegrees(acos(cosAngle.toDouble())).toFloat()
+    }
+
+    /**
+     * Blends `this` ray toward [other] with weight [otherWeight] in `[0.0, 1.0]` and normalizes
+     * the result back onto the unit sphere.
+     */
+    fun blendAndNormalize(other: WorldRay3D, otherWeight: Float): WorldRay3D {
+        val w = otherWeight.coerceIn(0f, 1f)
+        val keep = 1f - w
+        return WorldRay3D(
+            eastX = eastX * keep + other.eastX * w,
+            northY = northY * keep + other.northY * w,
+            upZ = upZ * keep + other.upZ * w
+        ).normalized()
     }
 }
 
@@ -329,16 +389,23 @@ data class WorldPoint3D(
  * @property trackId Monotonically increasing unique identifier assigned when the track is created.
  * @property stoneClass Confirmed [StoneClass] taxonomy entry.
  * @property worldPosition Smoothed 3D ground coordinate in meters.
- * @property stripLeftPx Latest bounding-box left X coordinate in unified strip pixels.
- * @property stripTopPx Latest bounding-box top Y coordinate in unified strip pixels.
- * @property stripRightPx Latest bounding-box right X coordinate in unified strip pixels.
- * @property stripBottomPx Latest bounding-box bottom Y coordinate in unified strip pixels.
+ * @property stripLeftPx Current bounding-box left X coordinate in unified strip pixels (reprojected at 120 Hz).
+ * @property stripTopPx Current bounding-box top Y coordinate in unified strip pixels (reprojected at 120 Hz).
+ * @property stripRightPx Current bounding-box right X coordinate in unified strip pixels (reprojected at 120 Hz).
+ * @property stripBottomPx Current bounding-box bottom Y coordinate in unified strip pixels (reprojected at 120 Hz).
  * @property smoothedConfidence Exponentially smoothed confidence score in `[0.0, 1.0]`.
  * @property estimatedDiameterMm Smoothed physical diameter estimate in millimeters.
  * @property slantRangeMeters Slant range from the camera to the ground patch in meters.
  * @property hitCountInWindow Number of sweeps within the active rolling window that matched this track.
  * @property windowSize Rolling window length in sweeps (`M` in `N-of-M` spatial voting).
  * @property lastUpdatedTimestampNs Sensor timestamp (`nanoseconds`) of the most recent matching sweep.
+ * @property worldRay Optional 3D unit bearing ray in the `TYPE_GAME_ROTATION_VECTOR` world frame
+ *   for 120 Hz ego-motion reticle reprojection.
+ * @property angularWidthRad Horizontal angular span (`widthPx / focalLengthPx`, in radians) of the target box.
+ * @property angularHeightRad Vertical angular span (`heightPx / focalLengthPx`, in radians) of the target box.
+ * @property isVisibleInStrip True when the ego-motion-reprojected bounding box currently intersects
+ *   the active `[0..stripWidthPx] x [0..384]` push-broom strip ROI; false when camera rotation has
+ *   moved the target outside the strip so ghost reticles are suppressed.
  */
 data class ConfirmedTarget(
     val trackId: Long,
@@ -353,7 +420,11 @@ data class ConfirmedTarget(
     val slantRangeMeters: Float,
     val hitCountInWindow: Int,
     val windowSize: Int,
-    val lastUpdatedTimestampNs: Long
+    val lastUpdatedTimestampNs: Long,
+    val worldRay: WorldRay3D? = null,
+    val angularWidthRad: Float = 0f,
+    val angularHeightRad: Float = 0f,
+    val isVisibleInStrip: Boolean = true
 ) {
     val voteRatio: Float
         get() = (hitCountInWindow.toFloat() / windowSize.coerceAtLeast(1)).coerceIn(0f, 1f)

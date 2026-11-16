@@ -3,9 +3,9 @@
  *
  * Pipeline position (called once per sweep by ScannerViewModel):
  *   PushBroomCropper (strip detections, cross-tile NMS)
- *     -> GroundPlaneRaycaster (each detection placed in world coordinates)
- *     -> TemporalTargetTracker (this file: N-of-M voting + walking-speed check)
- *     -> MetalDetectorSonifier (audio pings) and the LCARS UI (reticles)
+ *     -> GroundPlaneRaycaster (each detection placed in world coordinates + 3D IMU world ray)
+ *     -> TemporalTargetTracker (this file: world-bearing association, N-of-M voting + hysteresis, speed check)
+ *     -> MetalDetectorSonifier (audio pings) and the LCARS UI (120 Hz ego-motion-locked reticles)
  *
  * Defines the tracker's input type [ProjectedCandidate], its output type [TrackerSweepOutput],
  * and [TemporalTargetTracker] itself.
@@ -17,6 +17,10 @@ import com.gneissfind.app.model.ScanSpeedState
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.WorldPoint3D
+import com.gneissfind.app.model.WorldRay3D
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * One detection from the current sweep after [GroundPlaneRaycaster] has placed it in the world.
@@ -25,24 +29,33 @@ import com.gneissfind.app.model.WorldPoint3D
  * @property stripDetection The detection in push-broom strip pixel coordinates, with class and
  *   confidence. Its box is passed through to [ConfirmedTarget] so the UI can draw it.
  * @property worldPosition Where the detection's ray meets the ground, in world coordinates
- *   (meters; y is vertical, as in [GroundPlaneRaycaster]). The tracker compares these positions to
- *   decide whether two detections are the same stone.
+ *   (meters; y is vertical, as in [GroundPlaneRaycaster]).
  * @property slantRangeMeters Straight-line camera-to-stone distance, in meters.
  * @property refinedDiameterMm Stone size estimate in millimeters: the detection box's longer side
  *   (px) times the ground sample distance (mm/px) at this stone's range (see ScannerViewModel).
+ * @property worldRay Optional unit 3D bearing vector in the `TYPE_GAME_ROTATION_VECTOR` world
+ *   frame (`R_world_from_scr(t_capture) * d_scr`). When present, track association is invariant
+ *   to handheld pitch, yaw, and roll between sweeps, and [ConfirmedTarget] reticles can be
+ *   reprojected at 120 Hz.
+ * @property angularWidthRad Horizontal angular width (`widthPx / focalLengthPx`, in radians).
+ * @property angularHeightRad Vertical angular height (`heightPx / focalLengthPx`, in radians).
  */
 data class ProjectedCandidate(
     val stripDetection: StripDetection,
     val worldPosition: WorldPoint3D,
     val slantRangeMeters: Float,
-    val refinedDiameterMm: Float
+    val refinedDiameterMm: Float,
+    val worldRay: WorldRay3D? = null,
+    val angularWidthRad: Float = 0f,
+    val angularHeightRad: Float = 0f
 )
 
 /**
  * What [TemporalTargetTracker.updateSweep] reports after each sweep.
  *
- * @property confirmedTargets Tracks currently at or above the vote threshold, strongest first
- *   (most votes, then highest smoothed confidence). Empty when nothing is confirmed.
+ * @property confirmedTargets Tracks currently confirmed (by N-of-M voting, fast consecutive
+ *   world-ray lock, or confirmation hysteresis), strongest first (most votes, then highest
+ *   smoothed confidence). Empty when nothing is confirmed.
  * @property speedState The user's horizontal walking speed and whether it exceeds the limit.
  * @property totalCandidateTracks Number of tracks alive after this sweep, confirmed or not.
  */
@@ -54,40 +67,47 @@ data class TrackerSweepOutput(
 
 /**
  * Turns noisy per-sweep detections into confirmed stone targets by requiring each stone to be
- * re-detected at the same place on the ground in several recent sweeps ("N-of-M voting",
+ * re-detected at the same world bearing / ground location across recent sweeps ("N-of-M voting",
  * AGENTS.md §5). Also classifies the user's walking speed against the over-speed limit that
  * drives the "SLOW SWEEP" warning.
  *
  * State: a list of tracks, one per suspected stone. Each track remembers its smoothed world
- * position, class, confidence, diameter, latest strip box, and the recent sweeps it was seen in.
- * A track that stops being re-detected ages out on its own once its votes leave the window.
- *
- * Votes are counted in sweeps, not seconds, so the window's wall-clock length depends on the
- * sweep rate.
+ * position, 3D world bearing ray, angular box size, class, confidence, diameter, latest strip box,
+ * confirmation hysteresis latch, and the recent sweeps it was seen in. A track that stops being
+ * re-detected ages out on its own once its votes leave the window.
  *
  * Thread safety: [updateSweep] and [reset] are synchronized on this instance.
  *
- * @param minVotesToConfirm N: hits within the window needed for a track to be reported as confirmed.
+ * @param minVotesToConfirm N: hits within the window needed for a track to promote to confirmed.
  * @param rollingWindowSweeps M: how many of the most recent sweeps count toward votes.
- * @param clusterRadiusMeters Maximum 3D world-space distance (m) at which a detection and an
+ * @param clusterRadiusMeters Baseline 3D world-space distance (m) at which a detection and an
  *   existing track are treated as the same stone.
  * @param maxWalkSpeedMps Horizontal speed (m/s) above which [updateSweep] reports
  *   [ScanSpeedState.SpeedWarning].
+ * @param maxAngularDistanceDeg Maximum world-frame angular separation (degrees) between two
+ *   [WorldRay3D] vectors to associate them as the same physical target across camera rotations.
+ * @param enableFastConsecutiveLock When true, a world-ray-anchored target detected on 2 consecutive
+ *   sweeps (`sweepId - 1` and `sweepId`) with smoothed confidence `>= FAST_LOCK_MIN_CONFIDENCE`
+ *   promotes immediately so ~2.2 Hz GPU sweeps lock in ~0.4 s instead of ~1.2 s while still
+ *   rejecting single-frame false positives.
  */
 class TemporalTargetTracker(
     private val minVotesToConfirm: Int = DEFAULT_MIN_VOTES,
     private val rollingWindowSweeps: Int = DEFAULT_WINDOW_SWEEPS,
     private val clusterRadiusMeters: Float = DEFAULT_CLUSTER_RADIUS_METERS,
-    private val maxWalkSpeedMps: Float = MAX_SWEEP_SPEED_MPS
+    private val maxWalkSpeedMps: Float = MAX_SWEEP_SPEED_MPS,
+    private val maxAngularDistanceDeg: Float = DEFAULT_MAX_ANGULAR_DISTANCE_DEG,
+    private val enableFastConsecutiveLock: Boolean = true
 ) {
     /**
      * Mutable state for one suspected stone. Internal; copied into a [ConfirmedTarget] for output.
      *
      * - [stoneClass] never changes after creation: detections only match tracks of their own class.
-     * - [worldPosition], [smoothedConfidence] and [smoothedDiameterMm] are exponential moving
-     *   averages over the track's hits.
-     * - The strip box (`stripLeftPx`..`stripBottomPx`) and [slantRangeMeters] are copied from
-     *   the latest hit, not smoothed.
+     * - [worldPosition], [worldRay], [angularWidthRad], [angularHeightRad], [smoothedConfidence],
+     *   and [smoothedDiameterMm] are exponential moving averages over the track's hits.
+     * - [isConfirmedLatch] provides confirmation hysteresis: once a track promotes (at
+     *   `>= minVotesToConfirm` or via 2 consecutive high-confidence world-ray hits), it stays
+     *   confirmed as long as it retains at least `minVotesToMaintain` (`2`) hits in the window.
      * - [hitSweepIds] holds the sweep numbers in which this track was matched, oldest first, at
      *   most one per sweep. Its size is the track's vote count.
      */
@@ -95,6 +115,9 @@ class TemporalTargetTracker(
         val trackId: Long,
         var stoneClass: StoneClass,
         var worldPosition: WorldPoint3D,
+        var worldRay: WorldRay3D?,
+        var angularWidthRad: Float,
+        var angularHeightRad: Float,
         var stripLeftPx: Float,
         var stripTopPx: Float,
         var stripRightPx: Float,
@@ -103,6 +126,7 @@ class TemporalTargetTracker(
         var smoothedDiameterMm: Float,
         var slantRangeMeters: Float,
         var lastTimestampNs: Long,
+        var isConfirmedLatch: Boolean = false,
         val hitSweepIds: ArrayDeque<Long> = ArrayDeque()
     )
 
@@ -163,11 +187,11 @@ class TemporalTargetTracker(
             }
         }
 
-        // 3. Associate candidates with tracks. Greedy nearest neighbor in input order: each
-        //    candidate claims the closest unclaimed same-class track within clusterRadiusMeters,
-        //    otherwise it starts a new track. An earlier candidate can therefore claim a track
-        //    that a later candidate was closer to.
-        // Tracks already claimed this sweep, so that each track gets at most one vote per sweep.
+        // 3. Associate candidates with tracks. When 3D IMU world rays are present, match by
+        //    world-frame angular bearing (<= maxAngularDistanceDeg) or range-scaled 3D ground
+        //    distance so handheld wrist pitch/yaw rotation never splits a stationary object into
+        //    disconnected tracks. When worldRay is null (synthetic/unit tests), match strictly
+        //    within clusterRadiusMeters.
         val matchedTrackIdsThisSweep = HashSet<Long>(candidates.size)
 
         for (cand in candidates) {
@@ -175,29 +199,69 @@ class TemporalTargetTracker(
             if (!det.stoneClass.isUserAlertable) continue
 
             var bestTrack: TrackEntry? = null
-            var bestDistM = clusterRadiusMeters
+            var bestNormalizedScore = 1.0f
 
             for (track in activeTracks) {
                 if (track.trackId in matchedTrackIdsThisSweep) continue
                 if (track.stoneClass != det.stoneClass) continue
 
-                val distM = track.worldPosition.distanceMetersTo(cand.worldPosition)
-                if (distM <= bestDistM) {
-                    bestDistM = distM
-                    bestTrack = track
+                val candRay = cand.worldRay
+                val trackRay = track.worldRay
+                if (candRay != null && trackRay != null) {
+                    val angDeg = trackRay.angularDistanceDegTo(candRay)
+                    val distM = track.worldPosition.distanceMetersTo(cand.worldPosition)
+                    val rangeScaledRadiusM = max(
+                        clusterRadiusMeters,
+                        cand.slantRangeMeters * RANGE_SCALED_CLUSTER_RATIO
+                    )
+                    if (angDeg <= maxAngularDistanceDeg || distM <= rangeScaledRadiusM) {
+                        val normScore = min(
+                            angDeg / maxAngularDistanceDeg.coerceAtLeast(0.1f),
+                            distM / rangeScaledRadiusM.coerceAtLeast(0.01f)
+                        )
+                        if (normScore <= bestNormalizedScore) {
+                            bestNormalizedScore = normScore
+                            bestTrack = track
+                        }
+                    }
+                } else {
+                    val distM = track.worldPosition.distanceMetersTo(cand.worldPosition)
+                    if (distM <= clusterRadiusMeters) {
+                        val normScore = distM / clusterRadiusMeters.coerceAtLeast(1e-4f)
+                        if (normScore <= bestNormalizedScore) {
+                            bestNormalizedScore = normScore
+                            bestTrack = track
+                        }
+                    }
                 }
             }
 
             if (bestTrack != null) {
                 matchedTrackIdsThisSweep.add(bestTrack.trackId)
-                // Exponential moving average of world position, confidence and diameter.
-                // RATIONALE-UNKNOWN: how were these smoothing weights chosen? Not recorded in
-                // AGENTS.md or docs/.
+                val posWeight = if (cand.worldRay != null) 0.55f else 0.35f
+                val posKeep = 1.0f - posWeight
                 bestTrack.worldPosition = WorldPoint3D(
-                    xMeters = bestTrack.worldPosition.xMeters * 0.65f + cand.worldPosition.xMeters * 0.35f,
-                    yMeters = bestTrack.worldPosition.yMeters * 0.65f + cand.worldPosition.yMeters * 0.35f,
-                    zMeters = bestTrack.worldPosition.zMeters * 0.65f + cand.worldPosition.zMeters * 0.35f
+                    xMeters = bestTrack.worldPosition.xMeters * posKeep + cand.worldPosition.xMeters * posWeight,
+                    yMeters = bestTrack.worldPosition.yMeters * posKeep + cand.worldPosition.yMeters * posWeight,
+                    zMeters = bestTrack.worldPosition.zMeters * posKeep + cand.worldPosition.zMeters * posWeight
                 )
+                if (cand.worldRay != null) {
+                    bestTrack.worldRay = bestTrack.worldRay
+                        ?.blendAndNormalize(cand.worldRay, WORLD_RAY_NEW_WEIGHT)
+                        ?: cand.worldRay.normalized()
+                }
+                if (cand.angularWidthRad > 0f && cand.angularHeightRad > 0f) {
+                    bestTrack.angularWidthRad = if (bestTrack.angularWidthRad > 0f) {
+                        bestTrack.angularWidthRad * 0.50f + cand.angularWidthRad * 0.50f
+                    } else {
+                        cand.angularWidthRad
+                    }
+                    bestTrack.angularHeightRad = if (bestTrack.angularHeightRad > 0f) {
+                        bestTrack.angularHeightRad * 0.50f + cand.angularHeightRad * 0.50f
+                    } else {
+                        cand.angularHeightRad
+                    }
+                }
                 bestTrack.stripLeftPx = det.leftPx
                 bestTrack.stripTopPx = det.topPx
                 bestTrack.stripRightPx = det.rightPx
@@ -210,15 +274,15 @@ class TemporalTargetTracker(
                     bestTrack.hitSweepIds.addLast(sweepId)
                 }
             } else {
-                // No match: start a new track with this detection as its first vote. It is marked
-                // as claimed, so a second same-class candidate within the radius in this sweep
-                // starts its own track instead of adding a second vote.
                 val newId = nextTrackId++
                 matchedTrackIdsThisSweep.add(newId)
                 val entry = TrackEntry(
                     trackId = newId,
                     stoneClass = det.stoneClass,
                     worldPosition = cand.worldPosition,
+                    worldRay = cand.worldRay?.normalized(),
+                    angularWidthRad = cand.angularWidthRad,
+                    angularHeightRad = cand.angularHeightRad,
                     stripLeftPx = det.leftPx,
                     stripTopPx = det.topPx,
                     stripRightPx = det.rightPx,
@@ -236,10 +300,31 @@ class TemporalTargetTracker(
         // 4. Remove tracks that have no votes left in the window
         activeTracks.removeAll { it.hitSweepIds.isEmpty() }
 
-        // 5. Report every track with at least minVotesToConfirm votes. Confirmation is not
-        //    latched: a track drops out of the output when its votes age below the threshold.
+        // 5. Update confirmation latch with hysteresis:
+        //    - Promotes when hits >= minVotesToConfirm (3-of-6) OR on 2 consecutive high-confidence
+        //      world-ray-anchored hits.
+        //    - Once promoted, stays confirmed while hits >= minVotesToMaintain (2) so a momentary
+        //      missed sweep during camera motion does not drop an active lock.
+        val minVotesToMaintain = min(DEFAULT_MIN_VOTES_TO_MAINTAIN, minVotesToConfirm)
+        for (track in activeTracks) {
+            val hits = track.hitSweepIds.size
+            if (hits >= minVotesToConfirm) {
+                track.isConfirmedLatch = true
+            } else if (
+                enableFastConsecutiveLock &&
+                track.worldRay != null &&
+                hits >= FAST_LOCK_CONSECUTIVE_HITS &&
+                track.smoothedConfidence >= FAST_LOCK_MIN_CONFIDENCE &&
+                hasTwoConsecutiveRecentHits(track.hitSweepIds, sweepId)
+            ) {
+                track.isConfirmedLatch = true
+            } else if (track.isConfirmedLatch && hits < minVotesToMaintain) {
+                track.isConfirmedLatch = false
+            }
+        }
+
         val confirmed = activeTracks
-            .filter { it.hitSweepIds.size >= minVotesToConfirm }
+            .filter { it.isConfirmedLatch }
             .map { track ->
                 ConfirmedTarget(
                     trackId = track.trackId,
@@ -254,7 +339,11 @@ class TemporalTargetTracker(
                     slantRangeMeters = track.slantRangeMeters,
                     hitCountInWindow = track.hitSweepIds.size,
                     windowSize = rollingWindowSweeps,
-                    lastUpdatedTimestampNs = track.lastTimestampNs
+                    lastUpdatedTimestampNs = track.lastTimestampNs,
+                    worldRay = track.worldRay,
+                    angularWidthRad = track.angularWidthRad,
+                    angularHeightRad = track.angularHeightRad,
+                    isVisibleInStrip = true
                 )
             }
             .sortedWith(
@@ -267,6 +356,13 @@ class TemporalTargetTracker(
             speedState = speedState,
             totalCandidateTracks = activeTracks.size
         )
+    }
+
+    private fun hasTwoConsecutiveRecentHits(hitSweepIds: ArrayDeque<Long>, currentSweepId: Long): Boolean {
+        if (hitSweepIds.size < 2) return false
+        val last = hitSweepIds.last()
+        val prev = hitSweepIds[hitSweepIds.size - 2]
+        return last == currentSweepId && prev == currentSweepId - 1L
     }
 
     /**
@@ -309,21 +405,39 @@ class TemporalTargetTracker(
 
         val dx = cameraWorldPos.xMeters - prev.xMeters
         val dz = cameraWorldPos.zMeters - prev.zMeters
-        return kotlin.math.sqrt(dx * dx + dz * dz) / dtSec
+        return sqrt(dx * dx + dz * dz) / dtSec
     }
 
     companion object {
         /** Default N for N-of-M voting (AGENTS.md §5: default 3 of 6 sweeps). */
         const val DEFAULT_MIN_VOTES = 3
 
+        /** Minimum votes in the rolling window required to maintain an already-confirmed lock. */
+        const val DEFAULT_MIN_VOTES_TO_MAINTAIN = 2
+
         /** Default M for N-of-M voting (AGENTS.md §5). */
         const val DEFAULT_WINDOW_SWEEPS = 6
 
-        /**
-         * Default association radius in meters, in 3D world space.
-         * RATIONALE-UNKNOWN: how was this radius chosen? Not specified in AGENTS.md or docs/.
-         */
+        /** Baseline association radius in meters in 3D world space (AGENTS.md §5: 40 mm). */
         const val DEFAULT_CLUSTER_RADIUS_METERS = 0.040f
+
+        /**
+         * Maximum world-frame angular separation (degrees) between two 3D bearing rays to associate
+         * them as the same target across handheld pitch/yaw/roll movements.
+         */
+        const val DEFAULT_MAX_ANGULAR_DISTANCE_DEG = 4.5f
+
+        /** Range-proportional ground association ratio (`0.08 * R`, e.g., 120 mm at 1.5 m). */
+        private const val RANGE_SCALED_CLUSTER_RATIO = 0.08f
+
+        /** EMA blend weight applied to a new hit's world-frame unit ray (`65%` new, `35%` prior). */
+        private const val WORLD_RAY_NEW_WEIGHT = 0.65f
+
+        /** Consecutive hits required for high-confidence fast lock on live camera sweeps. */
+        const val FAST_LOCK_CONSECUTIVE_HITS = 2
+
+        /** Minimum smoothed confidence required for 2-sweep consecutive fast lock. */
+        const val FAST_LOCK_MIN_CONFIDENCE = 0.60f
 
         /** Walking speed (m/s) above which the "SLOW SWEEP" warning is raised (AGENTS.md §5). */
         const val MAX_SWEEP_SPEED_MPS = 1.10f

@@ -167,6 +167,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     private var lastFrameTimestampNs: Long = 0L
     private var smoothedSweepHz: Float = 0f
+    private val displayRotationMatrixScratch = FloatArray(9)
 
     private val _uiState = MutableStateFlow(
         ScannerUiState(
@@ -177,6 +178,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         raycaster.onRealtimeImuPitchListener = { smoothedPitchDeg, rollDeg, refPitchDeg ->
+            var updatedVisibleTargetsForAudio: List<ConfirmedTarget>? = null
+            var currentSpeedForAudio: ScanSpeedState = ScanSpeedState.Normal(0f)
             _uiState.update { prev ->
                 val fy = prev.verticalFocalLengthPx
                 val floatStab = GroundPlaneRaycaster.computeStabilizedCropYFloat(
@@ -193,6 +196,24 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     forwardPitchDeg = lookPitchDeg
                 )
                 val gsd = PushBroomCropper.computeGsdMmPerPx(slantR, prev.activeZoomRatio)
+                val reprojectedTargets = if (prev.confirmedTargets.isNotEmpty()) {
+                    val liveMat = raycaster.copyLatestRotationMatrix(displayRotationMatrixScratch)
+                    raycaster.reprojectConfirmedTargetsToCurrentPose(
+                        targets = prev.confirmedTargets,
+                        stripGeometry = prev.stripGeometry,
+                        currentCropYFloat = floatStab.clampedCropYFloat,
+                        currentFocalLengthPx = fy,
+                        currentRotationMatrix = liveMat
+                    )
+                } else {
+                    prev.confirmedTargets
+                }
+                val prevVisibleCount = prev.confirmedTargets.count { it.isVisibleInStrip }
+                val newVisibleCount = reprojectedTargets.count { it.isVisibleInStrip }
+                if (prevVisibleCount != newVisibleCount) {
+                    updatedVisibleTargetsForAudio = reprojectedTargets.filter { it.isVisibleInStrip }
+                    currentSpeedForAudio = prev.speedState
+                }
                 prev.copy(
                     imuPitchDeg = smoothedPitchDeg,
                     rollDeg = rollDeg,
@@ -202,8 +223,12 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     displayCropYFloat = floatStab.clampedCropYFloat,
                     isPitchClamped = floatStab.isPitchClamped,
                     slantRangeMeters = slantR,
-                    gsdMmPerPx = gsd
+                    gsdMmPerPx = gsd,
+                    confirmedTargets = reprojectedTargets
                 )
+            }
+            updatedVisibleTargetsForAudio?.let { visibleTargets ->
+                sonifier.updateTargets(visibleTargets, currentSpeedForAudio)
             }
         }
     }
@@ -507,6 +532,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             )
 
             // 6. Raycast detections onto ground plane & update 3-of-6 spatial voting + 1.10 m/s speed gate
+            val anchorWorldRays = stateSnapshot.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU
             val projectedCandidates = filteredDetections.map { det ->
                 val raycast = raycaster.raycastStripDetection(
                     detection = det,
@@ -518,7 +544,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     stripDetection = det,
                     worldPosition = raycast.worldPoint,
                     slantRangeMeters = raycast.slantRangeMeters,
-                    refinedDiameterMm = det.maxSpanPx * raycast.gsdMmPerPx
+                    refinedDiameterMm = det.maxSpanPx * raycast.gsdMmPerPx,
+                    worldRay = if (anchorWorldRays) raycast.worldRay else null,
+                    angularWidthRad = if (anchorWorldRays) raycast.angularWidthRad else 0f,
+                    angularHeightRad = if (anchorWorldRays) raycast.angularHeightRad else 0f
                 )
             }
 
@@ -529,20 +558,38 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 currentSpeedMps = poseSnapshot.horizontalSpeedMps
             )
 
+            // Reproject confirmed targets from frame capture time (t_capture) to current live
+            // display orientation (t_now) so ~390 ms GPU inference latency does not offset reticles.
+            val useLiveImuDisplay = raycaster.hasLiveImuStream
+            val currentDisplayCropY = if (useLiveImuDisplay) {
+                _uiState.value.displayCropYFloat
+            } else {
+                poseSnapshot.cropY.toFloat()
+            }
+            val reprojectedConfirmed = if (anchorWorldRays && trackerOutput.confirmedTargets.isNotEmpty()) {
+                raycaster.reprojectConfirmedTargetsToCurrentPose(
+                    targets = trackerOutput.confirmedTargets,
+                    stripGeometry = geometry,
+                    currentCropYFloat = currentDisplayCropY,
+                    currentFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
+                )
+            } else {
+                trackerOutput.confirmedTargets
+            }
+
             // 7. Drive AudioTrack sonifier (strictly reserved for stone pings & overspeed warning)
             sonifier.updateTargets(
-                confirmedTargets = trackerOutput.confirmedTargets,
+                confirmedTargets = reprojectedConfirmed.filter { it.isVisibleInStrip },
                 speedState = trackerOutput.speedState
             )
             val audioTel = sonifier.latestTelemetry
 
-            val useLiveImuDisplay = raycaster.hasLiveImuStream
             _uiState.update { prev ->
                 prev.copy(
                     detectorStatus = activeDetector.statusSummary,
                     stripGeometry = geometry,
                     rawStripDetections = filteredDetections,
-                    confirmedTargets = trackerOutput.confirmedTargets,
+                    confirmedTargets = reprojectedConfirmed,
                     speedState = trackerOutput.speedState,
                     imuPitchDeg = if (useLiveImuDisplay) prev.imuPitchDeg else poseSnapshot.forwardPitchDeg,
                     rollDeg = if (useLiveImuDisplay) prev.rollDeg else poseSnapshot.rollDeg,
