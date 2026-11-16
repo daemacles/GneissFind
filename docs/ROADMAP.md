@@ -36,6 +36,25 @@ Execute Milestone 2 end-to-end without regressing any `fc80785` or `8707282` har
 
 ---
 
+## Milestone 2B — Achieving >= 5.0 Hz Sustained Full-Swath Detection on Pixel 10 Pro XL *(Completed & 180s Thermal-Soak Verified — see [`docs/M2B_OVERNIGHT_REPORT.md`](M2B_OVERNIGHT_REPORT.md))*
+
+### Goal
+Overcome the live-app GPU bandwidth and thermal bottleneck (`420–577 ms/sweep`, `1.5–2.4 Hz` in `RF-DETR-Nano 384 B=5`) to achieve **`>= 5.0 FPS` (`<= 200 ms` sweep period; stretch `>= 8.0 FPS`) sustained** across a **180-second live CameraX + 120 Hz LCARS thermal soak** on the Pixel 10 Pro XL (`Tensor G5`) while preserving the full `1792 px` (`93.3%` landscape width) horizontal FOV and small-pebble recall (`28–45 px` targets representing `20–26 mm` stones at `0.59 mm/px` GSD).
+
+### Milestone 2B Acceptance Criteria & Empirical Results
+- [x] **Anti-Cheating Dual-Scale Strip Recall Oracle (`ml-pipeline/tests/eval_small_proxy_strip.py`):** Synthesizes deterministic `1792x384` gravel-textured evaluation strips with `4` medium targets (`120–200 px`, including a cross-tile seam target) and `12` small pebble targets (`28–45 px` minor-axis width) and evaluates candidate detectors end-to-end with `IoU >= 0.45 OR IoM >= 0.65` cross-tile union merging.
+- [x] **LiteRT `2.3.2` Upgrade, Zero-Copy `encMemory`, & Lock-Free 3-Slot Async Pipeline:** Upgraded to `com.google.ai.edge.litert:litert:2.3.2` (`litert-gpu:2.3.2`, `litert-npu-runtime-google-tensor:2.3.2`), eliminated the `5.9 MB` `part1Outputs[0] -> part2Inputs[0]` host round-trip copy via `part2ZeroCopyInputs`, and decoupled CameraX `ImageAnalysis` (`~3 ms` YUV extraction + immediate `imageProxy.close()`) from a dedicated `GneissFind-Inference` thread via a 3-slot lock-free `PreparedSweepSlot` ring buffer.
+- [x] **`W8-Dyn` (`dynamic_wi8_afp32`) GPU Weight Quantization + Top-K=`100` Surgery:** Compressed `RF-DETR-Nano Part 1 + Part 2` by **`3.7x` (`104.5 MB -> 28.1 MB`)** with zero recall loss using `dynamic_wi8_afp32` and `allowSrcQuantizedFcConvOps = true` on the Tensor G5 GPU, while trimming Stage-2 decoder queries from `K=300` to `K=100` (`-46%` Part 2 latency, `0.0%` recall loss).
+- [x] **Tensor G5 NPU Postmortem & 27-Configuration Pareto Bake-Off:** Documented why `Accelerator.NPU` on standalone APKs hits `kLiteRtStatusErrorNotFound` (AICore dynamic NPU provider requirement), contends with Camera HAL `G3ACoordinator` on `/dev/edgetpu`, and suffers `W8A8` ViT activation collapse (`100% -> 12.5%` small recall), whereas `W8-Dyn` on GPU FP16 delivers a `28–33%` speedup with `100%` FP32 recall parity. Also benchmarked 1-Graph `YOLO26s` / `YOLO26n` (`384/320/256 B=5`, `76.1–55.7 ms` / `13.1–18.0 FPS`).
+- [x] **180-Second Continuous Live-App Thermal Soaks (`t = 150..180s`):**
+  - **`S-01` (`RF-DETR 256 B=3 W8-DYN`, Default Apache-2.0):** **`108.2 ms` (`9.24 FPS`) cold** (beating the `>= 8.0 FPS` stretch goal) and **`152.2 ms` (`6.57 FPS` batch / priority target tile, `3.29 Hz` full 5-tile swath) sustained at `t = 150..180s`**.
+  - **`S-02` (`RF-DETR 320 B=3 W8-DYN`, `100%` Small `38-45px` Recall Apache-2.0):** **`141.5 ms` (`7.07 FPS`) cold** and **`187.9–204.2 ms` (`4.90–5.32 FPS`) under `Thermal Status: 1`**.
+  - **`S-03` (`RF-DETR 256 B=5 W8-DYN`, All 5 Tiles Every Sweep Apache-2.0):** **`158.0 ms` (`6.33 FPS`) cold** and **`206.0 ms` (`4.85 FPS` across all 5 tiles simultaneously) at `t = 150..180s`** (`3.2x` faster than the `577 ms` baseline).
+  - **`S-04` (`YOLO26-S 384 B=5 GPU`, AGPL-3.0 Reference):** **`76.1 ms` (`13.15 FPS`) cold** and **`128.3 ms` (`7.80 FPS` across all 5 tiles) at `t = 150..180s`**.
+- [x] **Multi-Model LCARS `SOURCE` Drawer & Report:** Bundled the finalist `.tflite` models into `android/app/src/main/assets/`, wired runtime hot-swapping in `LcarsSourceDrawerOverlay` (`DetectorSourceOption`), and published [`docs/M2B_OVERNIGHT_REPORT.md`](M2B_OVERNIGHT_REPORT.md).
+
+---
+
 ## Milestone 3 — T7920 Auto-Labeling & Hard-Negative Copy-Paste Pipeline (`ml-pipeline/`)
 - Build `SAM 2` video propagation scripts pinned to `GPU 1 & 2` (`2x RTX 4000 Ada`) to auto-segment `FieldDataLogger` salted gravel-bar PNG strips into 5-class bounding boxes (`4 PNW stone targets + hard_confuser`).
 - Build Copy-Paste instance compositor pasting segmented raw PNW stones onto unsalted local hard-negative gravel frames.
