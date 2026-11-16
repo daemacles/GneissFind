@@ -425,6 +425,7 @@ def flat_gather_top_rows(scores: Tensor, k: int) -> Callable[[Tensor], Tensor]:
 def load_prepared_lwdetr(
     resolution: int = DEFAULT_INPUT_RESOLUTION,
     checkpoint_path: str | None = None,
+    num_queries: int | None = None,
 ) -> tuple[nn.Module, RFDETRNano]:
     """Loads ``RFDETRNano`` on CPU and prepares a deep-copied ``LWDETR`` module for LiteRT export.
 
@@ -436,18 +437,22 @@ def load_prepared_lwdetr(
         resolution: Square input edge length in pixels (must be divisible by 32; 384 for Nano).
         checkpoint_path: Optional path to ``rf-detr-nano.pth``; ``None`` uses ``rfdetr``'s cached
             MD5-verified weights.
+        num_queries: Optional decoder query count override (e.g., ``100`` vs default ``300``).
 
     Returns:
         Tuple ``(export_lwdetr, eager_detector)`` where ``export_lwdetr`` is an eval-mode CPU
         ``LWDETR`` ready for wrapping and ``eager_detector`` is the unmodified ``RFDETRNano``
         instance for reference parity checks.
     """
-    init_kwargs: dict[str, Any] = {"resolution": resolution, "device": "cpu"}
+    init_kwargs: dict[str, Any] = {"resolution": DEFAULT_INPUT_RESOLUTION, "device": "cpu"}
     if checkpoint_path is not None:
         init_kwargs["pretrain_weights"] = checkpoint_path
 
     detector = RFDETRNano(**init_kwargs)
     lwdetr = copy.deepcopy(detector.model.model).cpu().eval()
+    if num_queries is not None:
+        lwdetr.num_queries = int(num_queries)
+        lwdetr.transformer.num_queries = int(num_queries)
 
     # Freeze DINOv2 positional embeddings prior to tracing so bicubic antialiased upsampling is not
     # emitted into the exported graph (see rfdetr/export/prepare.py).
