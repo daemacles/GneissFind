@@ -1,13 +1,16 @@
 /*
- * LiteRT 2.x GPU (FP16) detector running RF-DETR-Nano (384x384) across the push-broom tile swath.
+ * Multi-resolution, multi-architecture LiteRT 2.3.x GPU (FP16 / Quantized) & Tensor G5 NPU detector
+ * running RF-DETR-Nano (384/320/256, K=300/100, B=5/6/3-Interleaved/1) and YOLO26n/s across the
+ * push-broom tile swath.
  *
  * Consumes pre-allocated NHWC RGB [0..1] float tiles from PushBroomSweepBuffers and class-index
- * routing rules from assets/rf_detr_coco_metadata.json; produces tile-local TileDetection lists
- * and stage latency telemetry for ScannerViewModel.
+ * routing rules from assets/rf_detr_coco_metadata.json or LiveModelProfile; produces tile-local
+ * TileDetection lists and stage latency telemetry for ScannerViewModel.
  *
  * Main types:
+ * - LiveModelProfile: selectable on-device model/resolution/scheduling profiles for the LCARS SOURCE drawer.
  * - CocoStandInMetadata: parsed runtime configuration and MS-COCO-to-StoneClass routing table.
- * - RfDetrTwoGraphGpuDetector: zero-allocation 2-Graph/1-Graph LiteRT GPU FP16 detector and host Top-K proposal bridge.
+ * - RfDetrTwoGraphGpuDetector: zero-allocation 2-Graph/1-Graph LiteRT GPU/NPU detector and host Top-K proposal bridge.
  */
 package com.gneissfind.app.inference
 
@@ -30,25 +33,169 @@ import java.nio.FloatBuffer
 import java.util.Arrays
 import java.util.Locale
 import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+/**
+ * Selectable live hardware detector profiles exposed in the LCARS `SOURCE` drawer and benchmark harness.
+ *
+ * @property modelName Canonical profile identifier logged in telemetry.
+ * @property statusBadge Human-readable status string shown in the LCARS `SOURCE` drawer.
+ * @property topology Execution topology (`"two_graph"` or `"single_graph"`).
+ * @property inputResolution Square tile input resolution in pixels (`384`, `320`, or `256`).
+ * @property batchSize Static batch dimension (`5`, `6`, `3`, or `1`).
+ * @property numQueries Decoder Top-K query count (`300` or `100`) or dense anchor count (`3024` for YOLO26).
+ * @property numClasses Output class count (`91` for sparse COCO RF-DETR, `80` for contiguous COCO YOLO26).
+ * @property singleGraphAsset Asset filename when [topology] is `"single_graph"`.
+ * @property part1Asset Asset filename for Part 1 when [topology] is `"two_graph"`.
+ * @property part2Asset Asset filename for Part 2 when [topology] is `"two_graph"`.
+ * @property interleaveEvenOdd True when a `B=3` model alternates even (`[0,2,4]`) and odd (`[1,3,priority]`)
+ *   tiles across consecutive sweeps while caching opposite-parity detections for 1 sweep.
+ */
+enum class LiveModelProfile(
+    val modelName: String,
+    val statusBadge: String,
+    val topology: String,
+    val inputResolution: Int,
+    val batchSize: Int,
+    val numQueries: Int,
+    val numClasses: Int,
+    val singleGraphAsset: String,
+    val part1Asset: String,
+    val part2Asset: String,
+    val interleaveEvenOdd: Boolean = false
+) {
+    /**
+     * Milestone 2B Apache-2.0 High-Recall Balanced Winner: `RF-DETR-Nano` with `3x320x320` Even/Odd
+     * Priority Sub-Swath Interleaving, `W8-Dyn` quantized weights (`28.3 MB`), and `K=100` Top-K
+     * queries (`100%` Small `38-45px` recall, `141.5 ms` / `7.07 FPS` cold, `-60.1%` FLOPs/sweep).
+     */
+    RFDETR_NANO_320_B3_INTERLEAVED(
+        modelName = "rf_detr_nano_b3_320_k100_w8dyn_interleaved",
+        statusBadge = "RF-DETR 320 B=3 W8-DYN • GPU FP16",
+        topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+        inputResolution = 320,
+        batchSize = 3,
+        numQueries = 100,
+        numClasses = 91,
+        singleGraphAsset = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME,
+        part1Asset = "rf_detr_nano_part1_b3_320_w8dyn.tflite",
+        part2Asset = "rf_detr_nano_part2_b3_320_k100_w8dyn.tflite",
+        interleaveEvenOdd = true
+    ),
+
+    /**
+     * Milestone 2B Apache-2.0 Full-Frame Every-Sweep Winner: `RF-DETR-Nano` at `5x256x256` (`K=100`,
+     * `W8-Dyn` `28.5 MB`) evaluating all 5 tiles on every single sweep (`158-162 ms` / `6.15-6.33 FPS`
+     * cold, `206 ms` / `4.85 FPS` 180s soaked, `87.5%` Small `38-45px` recall).
+     */
+    RFDETR_NANO_256_B5_K100(
+        modelName = "rf_detr_nano_b5_256_k100_w8dyn",
+        statusBadge = "RF-DETR 256 B=5 W8-DYN • GPU FP16",
+        topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+        inputResolution = 256,
+        batchSize = 5,
+        numQueries = 100,
+        numClasses = 91,
+        singleGraphAsset = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME,
+        part1Asset = "rf_detr_nano_part1_b5_256_w8dyn.tflite",
+        part2Asset = "rf_detr_nano_part2_b5_256_k100_w8dyn.tflite",
+        interleaveEvenOdd = false
+    ),
+
+    /**
+     * Milestone 2B Apache-2.0 Ultra-Fast Sustained Winner: `RF-DETR-Nano` with `3x256x256` Even/Odd
+     * Priority Sub-Swath Interleaving, `W8-Dyn` weights (`28.1 MB`), and `K=100` (`108.2 ms` /
+     * `9.24 FPS` cold, `152.2 ms` / `6.57 FPS` sustained after 180s thermal soak).
+     */
+    RFDETR_NANO_256_B3_INTERLEAVED(
+        modelName = "rf_detr_nano_b3_256_k100_w8dyn_interleaved",
+        statusBadge = "RF-DETR 256 B=3 W8-DYN • GPU FP16",
+        topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+        inputResolution = 256,
+        batchSize = 3,
+        numQueries = 100,
+        numClasses = 91,
+        singleGraphAsset = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME,
+        part1Asset = "rf_detr_nano_part1_b3_256_w8dyn.tflite",
+        part2Asset = "rf_detr_nano_part2_b3_256_k100_w8dyn.tflite",
+        interleaveEvenOdd = true
+    ),
+
+    /**
+     * Milestone 2B Apache-2.0 Full-Frame `5x320x320` (`K=100`): `100%` Small `38-45px` recall
+     * across all 5 tiles every sweep (`-33.4%` FLOPs/sweep).
+     */
+    RFDETR_NANO_320_B5_K100(
+        modelName = "rf_detr_nano_b5_320_k100",
+        statusBadge = "RF-DETR 320 B=5 K100 • GPU FP16",
+        topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+        inputResolution = 320,
+        batchSize = 5,
+        numQueries = 100,
+        numClasses = 91,
+        singleGraphAsset = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME,
+        part1Asset = "rf_detr_nano_part1_b5_320.tflite",
+        part2Asset = "rf_detr_nano_part2_b5_320_k100.tflite",
+        interleaveEvenOdd = false
+    ),
+
+    /**
+     * Milestone 2B Single-Graph CNN Speed Reference (`AGPL-3.0` benchmark): `YOLO26s` at `5x384x384`
+     * on GPU FP16 (`41.15 GFLOPs` per 5-tile sweep).
+     */
+    YOLO26S_384_B5_GPU(
+        modelName = "yolo26s_b5_384",
+        statusBadge = "YOLO26-S 384 B=5 • GPU FP16 [AGPL]",
+        topology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH,
+        inputResolution = 384,
+        batchSize = 5,
+        numQueries = 3024,
+        numClasses = 80,
+        singleGraphAsset = "yolo26s_b5_384.tflite",
+        part1Asset = CocoStandInMetadata.PART1_ASSET_NAME,
+        part2Asset = CocoStandInMetadata.PART2_ASSET_NAME,
+        interleaveEvenOdd = false
+    ),
+
+    /**
+     * Milestone 2 Baseline Reference: `RF-DETR-Nano` at `5x384x384` (`K=300` queries, `148.55 GFLOPs`).
+     */
+    RFDETR_NANO_384_BASELINE(
+        modelName = "rf_detr_nano_b5_384_k300",
+        statusBadge = "RF-DETR 384 B=5 K300 • BASELINE",
+        topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+        inputResolution = 384,
+        batchSize = 5,
+        numQueries = 300,
+        numClasses = 91,
+        singleGraphAsset = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME,
+        part1Asset = CocoStandInMetadata.PART1_ASSET_NAME,
+        part2Asset = CocoStandInMetadata.PART2_ASSET_NAME,
+        interleaveEvenOdd = false
+    )
+}
 
 /**
  * Parsed runtime configuration and MS-COCO stand-in class routing table loaded from
  * `assets/rf_detr_coco_metadata.json` (`.agents/rules/litert-inference.md §4`).
  *
  * @property modelName Identifier of the exported model family.
- * @property inputResolution Square tile width and height in pixels (`384`).
- * @property batchSize Configured static batch dimension (`5` for batched sweep, `1` for sequential).
+ * @property inputResolution Square tile width and height in pixels (`384`, `320`, or `256`).
+ * @property batchSize Configured static batch dimension (`5`, `6`, `3`, or `1`).
  * @property topology Graph execution topology: `"two_graph"` or `"single_graph"`.
  * @property singleGraphAsset Asset filename for the single-graph `.tflite` model.
  * @property part1Asset Asset filename for Part 1 (backbone + encoder + proposal scores).
  * @property part2Asset Asset filename for Part 2 (decoder + detection head).
- * @property encoderGridH Spatial height of the encoder proposal grid (`24`).
- * @property encoderGridW Spatial width of the encoder proposal grid (`24`).
- * @property numEncoderTokens Total encoder spatial tokens (`encoderGridH * encoderGridW = 576`).
+ * @property encoderGridH Spatial height of the encoder proposal grid (`24` at `384`, `20` at `320`, `16` at `256`).
+ * @property encoderGridW Spatial width of the encoder proposal grid (`24` at `384`, `20` at `320`, `16` at `256`).
+ * @property numEncoderTokens Total encoder spatial tokens (`encoderGridH * encoderGridW`).
  * @property hiddenDim Transformer decoder embedding width (`256`).
  * @property proposalDefaultWh Default normalized proposal width and height (`0.05f`).
- * @property numQueries Number of top-scoring object queries passed to the decoder (`300`).
- * @property numClasses Number of output class logits/probabilities per query (`91` for sparse COCO).
+ * @property numQueries Number of top-scoring object queries passed to the decoder (`300` or `100`, or `3024` for YOLO26).
+ * @property numClasses Number of output class logits/probabilities per query (`91` for sparse COCO, `80` for contiguous COCO).
  * @property scoresAreProbabilities True when the exported graph already applies `sigmoid(logits)`.
  * @property scoreThreshold Minimum confidence score required to emit a [TileDetection].
  * @property cocoClassIdToStoneClassId Lookup table indexed by model `class_id` returning the mapped
@@ -92,56 +239,71 @@ data class CocoStandInMetadata(
         const val DEFAULT_PROPOSAL_WH = 0.05f
         const val DEFAULT_COCO_TOP_K_QUERIES = 300
         const val DEFAULT_COCO_NUM_CLASSES = 91
+        const val CONTIGUOUS_COCO_NUM_CLASSES = 80
         const val DEFAULT_SCORE_THRESHOLD = 0.35f
 
         /**
-         * Builds the default 91-class sparse MS-COCO lookup table verified against `rfdetr 1.12.1`:
-         *  - `47` (`cup`) -> `0` ([StoneClass.CHALCEDONY_AGATE])
-         *  - `53` (`apple`) -> `1` ([StoneClass.JASPER_RED_YELLOW])
-         *  - `90` (`toothbrush`) -> `2` ([StoneClass.GREEN_GEM_ROCK])
-         *  - `75` (`remote`) -> `3` ([StoneClass.PETRIFIED_WOOD])
-         *  - All other indices -> `4` ([StoneClass.HARD_CONFUSER])
+         * Builds the default 91-class sparse MS-COCO lookup table verified against `rfdetr 1.12.1`
+         * (or the 80-class contiguous MS-COCO lookup table when `numClasses == 80` for `YOLO26`):
+         * - Sparse 91-class (`numClasses != 80`):
+         *   `47` (`cup`) -> `0`, `53` (`apple`) -> `1`, `90` (`toothbrush`) -> `2`, `75` (`remote`) -> `3`.
+         * - Contiguous 80-class (`numClasses == 80`):
+         *   `41` (`cup`) -> `0`, `47` (`apple`) -> `1`, `79` (`toothbrush`) -> `2`, `65` (`remote`) -> `3`.
          *
-         * @param numClasses Number of output class slots in the model head (defaults to [DEFAULT_COCO_NUM_CLASSES]).
-         * @return Integer lookup table of length `max(numClasses + 1, 128)` mapping COCO class ID to [StoneClass.id].
+         * @param numClasses Number of output class slots in the model head.
+         * @return Integer lookup table mapping model class ID to [StoneClass.id].
          */
         fun buildDefaultCocoToStoneClassLut(numClasses: Int = DEFAULT_COCO_NUM_CLASSES): IntArray {
             val lutSize = maxOf(numClasses + 1, 128)
             return IntArray(lutSize) { StoneClass.HARD_CONFUSER.id }.apply {
-                this[47] = StoneClass.CHALCEDONY_AGATE.id
-                this[53] = StoneClass.JASPER_RED_YELLOW.id
-                this[90] = StoneClass.GREEN_GEM_ROCK.id
-                this[75] = StoneClass.PETRIFIED_WOOD.id
+                if (numClasses == CONTIGUOUS_COCO_NUM_CLASSES) {
+                    this[41] = StoneClass.CHALCEDONY_AGATE.id
+                    this[47] = StoneClass.JASPER_RED_YELLOW.id
+                    this[79] = StoneClass.GREEN_GEM_ROCK.id
+                    this[65] = StoneClass.PETRIFIED_WOOD.id
+                } else {
+                    this[47] = StoneClass.CHALCEDONY_AGATE.id
+                    this[53] = StoneClass.JASPER_RED_YELLOW.id
+                    this[90] = StoneClass.GREEN_GEM_ROCK.id
+                    this[75] = StoneClass.PETRIFIED_WOOD.id
+                }
             }
         }
     }
 }
 
 /**
- * LiteRT 2.x GPU (FP16) detector executing `RF-DETR-Nano` ($384 \times 384$ tiles) in either
- * 2-Graph split topology (`Part 1` backbone/encoder + Kotlin Host Top-300 proposal gather + `Part 2`
- * decoder) or 1-Graph end-to-end topology, supporting both static `B=5` batched sweep dispatch and
- * `5 x B=1` sequential tile dispatch (`.agents/rules/litert-inference.md §3–§5`).
+ * LiteRT 2.3.x GPU (FP16 / Quantized) & Google Tensor G5 NPU detector executing `RF-DETR-Nano`
+ * ($384 \times 384$, $320 \times 320$, or $256 \times 256$ tiles) and `YOLO26n/s` in either 2-Graph
+ * split topology (`Part 1` backbone/encoder + Kotlin Host Top-K proposal gather + `Part 2` decoder)
+ * or 1-Graph end-to-end topology, supporting static `B=5`/`B=6` batched dispatch, `B=3` Even/Odd
+ * Priority Sub-Swath Interleaving, and `5 x B=1` sequential dispatch (`.agents/rules/litert-inference.md §3–§5`).
  *
  * Responsibility and state: owns the LiteRT [Environment], [CompiledModel] handles, native
- * [TensorBuffer] bindings, and pre-allocated direct `ByteBuffer` / `FloatArray` staging buffers so
- * [detectSweep] performs zero heap allocations per frame.
+ * [TensorBuffer] bindings, precomputed bilinear resampling tables, and pre-allocated staging arrays
+ * so [detectSweep] performs zero heap allocations per frame.
  *
- * Lifecycle: lazily initializes LiteRT GPU models on the first [detectSweep] call so OpenCL/EGL
- * contexts bind to the CameraX single-threaded analyzer worker; release via [close].
+ * Lifecycle: lazily initializes LiteRT GPU/NPU models on the first [detectSweep] call so OpenCL/EGL
+ * contexts bind to the inference worker thread; release via [close].
  *
- * Threading: confined to the single-threaded CameraX analysis executor.
+ * Threading: confined to the single-threaded inference executor.
  *
  * @param appContext Application context used to read `assets/` and locate `codeCacheDir` for
- *   serialized GPU shader caching.
+ *   serialized GPU/NPU shader caching.
  * @param confidenceThreshold Minimum probability threshold (`[0.0, 1.0]`) to retain a query box.
+ * @param initialProfile Initial [LiveModelProfile] loaded when no `benchmark_override.json` is active.
  */
 class RfDetrTwoGraphGpuDetector(
     private val appContext: Context,
-    private val confidenceThreshold: Float = CocoStandInMetadata.DEFAULT_SCORE_THRESHOLD
+    private val confidenceThreshold: Float = CocoStandInMetadata.DEFAULT_SCORE_THRESHOLD,
+    initialProfile: LiveModelProfile = LiveModelProfile.RFDETR_NANO_384_BASELINE
 ) : StoneDetector {
 
     override val backend: DetectorBackend = DetectorBackend.RF_DETR_NANO_GPU
+
+    @Volatile
+    private var desiredLiveProfile: LiveModelProfile = initialProfile
+    private var activeLiveProfile: LiveModelProfile = initialProfile
 
     private var environment: Environment? = null
     private var singleModel: CompiledModel? = null
@@ -153,55 +315,93 @@ class RfDetrTwoGraphGpuDetector(
     private var part1Outputs: List<TensorBuffer> = emptyList()
     private var part2Inputs: List<TensorBuffer> = emptyList()
     private var part2Outputs: List<TensorBuffer> = emptyList()
+    private var part2ZeroCopyInputs: List<TensorBuffer> = emptyList()
 
     private var metadata: CocoStandInMetadata = CocoStandInMetadata(scoreThreshold = confidenceThreshold)
     private var activeTopology: String = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH
     private var activeAcceleratorLabel: String = "GPU FP16"
     private var compiledBatchSize: Int = StripRoiGeometry.MAX_TILES
+    private var activeInputResolution: Int = StripRoiGeometry.TILE_SIZE_PX
+    private var activeTileFloatCount: Int = DEFAULT_TILE_FLOAT_COUNT
+    private var singleBoxesOutputIdx: Int = 0
+    private var singleScoresOutputIdx: Int = 1
+    private var part2BoxesOutputIdx: Int = 0
+    private var part2ScoresOutputIdx: Int = 1
+    private var useZeroCopyEncMemory: Boolean = true
+    private var interleaveEvenOdd: Boolean = false
+
     private var overrideActiveTiles: Int? = null
     private var overridePreferTextureWeights: Boolean? = null
     private var overrideConstantTensorSharing: Boolean? = null
+    private var overrideAllowQuantizedFcConv: Boolean? = null
+    private var overrideNumStepsCmdBuffer: Int? = null
     private var overrideBufferStorageType: CompiledModel.GpuOptions.BufferStorageType? = null
+    private var overrideAcceleratorMode: String = "gpu"
     private var lastOverrideMtimeMs: Long = -1L
 
     private var initializedOnThread = false
     private var hardwareGraphsLoaded = false
-    private var initMessage: String = "RF-DETR NANO GPU [COCO PROXY]"
+    private var initMessage: String = initialProfile.statusBadge
 
-    // Pre-allocated direct ByteBuffer and float staging arrays for zero-GC B=5 or B=1 execution
-    private val directInputByteBuffer: ByteBuffer = ByteBuffer
-        .allocateDirect(StripRoiGeometry.MAX_TILES * TILE_FLOAT_COUNT * Float.SIZE_BYTES)
+    // Dynamic staging arrays sized once at model load time to match exact TensorBuffer byte capacities
+    private var directInputByteBuffer: ByteBuffer = ByteBuffer
+        .allocateDirect(MAX_SUPPORTED_BATCH * DEFAULT_TILE_FLOAT_COUNT * Float.SIZE_BYTES)
         .order(ByteOrder.nativeOrder())
-    private val directInputFloatBuffer: FloatBuffer = directInputByteBuffer.asFloatBuffer()
-    private val batchedInputFloats = FloatArray(StripRoiGeometry.MAX_TILES * TILE_FLOAT_COUNT)
-    private val singleTileInputFloats = FloatArray(TILE_FLOAT_COUNT)
+    private var directInputFloatBuffer: FloatBuffer = directInputByteBuffer.asFloatBuffer()
+    private var batchedInputFloats = FloatArray(StripRoiGeometry.MAX_TILES * DEFAULT_TILE_FLOAT_COUNT)
+    private var singleTileInputFloats = FloatArray(DEFAULT_TILE_FLOAT_COUNT)
 
-    // Pre-allocated 2-graph Host Top-300 bridge tables (sized for max B=5, 576 tokens, K=300, dim=256)
+    // Precomputed 1D bilinear resampling tables for 384 -> activeInputResolution (320 or 256)
+    private var resampleY0 = IntArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleY1 = IntArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleWy0 = FloatArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleWy1 = FloatArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleX0 = IntArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleX1 = IntArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleWx0 = FloatArray(StripRoiGeometry.TILE_SIZE_PX)
+    private var resampleWx1 = FloatArray(StripRoiGeometry.TILE_SIZE_PX)
+
+    // Precomputed 6x256 strip-to-tile X tables and reconstructed strip cache for B=6 256x256 mode
+    private val reconstructedStripRgb = FloatArray(
+        StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX * 3
+    )
+    private val sixTileX0 = IntArray(256)
+    private val sixTileX1 = IntArray(256)
+    private val sixTileWx0 = FloatArray(256)
+    private val sixTileWx1 = FloatArray(256)
+
+    // Pre-allocated 2-graph Host Top-K bridge tables (resized on model initialization to match exact TensorBuffer sizes)
     private var baseProposalsTable: FloatArray = buildNormalizedProposalGrid(
         gridH = CocoStandInMetadata.DEFAULT_ENCODER_GRID_SIZE,
         gridW = CocoStandInMetadata.DEFAULT_ENCODER_GRID_SIZE,
         defaultWh = CocoStandInMetadata.DEFAULT_PROPOSAL_WH
     )
-    private val batchedSelectedPrenormFloats = FloatArray(
+    private var batchedSelectedPrenormFloats = FloatArray(
         StripRoiGeometry.MAX_TILES *
             CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES *
             CocoStandInMetadata.DEFAULT_QUERY_HIDDEN_DIM
     )
-    private val batchedSelectedProposalsFloats = FloatArray(
+    private var batchedSelectedProposalsFloats = FloatArray(
         StripRoiGeometry.MAX_TILES * CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES * 4
     )
-    private val singleSelectedPrenormFloats = FloatArray(
+    private var singleSelectedPrenormFloats = FloatArray(
         CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES *
             CocoStandInMetadata.DEFAULT_QUERY_HIDDEN_DIM
     )
-    private val singleSelectedProposalsFloats = FloatArray(
+    private var singleSelectedProposalsFloats = FloatArray(
         CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES * 4
     )
-    private val batchedTopIndices = IntArray(
+    private var batchedTopIndices = IntArray(
         StripRoiGeometry.MAX_TILES * CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES
     )
-    private val scratchHeapScores = FloatArray(CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES)
-    private val scratchHeapIndices = IntArray(CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES)
+    private var scratchHeapScores = FloatArray(CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES)
+    private var scratchHeapIndices = IntArray(CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES)
+
+    // Track 4 Even/Odd Sub-Swath Interleaving state (caches per-tile detections for at most 1 sweep)
+    private val interleavedBatchTileMap = IntArray(3)
+    private val cachedTileDetections = Array(StripRoiGeometry.MAX_TILES) { ArrayList<TileDetection>(8) }
+    private val cachedTileSweepStamp = LongArray(StripRoiGeometry.MAX_TILES) { -10L }
+    private var priorityEvenTileIndex: Int = 2
 
     // Legacy fallback profiler buffers used only when .tflite assets are absent in unit tests
     private val stubEncoderLogits = FloatArray(DEFAULT_ENCODER_ANCHORS * NUM_CLASSES)
@@ -213,27 +413,59 @@ class RfDetrTwoGraphGpuDetector(
     private var rollingLatencyMs: Float = 0f
     private var sweepCount: Long = 0L
 
+    init {
+        buildResampleTables(StripRoiGeometry.TILE_SIZE_PX)
+        buildSixTileXTables()
+    }
+
     override val isHardwareReady: Boolean
         get() = hardwareGraphsLoaded
 
     override val statusSummary: String
         get() = initMessage
 
+    /** Currently selected [LiveModelProfile] when running without an external `benchmark_override.json`. */
+    val currentLiveProfile: LiveModelProfile
+        get() = desiredLiveProfile
+
     /**
-     * Checks whether an external `benchmark_override.json` file was updated by `adb` so the
-     * 4-way benchmark matrix (`1-Graph vs 2-Graph` x `B=5 vs 5xB=1`) can hot-swap models on the
-     * analyzer thread without restarting the camera session.
+     * Switches the active [LiveModelProfile] from the LCARS `SOURCE` drawer. The new LiteRT graphs
+     * are hot-swapped on the inference worker thread at the start of the next sweep.
+     */
+    fun setLiveModelProfile(profile: LiveModelProfile) {
+        if (desiredLiveProfile != profile) {
+            desiredLiveProfile = profile
+        }
+    }
+
+    /**
+     * Checks whether `benchmark_override.json` or [desiredLiveProfile] changed so models can
+     * hot-swap on the inference thread without restarting CameraX.
      */
     private fun checkBenchmarkOverrideHotSwap() {
         val overrideFile = resolveBenchmarkOverrideFile()
         val mtime = if (overrideFile != null && overrideFile.exists()) overrideFile.lastModified() else 0L
-        if (initializedOnThread && mtime != lastOverrideMtimeMs) {
-            Log.i(TAG, "Detected benchmark_override.json change (mtime=$mtime); reloading LiteRT models")
+        val profileChanged = desiredLiveProfile != activeLiveProfile
+        if (initializedOnThread && (mtime != lastOverrideMtimeMs || profileChanged)) {
+            Log.i(
+                TAG,
+                "Hot-swapping LiteRT models (overrideMtime=$mtime, profile=${desiredLiveProfile.name})"
+            )
             releaseModelsOnly()
             initializedOnThread = false
             sweepCount = 0L
             rollingLatencyMs = 0f
+            resetInterleaveCache()
         }
+    }
+
+    /** Clears the 1-sweep Even/Odd tile detection cache. */
+    private fun resetInterleaveCache() {
+        for (i in 0 until StripRoiGeometry.MAX_TILES) {
+            cachedTileDetections[i].clear()
+            cachedTileSweepStamp[i] = -10L
+        }
+        priorityEvenTileIndex = 2
     }
 
     /**
@@ -251,8 +483,60 @@ class RfDetrTwoGraphGpuDetector(
     }
 
     /**
+     * Precomputes 1D bilinear interpolation indices (`*3` for RGB stride on X) and weights mapping
+     * `[0 until dstRes]` back into a `[384 x 384]` source tile.
+     */
+    private fun buildResampleTables(dstRes: Int) {
+        val srcRes = StripRoiGeometry.TILE_SIZE_PX
+        resampleY0 = IntArray(dstRes)
+        resampleY1 = IntArray(dstRes)
+        resampleWy0 = FloatArray(dstRes)
+        resampleWy1 = FloatArray(dstRes)
+        resampleX0 = IntArray(dstRes)
+        resampleX1 = IntArray(dstRes)
+        resampleWx0 = FloatArray(dstRes)
+        resampleWx1 = FloatArray(dstRes)
+
+        val scale = srcRes.toFloat() / dstRes.toFloat()
+        for (i in 0 until dstRes) {
+            val srcCoord = ((i + 0.5f) * scale - 0.5f).coerceIn(0f, (srcRes - 1).toFloat())
+            val i0 = srcCoord.toInt().coerceIn(0, srcRes - 1)
+            val i1 = (i0 + 1).coerceAtMost(srcRes - 1)
+            val w1 = srcCoord - i0
+            val w0 = 1.0f - w1
+
+            resampleY0[i] = i0 * srcRes * 3
+            resampleY1[i] = i1 * srcRes * 3
+            resampleWy0[i] = w0
+            resampleWy1[i] = w1
+
+            resampleX0[i] = i0 * 3
+            resampleX1[i] = i1 * 3
+            resampleWx0[i] = w0
+            resampleWx1[i] = w1
+        }
+    }
+
+    /** Precomputes horizontal bilinear sampling tables mapping `256 px` into a `320 px` wide strip window. */
+    private fun buildSixTileXTables() {
+        val srcW = SIX_TILE_WINDOW_WIDTH_PX
+        val dstW = 256
+        val scale = srcW.toFloat() / dstW.toFloat()
+        for (x in 0 until dstW) {
+            val srcCoord = ((x + 0.5f) * scale - 0.5f).coerceIn(0f, (srcW - 1).toFloat())
+            val x0 = srcCoord.toInt().coerceIn(0, srcW - 1)
+            val x1 = (x0 + 1).coerceAtMost(srcW - 1)
+            val w1 = srcCoord - x0
+            sixTileX0[x] = x0
+            sixTileX1[x] = x1
+            sixTileWx0[x] = 1.0f - w1
+            sixTileWx1[x] = w1
+        }
+    }
+
+    /**
      * Lazily initializes LiteRT [Environment] and [CompiledModel] instances on the single-threaded
-     * CameraX analyzer worker so GPU OpenCL/EGL contexts maintain strict thread affinity.
+     * inference worker so GPU OpenCL/EGL and NPU contexts maintain strict thread affinity.
      */
     private fun ensureInitializedOnAnalyzerThread() {
         checkBenchmarkOverrideHotSwap()
@@ -261,33 +545,68 @@ class RfDetrTwoGraphGpuDetector(
 
         val overrideFile = resolveBenchmarkOverrideFile()
         lastOverrideMtimeMs = if (overrideFile != null && overrideFile.exists()) overrideFile.lastModified() else 0L
+        activeLiveProfile = desiredLiveProfile
 
         try {
             val assetList = appContext.assets.list("")?.toSet().orEmpty()
-            if (CocoStandInMetadata.METADATA_ASSET_NAME in assetList) {
+            var baseMeta = if (CocoStandInMetadata.METADATA_ASSET_NAME in assetList) {
                 val jsonText = appContext.assets.open(CocoStandInMetadata.METADATA_ASSET_NAME)
                     .bufferedReader()
                     .use { it.readText() }
-                metadata = parseCocoMetadataJson(jsonText, confidenceThreshold)
+                parseCocoMetadataJson(jsonText, confidenceThreshold)
+            } else {
+                CocoStandInMetadata(scoreThreshold = confidenceThreshold)
             }
-            baseProposalsTable = buildNormalizedProposalGrid(
-                gridH = metadata.encoderGridH,
-                gridW = metadata.encoderGridW,
-                defaultWh = metadata.proposalDefaultWh
+
+            // Apply active LiveModelProfile defaults before optional benchmark_override.json
+            val profile = activeLiveProfile
+            val profileGridSide = profile.inputResolution / 16
+            baseMeta = baseMeta.copy(
+                modelName = profile.modelName,
+                inputResolution = profile.inputResolution,
+                batchSize = profile.batchSize,
+                topology = profile.topology,
+                singleGraphAsset = if (profile.singleGraphAsset in assetList) {
+                    profile.singleGraphAsset
+                } else {
+                    baseMeta.singleGraphAsset
+                },
+                part1Asset = if (profile.part1Asset in assetList) {
+                    profile.part1Asset
+                } else {
+                    baseMeta.part1Asset
+                },
+                part2Asset = if (profile.part2Asset in assetList) {
+                    profile.part2Asset
+                } else {
+                    baseMeta.part2Asset
+                },
+                encoderGridH = profileGridSide,
+                encoderGridW = profileGridSide,
+                numEncoderTokens = profileGridSide * profileGridSide,
+                numQueries = profile.numQueries,
+                numClasses = profile.numClasses,
+                cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(profile.numClasses)
             )
 
-            val env = Environment.create(appContext, enableCompilerCache = true)
-            environment = env
-
-            // Optional benchmark override JSON allows hot-swapping 1g/2g and b1/b5 from filesDir/externalFilesDir
             val overrideJson = overrideFile?.readText()?.let { JSONObject(it) }
-            val desiredTopology = overrideJson?.optString("topology", metadata.topology) ?: metadata.topology
+            val desiredTopology = overrideJson?.optString("topology", baseMeta.topology) ?: baseMeta.topology
             val singleFileOverride = overrideJson?.optString("single_graph_path", "")?.takeIf { it.isNotEmpty() }
             val part1FileOverride = overrideJson?.optString("part1_path", "")?.takeIf { it.isNotEmpty() }
             val part2FileOverride = overrideJson?.optString("part2_path", "")?.takeIf { it.isNotEmpty() }
+
+            val requestedRes = overrideJson?.optInt("input_resolution", baseMeta.inputResolution)
+                ?: baseMeta.inputResolution
+            val requestedBatch = overrideJson?.optInt("batch_size", baseMeta.batchSize)
+                ?: baseMeta.batchSize
+            val requestedQueries = overrideJson?.optInt("num_queries", baseMeta.numQueries)
+                ?: baseMeta.numQueries
+            val requestedClasses = overrideJson?.optInt("num_classes", baseMeta.numClasses)
+                ?: baseMeta.numClasses
+
             overrideActiveTiles = if (overrideJson != null && overrideJson.has("active_tiles")) {
                 overrideJson.optInt("active_tiles", StripRoiGeometry.MAX_TILES)
-                    .coerceIn(1, StripRoiGeometry.MAX_TILES)
+                    .coerceIn(1, MAX_SUPPORTED_BATCH)
             } else {
                 null
             }
@@ -301,19 +620,36 @@ class RfDetrTwoGraphGpuDetector(
             } else {
                 null
             }
+            overrideAllowQuantizedFcConv = if (overrideJson != null && overrideJson.has("allow_quantized_fc_conv")) {
+                overrideJson.optBoolean("allow_quantized_fc_conv")
+            } else {
+                true
+            }
+            overrideNumStepsCmdBuffer = if (overrideJson != null && overrideJson.has("num_steps_cmd_buffer")) {
+                overrideJson.optInt("num_steps_cmd_buffer")
+            } else {
+                null
+            }
             overrideBufferStorageType = when (overrideJson?.optString("buffer_storage_type", "")?.lowercase(Locale.US)) {
                 "buffer" -> CompiledModel.GpuOptions.BufferStorageType.BUFFER
                 "texture_2d" -> CompiledModel.GpuOptions.BufferStorageType.TEXTURE_2D
                 "default" -> CompiledModel.GpuOptions.BufferStorageType.DEFAULT
                 else -> null
             }
+            overrideAcceleratorMode = overrideJson?.optString("accelerator", "gpu")?.lowercase(Locale.US) ?: "gpu"
+            useZeroCopyEncMemory = overrideJson?.optBoolean("zero_copy_enc_memory", true) ?: true
+            interleaveEvenOdd = overrideJson?.optBoolean("interleave_even_odd", profile.interleaveEvenOdd)
+                ?: profile.interleaveEvenOdd
+
+            val env = Environment.create(appContext, enableCompilerCache = true)
+            environment = env
 
             val hasTwoGraphOverride = part1FileOverride != null && part2FileOverride != null &&
                 File(part1FileOverride).exists() && File(part2FileOverride).exists()
             val hasSingleGraphOverride = singleFileOverride != null && File(singleFileOverride).exists()
 
-            val hasTwoGraphAssets = metadata.part1Asset in assetList && metadata.part2Asset in assetList
-            val hasSingleGraphAsset = metadata.singleGraphAsset in assetList
+            val hasTwoGraphAssets = baseMeta.part1Asset in assetList && baseMeta.part2Asset in assetList
+            val hasSingleGraphAsset = baseMeta.singleGraphAsset in assetList
 
             val useTwoGraph = when {
                 desiredTopology == CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH &&
@@ -325,51 +661,175 @@ class RfDetrTwoGraphGpuDetector(
                 else -> false
             }
 
+            val compileStartNs = System.nanoTime()
             if (useTwoGraph && (hasTwoGraphOverride || hasTwoGraphAssets)) {
                 val (m1, m2, accelLabel) = loadTwoGraphModels(
                     env = env,
                     part1FilePath = part1FileOverride.takeIf { hasTwoGraphOverride },
-                    part2FilePath = part2FileOverride.takeIf { hasTwoGraphOverride }
+                    part2FilePath = part2FileOverride.takeIf { hasTwoGraphOverride },
+                    part1AssetName = baseMeta.part1Asset,
+                    part2AssetName = baseMeta.part2Asset
                 )
+                val compileMs = (System.nanoTime() - compileStartNs) / 1_000_000.0
                 part1Model = m1
                 part2Model = m2
                 part1Inputs = m1.createInputBuffers()
                 part1Outputs = m1.createOutputBuffers()
                 part2Inputs = m2.createInputBuffers()
                 part2Outputs = m2.createOutputBuffers()
+                part2ZeroCopyInputs = listOf(part1Outputs[0], part2Inputs[1], part2Inputs[2])
 
-                val p1MaxScoresSize = part1Outputs.getOrNull(2)?.readFloat()?.size ?: 0
-                compiledBatchSize = if (p1MaxScoresSize >= metadata.numEncoderTokens) {
-                    (p1MaxScoresSize / metadata.numEncoderTokens).coerceIn(1, StripRoiGeometry.MAX_TILES)
+                // Auto-detect exact dimensions from compiled TensorBuffers
+                val p1InFloats = part1Inputs[0].readFloat().size
+                val p1MemFloats = part1Outputs[0].readFloat().size
+                val p1ScoresFloats = part1Outputs[2].readFloat().size
+                val p2PropFloats = part2Inputs[2].readFloat().size
+                val p2Out0Floats = part2Outputs[0].readFloat().size
+                val p2Out1Floats = part2Outputs[1].readFloat().size
+
+                activeInputResolution = requestedRes
+                activeTileFloatCount = activeInputResolution * activeInputResolution * 3
+                compiledBatchSize = if (activeTileFloatCount > 0 && p1InFloats >= activeTileFloatCount) {
+                    (p1InFloats / activeTileFloatCount).coerceIn(1, MAX_SUPPORTED_BATCH)
                 } else {
-                    overrideJson?.optInt("batch_size", metadata.batchSize) ?: metadata.batchSize
+                    requestedBatch.coerceIn(1, MAX_SUPPORTED_BATCH)
                 }
+
+                val detectedTokens = if (compiledBatchSize > 0 && p1ScoresFloats >= compiledBatchSize) {
+                    p1ScoresFloats / compiledBatchSize
+                } else {
+                    (activeInputResolution / 16) * (activeInputResolution / 16)
+                }
+                val detectedHiddenDim = if (p1ScoresFloats > 0 && p1MemFloats >= p1ScoresFloats) {
+                    p1MemFloats / p1ScoresFloats
+                } else {
+                    CocoStandInMetadata.DEFAULT_QUERY_HIDDEN_DIM
+                }
+                val detectedTopK = if (compiledBatchSize > 0 && p2PropFloats >= compiledBatchSize * 4) {
+                    p2PropFloats / (compiledBatchSize * 4)
+                } else {
+                    requestedQueries
+                }
+
+                part2BoxesOutputIdx = if (p2Out0Floats <= p2Out1Floats) 0 else 1
+                part2ScoresOutputIdx = 1 - part2BoxesOutputIdx
+                val scoresFloats = maxOf(p2Out0Floats, p2Out1Floats)
+                val detectedClasses = if (compiledBatchSize * detectedTopK > 0) {
+                    scoresFloats / (compiledBatchSize * detectedTopK)
+                } else {
+                    requestedClasses
+                }
+
+                val gridSide = sqrt(detectedTokens.toDouble()).roundToInt().coerceAtLeast(1)
+                metadata = baseMeta.copy(
+                    inputResolution = activeInputResolution,
+                    batchSize = compiledBatchSize,
+                    topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+                    encoderGridH = gridSide,
+                    encoderGridW = detectedTokens / gridSide,
+                    numEncoderTokens = detectedTokens,
+                    hiddenDim = detectedHiddenDim,
+                    numQueries = detectedTopK,
+                    numClasses = detectedClasses,
+                    cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(detectedClasses)
+                )
+
+                allocateStagingBuffersForMetadata()
                 activeTopology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH
                 activeAcceleratorLabel = accelLabel
                 hardwareGraphsLoaded = true
-                initMessage = "RF-DETR 2G B=$compiledBatchSize • $accelLabel [COCO]"
-                Log.i(TAG, "Initialized $initMessage (override=${overrideFile?.absolutePath ?: "none"})")
+                val intlvTag = if (interleaveEvenOdd && compiledBatchSize == 3) " INTLV" else ""
+                initMessage = if (overrideFile != null) {
+                    "RF-DETR 2G ${activeInputResolution} B=${compiledBatchSize}${intlvTag} K=${metadata.numQueries} • $accelLabel"
+                } else {
+                    profile.statusBadge
+                }
+                Log.i(
+                    TAG,
+                    String.format(
+                        Locale.US,
+                        "Initialized %s compile_ms=%.1f res=%d batch=%d tokens=%d topK=%d classes=%d zeroCopy=%b interleave=%b",
+                        initMessage,
+                        compileMs,
+                        activeInputResolution,
+                        compiledBatchSize,
+                        metadata.numEncoderTokens,
+                        metadata.numQueries,
+                        metadata.numClasses,
+                        useZeroCopyEncMemory,
+                        interleaveEvenOdd
+                    )
+                )
             } else if (hasSingleGraphOverride || hasSingleGraphAsset) {
                 val (sModel, accelLabel) = loadSingleGraphModel(
                     env = env,
-                    singleFilePath = singleFileOverride.takeIf { hasSingleGraphOverride }
+                    singleFilePath = singleFileOverride.takeIf { hasSingleGraphOverride },
+                    singleAssetName = baseMeta.singleGraphAsset
                 )
+                val compileMs = (System.nanoTime() - compileStartNs) / 1_000_000.0
                 singleModel = sModel
                 singleInputs = sModel.createInputBuffers()
                 singleOutputs = sModel.createOutputBuffers()
 
-                val boxesSize = singleOutputs.getOrNull(0)?.readFloat()?.size ?: 0
-                val perBatchBoxesFloats = metadata.numQueries * 4
-                compiledBatchSize = if (boxesSize >= perBatchBoxesFloats && perBatchBoxesFloats > 0) {
-                    (boxesSize / perBatchBoxesFloats).coerceIn(1, StripRoiGeometry.MAX_TILES)
+                val sInFloats = singleInputs[0].readFloat().size
+                val sOut0Floats = singleOutputs[0].readFloat().size
+                val sOut1Floats = singleOutputs[1].readFloat().size
+
+                activeInputResolution = requestedRes
+                activeTileFloatCount = activeInputResolution * activeInputResolution * 3
+                compiledBatchSize = if (activeTileFloatCount > 0 && sInFloats >= activeTileFloatCount) {
+                    (sInFloats / activeTileFloatCount).coerceIn(1, MAX_SUPPORTED_BATCH)
                 } else {
-                    overrideJson?.optInt("batch_size", metadata.batchSize) ?: metadata.batchSize
+                    requestedBatch.coerceIn(1, MAX_SUPPORTED_BATCH)
                 }
+
+                singleBoxesOutputIdx = if (sOut0Floats <= sOut1Floats) 0 else 1
+                singleScoresOutputIdx = 1 - singleBoxesOutputIdx
+                val boxesFloats = minOf(sOut0Floats, sOut1Floats)
+                val scoresFloats = maxOf(sOut0Floats, sOut1Floats)
+
+                val detectedQueries = if (compiledBatchSize > 0 && boxesFloats >= compiledBatchSize * 4) {
+                    boxesFloats / (compiledBatchSize * 4)
+                } else {
+                    requestedQueries
+                }
+                val detectedClasses = if (compiledBatchSize * detectedQueries > 0) {
+                    scoresFloats / (compiledBatchSize * detectedQueries)
+                } else {
+                    requestedClasses
+                }
+
+                metadata = baseMeta.copy(
+                    inputResolution = activeInputResolution,
+                    batchSize = compiledBatchSize,
+                    topology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH,
+                    numQueries = detectedQueries,
+                    numClasses = detectedClasses,
+                    cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(detectedClasses)
+                )
+
+                allocateStagingBuffersForMetadata()
                 activeTopology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH
                 activeAcceleratorLabel = accelLabel
                 hardwareGraphsLoaded = true
-                initMessage = "RF-DETR 1G B=$compiledBatchSize • $accelLabel [COCO]"
-                Log.i(TAG, "Initialized $initMessage (override=${overrideFile?.absolutePath ?: "none"})")
+                initMessage = if (overrideFile != null) {
+                    "1G ${activeInputResolution} B=${compiledBatchSize} Q=${metadata.numQueries} C=${metadata.numClasses} • $accelLabel"
+                } else {
+                    profile.statusBadge
+                }
+                Log.i(
+                    TAG,
+                    String.format(
+                        Locale.US,
+                        "Initialized %s compile_ms=%.1f res=%d batch=%d queries=%d classes=%d",
+                        initMessage,
+                        compileMs,
+                        activeInputResolution,
+                        compiledBatchSize,
+                        metadata.numQueries,
+                        metadata.numClasses
+                    )
+                )
             } else {
                 hardwareGraphsLoaded = false
                 initMessage = "LiteRT GPU Stub (missing .tflite in assets/)"
@@ -378,13 +838,42 @@ class RfDetrTwoGraphGpuDetector(
         } catch (t: Throwable) {
             hardwareGraphsLoaded = false
             initMessage = "LiteRT GPU Stub (${t.javaClass.simpleName})"
-            Log.w(TAG, "LiteRT GPU initialization fell back to stub profiler", t)
+            Log.w(TAG, "LiteRT initialization fell back to stub profiler: ${t.message}", t)
         }
     }
 
     /**
+     * Reallocates staging arrays once per model load to match the exact `TensorBuffer` dimensions
+     * (`compiledBatchSize`, `activeInputResolution`, `numEncoderTokens`, `numQueries`).
+     */
+    private fun allocateStagingBuffersForMetadata() {
+        buildResampleTables(activeInputResolution)
+        baseProposalsTable = buildNormalizedProposalGrid(
+            gridH = metadata.encoderGridH,
+            gridW = metadata.encoderGridW,
+            defaultWh = metadata.proposalDefaultWh
+        )
+        batchedInputFloats = FloatArray(compiledBatchSize * activeTileFloatCount)
+        singleTileInputFloats = FloatArray(activeTileFloatCount)
+        val directBytes = compiledBatchSize * activeTileFloatCount * Float.SIZE_BYTES
+        if (directInputByteBuffer.capacity() < directBytes) {
+            directInputByteBuffer = ByteBuffer.allocateDirect(directBytes).order(ByteOrder.nativeOrder())
+            directInputFloatBuffer = directInputByteBuffer.asFloatBuffer()
+        }
+        val k = metadata.numQueries
+        val d = metadata.hiddenDim
+        batchedSelectedPrenormFloats = FloatArray(compiledBatchSize * k * d)
+        batchedSelectedProposalsFloats = FloatArray(compiledBatchSize * k * 4)
+        singleSelectedPrenormFloats = FloatArray(k * d)
+        singleSelectedProposalsFloats = FloatArray(k * 4)
+        batchedTopIndices = IntArray(compiledBatchSize * k)
+        scratchHeapScores = FloatArray(k)
+        scratchHeapIndices = IntArray(k)
+    }
+
+    /**
      * Builds LiteRT [CompiledModel.Options] targeting `Accelerator.GPU` (FP16 precision, serialized
-     * OpenCL shader cache under `codeCacheDir`) with `Accelerator.CPU` XNNPACK fallback.
+     * OpenCL shader cache under `codeCacheDir`, optional quantized FC/Conv support) with CPU fallback.
      */
     private fun buildGpuOptions(cacheKey: String): CompiledModel.Options {
         val cacheDir = appContext.codeCacheDir.absolutePath
@@ -392,11 +881,42 @@ class RfDetrTwoGraphGpuDetector(
         return CompiledModel.Options(Accelerator.GPU, Accelerator.CPU).apply {
             gpuOptions = CompiledModel.GpuOptions(
                 constantTensorSharing = overrideConstantTensorSharing ?: true,
+                allowSrcQuantizedFcConvOps = overrideAllowQuantizedFcConv ?: true,
                 precision = CompiledModel.GpuOptions.Precision.FP16,
                 bufferStorageType = overrideBufferStorageType,
                 preferTextureWeights = overridePreferTextureWeights,
                 serializationDir = cacheDir,
                 modelCacheKey = cacheKey,
+                serializeProgramCache = true,
+                priority = CompiledModel.GpuOptions.Priority.HIGH,
+                numStepsOfCommandBufferPreparations = overrideNumStepsCmdBuffer
+            )
+            cpuOptions = CompiledModel.CpuOptions(
+                numThreads = 4,
+                xnnPackWeightCachePath = xnnCache
+            )
+        }
+    }
+
+    /**
+     * Builds LiteRT [CompiledModel.Options] targeting Google Tensor G5 `Accelerator.NPU`
+     * (either strict NPU+CPU or heterogeneous NPU+GPU+CPU).
+     */
+    private fun buildNpuOptions(cacheKey: String, allowGpuFallback: Boolean): CompiledModel.Options {
+        val cacheDir = appContext.codeCacheDir.absolutePath
+        val xnnCache = File(appContext.codeCacheDir, "xnnpack_npu_${cacheKey}.cache").absolutePath
+        val accels = if (allowGpuFallback) {
+            arrayOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
+        } else {
+            arrayOf(Accelerator.NPU, Accelerator.CPU)
+        }
+        return CompiledModel.Options(*accels).apply {
+            gpuOptions = CompiledModel.GpuOptions(
+                constantTensorSharing = true,
+                allowSrcQuantizedFcConvOps = true,
+                precision = CompiledModel.GpuOptions.Precision.FP16,
+                serializationDir = cacheDir,
+                modelCacheKey = "npu_${cacheKey}",
                 serializeProgramCache = true,
                 priority = CompiledModel.GpuOptions.Priority.HIGH
             )
@@ -407,7 +927,7 @@ class RfDetrTwoGraphGpuDetector(
         }
     }
 
-    /** Builds 4-thread XNNPACK CPU fallback [CompiledModel.Options] when the GPU delegate fails to compile. */
+    /** Builds 4-thread XNNPACK CPU fallback [CompiledModel.Options] when GPU/NPU compilation fails. */
     private fun buildCpuFallbackOptions(): CompiledModel.Options {
         val cacheFile = File(appContext.codeCacheDir, "xnnpack_weights.cache").absolutePath
         return CompiledModel.Options(Accelerator.CPU).apply {
@@ -419,88 +939,294 @@ class RfDetrTwoGraphGpuDetector(
     }
 
     /**
-     * Compiles Part 1 and Part 2 `.tflite` models for 2-Graph execution on GPU FP16, falling back
-     * to 4-thread CPU XNNPACK if GPU compilation fails.
+     * Compiles Part 1 and Part 2 `.tflite` models for 2-Graph execution on the requested accelerator
+     * (`gpu`, `npu`, `npu_strict`, `npu_p1_gpu_p2`, or `cpu`).
      */
     private fun loadTwoGraphModels(
         env: Environment,
         part1FilePath: String?,
-        part2FilePath: String?
+        part2FilePath: String?,
+        part1AssetName: String,
+        part2AssetName: String
     ): Triple<CompiledModel, CompiledModel, String> {
+        val p1Tag = (part1FilePath ?: part1AssetName).substringAfterLast('/').substringBeforeLast('.')
+        val p2Tag = (part2FilePath ?: part2AssetName).substringAfterLast('/').substringBeforeLast('.')
         return try {
-            val opt1 = buildGpuOptions("rf_detr_part1")
-            val opt2 = buildGpuOptions("rf_detr_part2")
+            val (opt1, opt2, label) = when (overrideAcceleratorMode) {
+                "npu_strict" -> Triple(
+                    buildNpuOptions(p1Tag, allowGpuFallback = false),
+                    buildNpuOptions(p2Tag, allowGpuFallback = false),
+                    "NPU STRICT"
+                )
+                "npu" -> Triple(
+                    buildNpuOptions(p1Tag, allowGpuFallback = true),
+                    buildNpuOptions(p2Tag, allowGpuFallback = true),
+                    "NPU+GPU"
+                )
+                "npu_p1_gpu_p2" -> Triple(
+                    buildNpuOptions(p1Tag, allowGpuFallback = false),
+                    buildGpuOptions(p2Tag),
+                    "NPU_P1+GPU_P2"
+                )
+                "cpu" -> Triple(
+                    buildCpuFallbackOptions(),
+                    buildCpuFallbackOptions(),
+                    "CPU XNN"
+                )
+                else -> Triple(
+                    buildGpuOptions(p1Tag),
+                    buildGpuOptions(p2Tag),
+                    "GPU FP16"
+                )
+            }
             val m1 = if (part1FilePath != null) {
                 CompiledModel.create(part1FilePath, opt1, env)
             } else {
-                CompiledModel.create(appContext.assets, metadata.part1Asset, opt1, env)
+                CompiledModel.create(appContext.assets, part1AssetName, opt1, env)
             }
             val m2 = if (part2FilePath != null) {
                 CompiledModel.create(part2FilePath, opt2, env)
             } else {
-                CompiledModel.create(appContext.assets, metadata.part2Asset, opt2, env)
+                CompiledModel.create(appContext.assets, part2AssetName, opt2, env)
             }
-            Triple(m1, m2, "GPU FP16")
-        } catch (gpuErr: Throwable) {
-            Log.w(TAG, "GPU FP16 delegate unavailable (${gpuErr.message}); falling back to CPU XNNPACK")
-            val cpuOpt = buildCpuFallbackOptions()
-            val m1 = if (part1FilePath != null) {
-                CompiledModel.create(part1FilePath, cpuOpt, env)
-            } else {
-                CompiledModel.create(appContext.assets, metadata.part1Asset, cpuOpt, env)
+            Triple(m1, m2, label)
+        } catch (accelErr: Throwable) {
+            Log.w(
+                TAG,
+                "Accelerator '$overrideAcceleratorMode' failed for 2-graph (${accelErr.message}); falling back to GPU FP16 / CPU",
+                accelErr
+            )
+            try {
+                val opt1 = buildGpuOptions(p1Tag)
+                val opt2 = buildGpuOptions(p2Tag)
+                val m1 = if (part1FilePath != null) {
+                    CompiledModel.create(part1FilePath, opt1, env)
+                } else {
+                    CompiledModel.create(appContext.assets, part1AssetName, opt1, env)
+                }
+                val m2 = if (part2FilePath != null) {
+                    CompiledModel.create(part2FilePath, opt2, env)
+                } else {
+                    CompiledModel.create(appContext.assets, part2AssetName, opt2, env)
+                }
+                Triple(m1, m2, "GPU FP16 (FB)")
+            } catch (gpuErr: Throwable) {
+                Log.w(TAG, "GPU FP16 delegate unavailable (${gpuErr.message}); falling back to CPU XNNPACK")
+                val cpuOpt = buildCpuFallbackOptions()
+                val m1 = if (part1FilePath != null) {
+                    CompiledModel.create(part1FilePath, cpuOpt, env)
+                } else {
+                    CompiledModel.create(appContext.assets, part1AssetName, cpuOpt, env)
+                }
+                val m2 = if (part2FilePath != null) {
+                    CompiledModel.create(part2FilePath, cpuOpt, env)
+                } else {
+                    CompiledModel.create(appContext.assets, part2AssetName, cpuOpt, env)
+                }
+                Triple(m1, m2, "CPU XNN")
             }
-            val m2 = if (part2FilePath != null) {
-                CompiledModel.create(part2FilePath, cpuOpt, env)
-            } else {
-                CompiledModel.create(appContext.assets, metadata.part2Asset, cpuOpt, env)
-            }
-            Triple(m1, m2, "CPU XNN")
         }
     }
 
     /**
-     * Compiles the monolithic 1-Graph `.tflite` model on GPU FP16, falling back to 4-thread CPU XNNPACK
-     * if GPU compilation fails (e.g. due to dynamic `Gather`/`TopKV2` ops).
+     * Compiles the monolithic 1-Graph `.tflite` model on the requested accelerator (`gpu`, `npu`,
+     * `npu_strict`, or `cpu`), falling back cleanly if compilation fails.
      */
     private fun loadSingleGraphModel(
         env: Environment,
-        singleFilePath: String?
+        singleFilePath: String?,
+        singleAssetName: String
     ): Pair<CompiledModel, String> {
+        val tag = (singleFilePath ?: singleAssetName).substringAfterLast('/').substringBeforeLast('.')
         return try {
-            val opt = buildGpuOptions("rf_detr_single")
+            val (opt, label) = when (overrideAcceleratorMode) {
+                "npu_strict" -> buildNpuOptions(tag, allowGpuFallback = false) to "NPU STRICT"
+                "npu", "npu_p1_gpu_p2" -> buildNpuOptions(tag, allowGpuFallback = true) to "NPU+GPU"
+                "cpu" -> buildCpuFallbackOptions() to "CPU XNN"
+                else -> buildGpuOptions(tag) to "GPU FP16"
+            }
             val m = if (singleFilePath != null) {
                 CompiledModel.create(singleFilePath, opt, env)
             } else {
-                CompiledModel.create(appContext.assets, metadata.singleGraphAsset, opt, env)
+                CompiledModel.create(appContext.assets, singleAssetName, opt, env)
             }
-            m to "GPU FP16"
-        } catch (gpuErr: Throwable) {
-            Log.w(TAG, "GPU FP16 delegate unavailable for 1-graph (${gpuErr.message}); falling back to CPU XNNPACK")
-            val cpuOpt = buildCpuFallbackOptions()
-            val m = if (singleFilePath != null) {
-                CompiledModel.create(singleFilePath, cpuOpt, env)
-            } else {
-                CompiledModel.create(appContext.assets, metadata.singleGraphAsset, cpuOpt, env)
+            m to label
+        } catch (accelErr: Throwable) {
+            Log.w(
+                TAG,
+                "Accelerator '$overrideAcceleratorMode' failed for 1-graph (${accelErr.message}); falling back",
+                accelErr
+            )
+            try {
+                val opt = buildGpuOptions(tag)
+                val m = if (singleFilePath != null) {
+                    CompiledModel.create(singleFilePath, opt, env)
+                } else {
+                    CompiledModel.create(appContext.assets, singleAssetName, opt, env)
+                }
+                m to "GPU FP16 (FB)"
+            } catch (gpuErr: Throwable) {
+                Log.w(TAG, "GPU FP16 unavailable for 1-graph (${gpuErr.message}); falling back to CPU XNNPACK")
+                val cpuOpt = buildCpuFallbackOptions()
+                val m = if (singleFilePath != null) {
+                    CompiledModel.create(singleFilePath, cpuOpt, env)
+                } else {
+                    CompiledModel.create(appContext.assets, singleAssetName, cpuOpt, env)
+                }
+                m to "CPU XNN"
             }
-            m to "CPU XNN"
         }
     }
 
     /**
-     * Stages tile float buffers into the pre-allocated direct [ByteBuffer] and flat [batchedInputFloats]
-     * array for zero-allocation `B=5` batched dispatch, zero-padding inactive trailing tiles when
-     * `activeTiles < 5` (`THREE_TILE` mode).
+     * Bilinearly resamples a single `384x384x3` NHWC float tile into [dst] starting at [dstOffset]
+     * with target resolution [activeInputResolution] using precomputed 1D index and weight tables.
      */
-    private fun stageBatchedTileInputs(sweepBuffers: PushBroomSweepBuffers, activeTiles: Int) {
-        directInputFloatBuffer.clear()
-        for (tileIdx in 0 until StripRoiGeometry.MAX_TILES) {
-            val dstOffset = tileIdx * TILE_FLOAT_COUNT
-            if (tileIdx < activeTiles) {
-                val src = sweepBuffers.tileRgbFloats[tileIdx]
-                System.arraycopy(src, 0, batchedInputFloats, dstOffset, TILE_FLOAT_COUNT)
-                directInputFloatBuffer.put(src, 0, TILE_FLOAT_COUNT)
+    private fun stageSingleResampledTile(
+        srcTile384: FloatArray,
+        dst: FloatArray,
+        dstOffset: Int
+    ) {
+        if (activeInputResolution == StripRoiGeometry.TILE_SIZE_PX) {
+            System.arraycopy(srcTile384, 0, dst, dstOffset, activeTileFloatCount)
+            return
+        }
+        val res = activeInputResolution
+        val y0Arr = resampleY0
+        val y1Arr = resampleY1
+        val wy0Arr = resampleWy0
+        val wy1Arr = resampleWy1
+        val x0Arr = resampleX0
+        val x1Arr = resampleX1
+        val wx0Arr = resampleWx0
+        val wx1Arr = resampleWx1
+
+        var outIdx = dstOffset
+        for (y in 0 until res) {
+            val row0 = y0Arr[y]
+            val row1 = y1Arr[y]
+            val wy0 = wy0Arr[y]
+            val wy1 = wy1Arr[y]
+            for (x in 0 until res) {
+                val i00 = row0 + x0Arr[x]
+                val i01 = row0 + x1Arr[x]
+                val i10 = row1 + x0Arr[x]
+                val i11 = row1 + x1Arr[x]
+                val wx0 = wx0Arr[x]
+                val wx1 = wx1Arr[x]
+
+                val w00 = wy0 * wx0
+                val w01 = wy0 * wx1
+                val w10 = wy1 * wx0
+                val w11 = wy1 * wx1
+
+                dst[outIdx++] = srcTile384[i00] * w00 + srcTile384[i01] * w01 +
+                    srcTile384[i10] * w10 + srcTile384[i11] * w11
+                dst[outIdx++] = srcTile384[i00 + 1] * w00 + srcTile384[i01 + 1] * w01 +
+                    srcTile384[i10 + 1] * w10 + srcTile384[i11 + 1] * w11
+                dst[outIdx++] = srcTile384[i00 + 2] * w00 + srcTile384[i01 + 2] * w01 +
+                    srcTile384[i10 + 2] * w10 + srcTile384[i11 + 2] * w11
+            }
+        }
+    }
+
+    /**
+     * Reconstructs the `1792x384` strip from `sweepBuffers.tileRgbFloats[0..4]` and bilinearly
+     * samples 6 overlapping `320x384 -> 256x256` tiles into [batchedInputFloats] for `B=6` mode.
+     */
+    private fun stageSixBy256TilesFromFiveTileStrip(sweepBuffers: PushBroomSweepBuffers) {
+        val stripW = StripRoiGeometry.MAX_STRIP_WIDTH_PX
+        val stripH = StripRoiGeometry.STRIP_HEIGHT_PX
+        val tileW = StripRoiGeometry.TILE_SIZE_PX
+        val stripOffsets = intArrayOf(0, 352, 704, 1056, 1408)
+
+        for (t in 0 until StripRoiGeometry.MAX_TILES) {
+            val tileSrc = sweepBuffers.tileRgbFloats[t]
+            val xStart = if (t == 0) 0 else 16
+            val copyWidth = if (t == 0) tileW else (tileW - 16)
+            val dstXBase = stripOffsets[t] + xStart
+            for (y in 0 until stripH) {
+                val srcPos = (y * tileW + xStart) * 3
+                val dstPos = (y * stripW + dstXBase) * 3
+                System.arraycopy(tileSrc, srcPos, reconstructedStripRgb, dstPos, copyWidth * 3)
+            }
+        }
+
+        val y0Arr = resampleY0
+        val y1Arr = resampleY1
+        val wy0Arr = resampleWy0
+        val wy1Arr = resampleWy1
+        val x0Arr = sixTileX0
+        val x1Arr = sixTileX1
+        val wx0Arr = sixTileWx0
+        val wx1Arr = sixTileWx1
+
+        for (b in 0 until 6) {
+            val xOffset = SIX_TILE_256_X_OFFSETS[b]
+            var outIdx = b * activeTileFloatCount
+            for (y in 0 until 256) {
+                val row0 = (y0Arr[y] / (tileW * 3)) * stripW * 3
+                val row1 = (y1Arr[y] / (tileW * 3)) * stripW * 3
+                val wy0 = wy0Arr[y]
+                val wy1 = wy1Arr[y]
+                for (x in 0 until 256) {
+                    val sx0 = (xOffset + x0Arr[x]) * 3
+                    val sx1 = (xOffset + x1Arr[x]) * 3
+                    val i00 = row0 + sx0
+                    val i01 = row0 + sx1
+                    val i10 = row1 + sx0
+                    val i11 = row1 + sx1
+                    val w00 = wy0 * wx0Arr[x]
+                    val w01 = wy0 * wx1Arr[x]
+                    val w10 = wy1 * wx0Arr[x]
+                    val w11 = wy1 * wx1Arr[x]
+
+                    batchedInputFloats[outIdx++] = reconstructedStripRgb[i00] * w00 +
+                        reconstructedStripRgb[i01] * w01 +
+                        reconstructedStripRgb[i10] * w10 +
+                        reconstructedStripRgb[i11] * w11
+                    batchedInputFloats[outIdx++] = reconstructedStripRgb[i00 + 1] * w00 +
+                        reconstructedStripRgb[i01 + 1] * w01 +
+                        reconstructedStripRgb[i10 + 1] * w10 +
+                        reconstructedStripRgb[i11 + 1] * w11
+                    batchedInputFloats[outIdx++] = reconstructedStripRgb[i00 + 2] * w00 +
+                        reconstructedStripRgb[i01 + 2] * w01 +
+                        reconstructedStripRgb[i10 + 2] * w10 +
+                        reconstructedStripRgb[i11 + 2] * w11
+                }
+            }
+        }
+    }
+
+    /**
+     * Stages tile float buffers into [batchedInputFloats] for static batched dispatch (`B=5`, `B=6`,
+     * or `B=3`), applying bilinear resampling when `activeInputResolution != 384` and Even/Odd tile
+     * selection when [useInterleaveThisSweep] is true.
+     */
+    private fun stageBatchedTileInputs(
+        sweepBuffers: PushBroomSweepBuffers,
+        activeBatchItems: Int,
+        useInterleaveThisSweep: Boolean
+    ) {
+        if (compiledBatchSize == 6 && activeInputResolution == 256) {
+            stageSixBy256TilesFromFiveTileStrip(sweepBuffers)
+            return
+        }
+        for (batchSlot in 0 until compiledBatchSize) {
+            val dstOffset = batchSlot * activeTileFloatCount
+            if (batchSlot < activeBatchItems) {
+                val srcTileIdx = if (useInterleaveThisSweep) {
+                    interleavedBatchTileMap[batchSlot]
+                } else {
+                    batchSlot.coerceIn(0, StripRoiGeometry.MAX_TILES - 1)
+                }
+                stageSingleResampledTile(
+                    srcTile384 = sweepBuffers.tileRgbFloats[srcTileIdx],
+                    dst = batchedInputFloats,
+                    dstOffset = dstOffset
+                )
             } else {
-                Arrays.fill(batchedInputFloats, dstOffset, dstOffset + TILE_FLOAT_COUNT, 0f)
+                Arrays.fill(batchedInputFloats, dstOffset, dstOffset + activeTileFloatCount, 0f)
             }
         }
     }
@@ -514,33 +1240,53 @@ class RfDetrTwoGraphGpuDetector(
         var part2NsAcc = 0L
 
         val detections = ArrayList<TileDetection>(16)
-        val activeTiles = (overrideActiveTiles ?: sweepBuffers.activeTileCount)
-            .coerceIn(1, StripRoiGeometry.MAX_TILES)
+        val requestedSwathTiles = sweepBuffers.activeTileCount.coerceIn(1, StripRoiGeometry.MAX_TILES)
+        val useInterleaveThisSweep = interleaveEvenOdd &&
+            compiledBatchSize == 3 &&
+            requestedSwathTiles == StripRoiGeometry.MAX_TILES &&
+            overrideActiveTiles == null
+
+        if (useInterleaveThisSweep) {
+            if (sweepCount % 2L == 0L) {
+                interleavedBatchTileMap[0] = 0
+                interleavedBatchTileMap[1] = 2
+                interleavedBatchTileMap[2] = 4
+            } else {
+                interleavedBatchTileMap[0] = 1
+                interleavedBatchTileMap[1] = 3
+                interleavedBatchTileMap[2] = priorityEvenTileIndex.coerceIn(0, 4)
+            }
+        }
+
+        val activeBatchItems = when {
+            compiledBatchSize == 6 && activeInputResolution == 256 -> 6
+            useInterleaveThisSweep -> 3
+            else -> (overrideActiveTiles ?: requestedSwathTiles).coerceIn(1, compiledBatchSize.coerceAtLeast(1))
+        }
 
         val m1 = part1Model
         val m2 = part2Model
         val sModel = singleModel
 
         if (hardwareGraphsLoaded && activeTopology == CocoStandInMetadata.TOPOLOGY_TWO_GRAPH && m1 != null && m2 != null) {
-            if (compiledBatchSize >= StripRoiGeometry.MAX_TILES) {
-                // Static B=5 batched 2-Graph GPU execution (single JNI/GPU dispatch for all 5 tiles)
+            if (compiledBatchSize > 1) {
+                // Static batched (B=5, B=6, or B=3 Interleaved) 2-Graph execution
                 val t0 = System.nanoTime()
-                stageBatchedTileInputs(sweepBuffers, activeTiles)
+                stageBatchedTileInputs(sweepBuffers, activeBatchItems, useInterleaveThisSweep)
                 part1Inputs[0].writeFloat(batchedInputFloats)
                 m1.run(part1Inputs, part1Outputs)
-                val encMemory = part1Outputs[0].readFloat()
                 val encPrenorm = part1Outputs[1].readFloat()
                 val encMaxScores = part1Outputs[2].readFloat()
                 val t1 = System.nanoTime()
                 part1NsAcc += (t1 - t0)
 
-                // Stage 2: Host Top-300 query proposal gather across B=5 tiles
+                // Stage 2: Host Top-K query proposal gather across activeBatchItems
                 selectTopKProposalsFromMaxScores(
                     encMaxScores = encMaxScores,
                     outputMemoryPrenorm = encPrenorm,
                     baseProposals = baseProposalsTable,
-                    batchSize = StripRoiGeometry.MAX_TILES,
-                    activeBatchItems = activeTiles,
+                    batchSize = compiledBatchSize,
+                    activeBatchItems = activeBatchItems,
                     numTokens = metadata.numEncoderTokens,
                     hiddenDim = metadata.hiddenDim,
                     topK = metadata.numQueries,
@@ -553,33 +1299,42 @@ class RfDetrTwoGraphGpuDetector(
                 val t2 = System.nanoTime()
                 bridgeNsAcc += (t2 - t1)
 
-                // Stage 3: Decoder + Detection Head on GPU FP16
-                part2Inputs[0].writeFloat(encMemory)
+                // Stage 3: Decoder + Detection Head on GPU FP16 (zero-copy encMemory passthrough when supported)
                 part2Inputs[1].writeFloat(batchedSelectedPrenormFloats)
                 part2Inputs[2].writeFloat(batchedSelectedProposalsFloats)
-                m2.run(part2Inputs, part2Outputs)
-                val predBoxes = part2Outputs[0].readFloat()
-                val predScores = part2Outputs[1].readFloat()
+                if (useZeroCopyEncMemory) {
+                    try {
+                        m2.run(part2ZeroCopyInputs, part2Outputs)
+                    } catch (zeroCopyErr: Throwable) {
+                        Log.w(TAG, "Zero-copy encMemory passthrough unsupported (${zeroCopyErr.message}); using CPU copy")
+                        useZeroCopyEncMemory = false
+                        part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                        m2.run(part2Inputs, part2Outputs)
+                    }
+                } else {
+                    part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                    m2.run(part2Inputs, part2Outputs)
+                }
+                val predBoxes = part2Outputs[part2BoxesOutputIdx].readFloat()
+                val predScores = part2Outputs[part2ScoresOutputIdx].readFloat()
                 val t3 = System.nanoTime()
                 part2NsAcc += (t3 - t2)
 
-                decodeCocoBatchPredictions(
-                    activeTileCount = activeTiles,
+                decodeBatchedOutputsWithMode(
+                    activeBatchItems = activeBatchItems,
+                    useInterleaveThisSweep = useInterleaveThisSweep,
                     boxesCxCyWhNorm = predBoxes,
                     classScores = predScores,
-                    metadata = metadata,
-                    confidenceThreshold = confidenceThreshold,
                     outDetections = detections
                 )
             } else {
-                // Sequential 5 x B=1 2-Graph GPU execution
-                for (tileIdx in 0 until activeTiles) {
-                    val tileFloats = sweepBuffers.tileRgbFloats[tileIdx]
+                // Sequential N x B=1 2-Graph execution
+                val seqTiles = (overrideActiveTiles ?: requestedSwathTiles).coerceIn(1, StripRoiGeometry.MAX_TILES)
+                for (tileIdx in 0 until seqTiles) {
                     val t0 = System.nanoTime()
-                    System.arraycopy(tileFloats, 0, singleTileInputFloats, 0, TILE_FLOAT_COUNT)
+                    stageSingleResampledTile(sweepBuffers.tileRgbFloats[tileIdx], singleTileInputFloats, 0)
                     part1Inputs[0].writeFloat(singleTileInputFloats)
                     m1.run(part1Inputs, part1Outputs)
-                    val encMemory = part1Outputs[0].readFloat()
                     val encPrenorm = part1Outputs[1].readFloat()
                     val encMaxScores = part1Outputs[2].readFloat()
                     val t1 = System.nanoTime()
@@ -603,12 +1358,22 @@ class RfDetrTwoGraphGpuDetector(
                     val t2 = System.nanoTime()
                     bridgeNsAcc += (t2 - t1)
 
-                    part2Inputs[0].writeFloat(encMemory)
                     part2Inputs[1].writeFloat(singleSelectedPrenormFloats)
                     part2Inputs[2].writeFloat(singleSelectedProposalsFloats)
-                    m2.run(part2Inputs, part2Outputs)
-                    val predBoxes = part2Outputs[0].readFloat()
-                    val predScores = part2Outputs[1].readFloat()
+                    if (useZeroCopyEncMemory) {
+                        try {
+                            m2.run(part2ZeroCopyInputs, part2Outputs)
+                        } catch (zeroCopyErr: Throwable) {
+                            useZeroCopyEncMemory = false
+                            part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                            m2.run(part2Inputs, part2Outputs)
+                        }
+                    } else {
+                        part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                        m2.run(part2Inputs, part2Outputs)
+                    }
+                    val predBoxes = part2Outputs[part2BoxesOutputIdx].readFloat()
+                    val predScores = part2Outputs[part2ScoresOutputIdx].readFloat()
                     val t3 = System.nanoTime()
                     part2NsAcc += (t3 - t2)
 
@@ -624,35 +1389,33 @@ class RfDetrTwoGraphGpuDetector(
                 }
             }
         } else if (hardwareGraphsLoaded && activeTopology == CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH && sModel != null) {
-            if (compiledBatchSize >= StripRoiGeometry.MAX_TILES) {
-                // Static B=5 batched 1-Graph execution
+            if (compiledBatchSize > 1) {
+                // Static batched 1-Graph execution (RF-DETR 1G or YOLO26n/s)
                 val t0 = System.nanoTime()
-                stageBatchedTileInputs(sweepBuffers, activeTiles)
+                stageBatchedTileInputs(sweepBuffers, activeBatchItems, useInterleaveThisSweep)
                 singleInputs[0].writeFloat(batchedInputFloats)
                 sModel.run(singleInputs, singleOutputs)
-                val predBoxes = singleOutputs[0].readFloat()
-                val predScores = singleOutputs[1].readFloat()
+                val predBoxes = singleOutputs[singleBoxesOutputIdx].readFloat()
+                val predScores = singleOutputs[singleScoresOutputIdx].readFloat()
                 val t1 = System.nanoTime()
                 part1NsAcc += (t1 - t0)
 
-                decodeCocoBatchPredictions(
-                    activeTileCount = activeTiles,
+                decodeBatchedOutputsWithMode(
+                    activeBatchItems = activeBatchItems,
+                    useInterleaveThisSweep = useInterleaveThisSweep,
                     boxesCxCyWhNorm = predBoxes,
                     classScores = predScores,
-                    metadata = metadata,
-                    confidenceThreshold = confidenceThreshold,
                     outDetections = detections
                 )
             } else {
-                // Sequential 5 x B=1 1-Graph execution
-                for (tileIdx in 0 until activeTiles) {
-                    val tileFloats = sweepBuffers.tileRgbFloats[tileIdx]
+                val seqTiles = (overrideActiveTiles ?: requestedSwathTiles).coerceIn(1, StripRoiGeometry.MAX_TILES)
+                for (tileIdx in 0 until seqTiles) {
                     val t0 = System.nanoTime()
-                    System.arraycopy(tileFloats, 0, singleTileInputFloats, 0, TILE_FLOAT_COUNT)
+                    stageSingleResampledTile(sweepBuffers.tileRgbFloats[tileIdx], singleTileInputFloats, 0)
                     singleInputs[0].writeFloat(singleTileInputFloats)
                     sModel.run(singleInputs, singleOutputs)
-                    val predBoxes = singleOutputs[0].readFloat()
-                    val predScores = singleOutputs[1].readFloat()
+                    val predBoxes = singleOutputs[singleBoxesOutputIdx].readFloat()
+                    val predScores = singleOutputs[singleScoresOutputIdx].readFloat()
                     val t1 = System.nanoTime()
                     part1NsAcc += (t1 - t0)
 
@@ -669,7 +1432,7 @@ class RfDetrTwoGraphGpuDetector(
             }
         } else {
             // Stubbed profiler fallback when .tflite assets are absent in unit tests
-            for (tileIdx in 0 until activeTiles) {
+            for (tileIdx in 0 until requestedSwathTiles) {
                 val tileFloats = sweepBuffers.tileRgbFloats[tileIdx]
                 val t0 = System.nanoTime()
                 val sampleEnergy = tileFloats[0] + tileFloats[tileFloats.size / 2] + tileFloats[tileFloats.size - 1]
@@ -714,11 +1477,13 @@ class RfDetrTwoGraphGpuDetector(
                 TAG,
                 String.format(
                     Locale.US,
-                    "RFDETR_BENCH sweep=%d topology=%s batch=%d tiles=%d accel=%s total_ms=%.2f p1_ms=%.2f topk_ms=%.2f p2_ms=%.2f rolling_ms=%.2f dets=%d",
+                    "RFDETR_BENCH sweep=%d topology=%s res=%d batch=%d tiles=%d intlv=%b accel=%s total_ms=%.2f p1_ms=%.2f topk_ms=%.2f p2_ms=%.2f rolling_ms=%.2f dets=%d",
                     sweepCount,
                     activeTopology,
+                    activeInputResolution,
                     compiledBatchSize,
-                    activeTiles,
+                    activeBatchItems,
+                    useInterleaveThisSweep,
                     activeAcceleratorLabel.replace(' ', '_'),
                     totalMs,
                     p1Ms,
@@ -741,6 +1506,94 @@ class RfDetrTwoGraphGpuDetector(
         )
     }
 
+    /**
+     * Decodes batched predictions for standard `B=5`, `6x256` (`B=6`), or Track 4 `B=3` Even/Odd
+     * Sub-Swath Interleaving (updating the 1-sweep opposite-parity cache so all 5 tiles are emitted).
+     */
+    private fun decodeBatchedOutputsWithMode(
+        activeBatchItems: Int,
+        useInterleaveThisSweep: Boolean,
+        boxesCxCyWhNorm: FloatArray,
+        classScores: FloatArray,
+        outDetections: MutableList<TileDetection>
+    ) {
+        if (compiledBatchSize == 6 && activeInputResolution == 256) {
+            val raw6 = ArrayList<TileDetection>(16)
+            for (b in 0 until 6) {
+                raw6.clear()
+                decodeCocoSingleTilePredictions(
+                    tileIndex = 0,
+                    batchElementIndex = b,
+                    boxesCxCyWhNorm = boxesCxCyWhNorm,
+                    classScores = classScores,
+                    metadata = metadata,
+                    confidenceThreshold = confidenceThreshold,
+                    outDetections = raw6
+                )
+                val stripXOffset = SIX_TILE_256_X_OFFSETS[b].toFloat()
+                val scaleX = SIX_TILE_WINDOW_WIDTH_PX.toFloat() / StripRoiGeometry.TILE_SIZE_PX.toFloat()
+                val mappedTileIdx = ((b * 4) / 5).coerceIn(0, 4)
+                val targetTileStripOffset = (mappedTileIdx * StripRoiGeometry.TILE_STRIDE_PX).toFloat()
+                for (d in raw6) {
+                    val stripL = stripXOffset + d.leftPx * scaleX
+                    val stripR = stripXOffset + d.rightPx * scaleX
+                    outDetections.add(
+                        d.copy(
+                            tileIndex = mappedTileIdx,
+                            leftPx = (stripL - targetTileStripOffset).coerceIn(0f, 384f),
+                            rightPx = (stripR - targetTileStripOffset).coerceIn(0f, 384f)
+                        )
+                    )
+                }
+            }
+            return
+        }
+
+        if (useInterleaveThisSweep) {
+            var bestEvenScore = -1f
+            var bestEvenTile = priorityEvenTileIndex
+            for (slot in 0 until activeBatchItems) {
+                val tileIdx = interleavedBatchTileMap[slot]
+                val cache = cachedTileDetections[tileIdx]
+                cache.clear()
+                decodeCocoSingleTilePredictions(
+                    tileIndex = tileIdx,
+                    batchElementIndex = slot,
+                    boxesCxCyWhNorm = boxesCxCyWhNorm,
+                    classScores = classScores,
+                    metadata = metadata,
+                    confidenceThreshold = confidenceThreshold,
+                    outDetections = cache
+                )
+                cachedTileSweepStamp[tileIdx] = sweepCount
+                if (tileIdx % 2 == 0) {
+                    for (det in cache) {
+                        if (det.classId != StoneClass.HARD_CONFUSER.id && det.confidence > bestEvenScore) {
+                            bestEvenScore = det.confidence
+                            bestEvenTile = tileIdx
+                        }
+                    }
+                }
+            }
+            priorityEvenTileIndex = bestEvenTile
+            for (tileIdx in 0 until StripRoiGeometry.MAX_TILES) {
+                if (sweepCount - cachedTileSweepStamp[tileIdx] <= 1L) {
+                    outDetections.addAll(cachedTileDetections[tileIdx])
+                }
+            }
+            return
+        }
+
+        decodeCocoBatchPredictions(
+            activeTileCount = activeBatchItems,
+            boxesCxCyWhNorm = boxesCxCyWhNorm,
+            classScores = classScores,
+            metadata = metadata,
+            confidenceThreshold = confidenceThreshold,
+            outDetections = outDetections
+        )
+    }
+
     /** Closes all native LiteRT [TensorBuffer], [CompiledModel], and [Environment] handles. */
     private fun releaseModelsOnly() {
         singleInputs.forEach { runCatching { it.close() } }
@@ -759,6 +1612,7 @@ class RfDetrTwoGraphGpuDetector(
         part1Outputs = emptyList()
         part2Inputs = emptyList()
         part2Outputs = emptyList()
+        part2ZeroCopyInputs = emptyList()
         singleModel = null
         part1Model = null
         part2Model = null
@@ -776,8 +1630,12 @@ class RfDetrTwoGraphGpuDetector(
         const val PART2_ASSET_NAME = CocoStandInMetadata.PART2_ASSET_NAME
         const val SINGLE_GRAPH_ASSET_NAME = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME
 
-        private const val TILE_FLOAT_COUNT =
+        private const val MAX_SUPPORTED_BATCH = 6
+        private const val DEFAULT_TILE_FLOAT_COUNT =
             StripRoiGeometry.TILE_SIZE_PX * StripRoiGeometry.TILE_SIZE_PX * 3
+        private const val SIX_TILE_WINDOW_WIDTH_PX = 320
+        private val SIX_TILE_256_X_OFFSETS = intArrayOf(0, 294, 588, 882, 1176, 1472)
+        private const val INTRA_TILE_NMS_IOU_THRESHOLD = 0.45f
 
         const val TOP_K_QUERIES = 100
         const val DEFAULT_ENCODER_ANCHORS = 900
@@ -786,9 +1644,8 @@ class RfDetrTwoGraphGpuDetector(
 
         /**
          * Parses `rf_detr_coco_metadata.json` into a [CocoStandInMetadata] instance, building the
-         * `O(1)` integer array lookup table mapping sparse MS-COCO class indices (`cup=47`,
-         * `apple=53`, `toothbrush=90`, `remote=75`) to [StoneClass.id] and all other indices to
-         * [StoneClass.HARD_CONFUSER].
+         * `O(1)` integer array lookup table mapping MS-COCO class indices to [StoneClass.id] and
+         * all other indices to [StoneClass.HARD_CONFUSER].
          *
          * @param jsonString Raw JSON content of `rf_detr_coco_metadata.json`.
          * @param defaultThreshold Fallback score threshold if omitted from JSON.
@@ -880,7 +1737,7 @@ class RfDetrTwoGraphGpuDetector(
 
         /**
          * Precomputes the static `[gridH * gridW, 4]` normalized `[cx, cy, w, h]` proposal anchor
-         * grid matching `RFDETRNano`'s $24 \times 24$ ($576$-token) encoder grid.
+         * grid matching `RFDETRNano`'s encoder grid ($24 \times 24$, $20 \times 20$, or $16 \times 16$).
          *
          * @param gridH Spatial height of the encoder grid (`24` default).
          * @param gridW Spatial width of the encoder grid (`24` default).
@@ -908,27 +1765,13 @@ class RfDetrTwoGraphGpuDetector(
         }
 
         /**
-         * Zero-allocation Host CPU Top-K ($K=300$ out of $576$) proposal bridge between Part 1 and
+         * Zero-allocation Host CPU Top-K ($K=100$ or $K=300$) proposal bridge between Part 1 and
          * Part 2 of the 2-Graph `RF-DETR-Nano` LiteRT split.
          *
          * For each batch item `b in 0 until activeBatchItems`, selects the [topK] spatial tokens
          * with highest `encMaxScores[b, token]` (breaking ties by smaller token index to match
          * `torch.topk(..., sorted=True)`) and gathers both their `outputMemoryPrenorm` vectors
          * (`[topK, hiddenDim]`) and their normalized `baseProposals` (`[topK, 4]`).
-         *
-         * @param encMaxScores Flattened `[batchSize, numTokens]` max-class proposal scores from Part 1 output 2.
-         * @param outputMemoryPrenorm Flattened `[batchSize, numTokens, hiddenDim]` pre-normalized encoder memory from Part 1 output 1.
-         * @param baseProposals Flattened `[numTokens, 4]` static proposal grid from [buildNormalizedProposalGrid].
-         * @param batchSize Compiled batch size of the Part 1 / Part 2 tensors (`5` or `1`).
-         * @param activeBatchItems Number of active tiles in the current sweep (`1..batchSize`); trailing batch slots are zero-filled.
-         * @param numTokens Total spatial encoder tokens per tile (`576`).
-         * @param hiddenDim Feature embedding dimension (`256`).
-         * @param topK Number of top-scoring queries to select per tile (`300`).
-         * @param outSelectedPrenorm Pre-allocated destination buffer of size `batchSize * topK * hiddenDim`.
-         * @param outSelectedProposals Pre-allocated destination buffer of size `batchSize * topK * 4`.
-         * @param outSelectedIndices Pre-allocated destination buffer of size `batchSize * topK` receiving selected token indices.
-         * @param scratchHeapScores Pre-allocated min-heap score scratchpad of length [topK].
-         * @param scratchHeapIndices Pre-allocated min-heap index scratchpad of length [topK].
          */
         fun selectTopKProposalsFromMaxScores(
             encMaxScores: FloatArray,
@@ -1042,7 +1885,7 @@ class RfDetrTwoGraphGpuDetector(
                     worst = right
                 }
                 if (!isWorseCandidate(
-                        heapScores[ worst],
+                        heapScores[worst],
                         heapIndices[worst],
                         heapScores[idx],
                         heapIndices[idx]
@@ -1072,13 +1915,6 @@ class RfDetrTwoGraphGpuDetector(
          * Decodes batched (`[B, numQueries, 4]` and `[B, numQueries, numClasses]`) COCO stand-in
          * predictions across `0 until activeTileCount` into [TileDetection] instances using the
          * class routing table in [metadata].
-         *
-         * @param activeTileCount Number of active tiles in the sweep (`1..5`).
-         * @param boxesCxCyWhNorm Flattened `[B, numQueries, 4]` normalized `[cx, cy, w, h]` box predictions in `[0, 1]`.
-         * @param classScores Flattened `[B, numQueries, numClasses]` class probabilities (or raw logits when `!metadata.scoresAreProbabilities`).
-         * @param metadata Parsed [CocoStandInMetadata] routing configuration.
-         * @param confidenceThreshold Minimum class probability required to emit a [TileDetection].
-         * @param outDetections Destination list to which decoded [TileDetection]s are appended.
          */
         fun decodeCocoBatchPredictions(
             activeTileCount: Int,
@@ -1105,13 +1941,9 @@ class RfDetrTwoGraphGpuDetector(
          * Decodes a single tile's `[numQueries, 4]` normalized `[cx, cy, w, h]` boxes and
          * `[numQueries, numClasses]` probabilities/logits at [batchElementIndex] into [outDetections].
          *
-         * @param tileIndex Logical push-broom tile index (`0..4`) stamped onto emitted [TileDetection]s.
-         * @param batchElementIndex Batch slice offset (`0` for `B=1` sequential dispatch, or `tileIndex` for `B=5` batched dispatch).
-         * @param boxesCxCyWhNorm Flattened `[B, numQueries, 4]` normalized `[cx, cy, w, h]` box tensor.
-         * @param classScores Flattened `[B, numQueries, numClasses]` score tensor.
-         * @param metadata Parsed [CocoStandInMetadata] routing configuration.
-         * @param confidenceThreshold Minimum class probability required to emit a [TileDetection].
-         * @param outDetections Destination list to which decoded [TileDetection]s are appended.
+         * When `metadata.numQueries > 300` (dense anchor models like `YOLO26`), applies intra-tile
+         * greedy NMS (`IoU >= 0.45`) so duplicate same-tile anchor predictions are suppressed before
+         * cross-tile seam stitching.
          */
         fun decodeCocoSingleTilePredictions(
             tileIndex: Int,
@@ -1136,6 +1968,7 @@ class RfDetrTwoGraphGpuDetector(
                 return
             }
 
+            val startIdx = outDetections.size
             for (q in 0 until numQueries) {
                 val scoreBase = batchScoreOffset + q * numClasses
                 var bestCocoClass = 0
@@ -1182,21 +2015,56 @@ class RfDetrTwoGraphGpuDetector(
                     )
                 )
             }
+
+            // Apply intra-tile greedy NMS when decoding dense anchor models (e.g., YOLO26 with 3024 anchors)
+            val addedCount = outDetections.size - startIdx
+            if (numQueries > CocoStandInMetadata.DEFAULT_COCO_TOP_K_QUERIES && addedCount > 1) {
+                val slice = ArrayList<TileDetection>(addedCount)
+                for (i in startIdx until outDetections.size) {
+                    slice.add(outDetections[i])
+                }
+                for (i in outDetections.size - 1 downTo startIdx) {
+                    outDetections.removeAt(i)
+                }
+                slice.sortByDescending { it.confidence }
+                for (cand in slice) {
+                    var suppressed = false
+                    for (k in startIdx until outDetections.size) {
+                        val kept = outDetections[k]
+                        if (kept.classId == cand.classId &&
+                            tileDetectionIou(kept, cand) >= INTRA_TILE_NMS_IOU_THRESHOLD
+                        ) {
+                            suppressed = true
+                            break
+                        }
+                    }
+                    if (!suppressed) {
+                        outDetections.add(cand)
+                    }
+                }
+            }
+        }
+
+        /** Computes 2D Intersection-over-Union between two tile-local [TileDetection] boxes. */
+        private fun tileDetectionIou(a: TileDetection, b: TileDetection): Float {
+            val interL = max(a.leftPx, b.leftPx)
+            val interT = max(a.topPx, b.topPx)
+            val interR = min(a.rightPx, b.rightPx)
+            val interB = min(a.bottomPx, b.bottomPx)
+            val interW = (interR - interL).coerceAtLeast(0f)
+            val interH = (interB - interT).coerceAtLeast(0f)
+            val interArea = interW * interH
+            if (interArea <= 0f) return 0f
+            val areaA = (a.rightPx - a.leftPx).coerceAtLeast(0f) * (a.bottomPx - a.topPx).coerceAtLeast(0f)
+            val areaB = (b.rightPx - b.leftPx).coerceAtLeast(0f) * (b.bottomPx - b.topPx).coerceAtLeast(0f)
+            val union = areaA + areaB - interArea
+            return if (union > 0f) interArea / union else 0f
         }
 
         /**
          * Host CPU Top-K ($K=100$) object query selection bridge for raw `[numAnchors, numClasses]`
          * encoder logits. Selects the [topK] anchor positions with highest max-class logit and
          * gathers their feature vectors contiguously into [outQueryFeatures].
-         *
-         * @param encoderLogits Flattened `[numAnchors, numClasses]` raw class logits.
-         * @param encoderFeatures Flattened `[numAnchors, hiddenDim]` encoder feature embeddings.
-         * @param numAnchors Number of spatial anchor tokens (`900` default).
-         * @param numClasses Number of classes per anchor (`5` default).
-         * @param hiddenDim Embedding dimension per anchor (`256` default).
-         * @param topK Number of top-scoring anchors to select (`100` default).
-         * @param outQueryFeatures Destination array of length `topK * hiddenDim`.
-         * @param outSelectedIndices Destination array of length `topK` receiving selected anchor indices.
          */
         fun selectTopKQueriesOnHost(
             encoderLogits: FloatArray,
@@ -1291,12 +2159,6 @@ class RfDetrTwoGraphGpuDetector(
         /**
          * Decodes normalized `[cx, cy, w, h]` boxes and raw 5-class logits into [TileDetection]
          * instances in `[0, 384]` tile pixel coordinates.
-         *
-         * @param tileIndex Push-broom tile index (`0..4`).
-         * @param boxesCxCyWhNorm Flattened `[numQueries, 4]` normalized `[cx, cy, w, h]` boxes.
-         * @param classLogits Flattened `[numQueries, NUM_CLASSES]` raw class logits (sigmoid applied internally).
-         * @param confidenceThreshold Minimum sigmoid probability required to retain a detection.
-         * @param outDetections Destination list to which decoded [TileDetection]s are appended.
          */
         fun decodeTilePredictions(
             tileIndex: Int,

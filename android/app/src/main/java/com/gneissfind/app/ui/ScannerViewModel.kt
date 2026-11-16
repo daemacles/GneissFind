@@ -1,9 +1,10 @@
 /*
  * AndroidViewModel coordinating the live push-broom camera stream, 120 Hz IMU pitch stabilization,
- * tile cropping, stone detection, 3D temporal voting, audio sonification, and field strip logging.
+ * double-buffered async tile cropping, stone detection, 3D temporal voting, audio sonification,
+ * and field strip logging.
  *
- * Exposes immutable ScannerUiState to Compose while decoupling display-rate EIS translation and
- * 120 Hz world-ray reticle reprojection from analyzer-rate inference sweeps.
+ * Exposes immutable ScannerUiState to Compose while decoupling display-rate EIS translation,
+ * camera-rate YUV strip extraction (< 4 ms ImageProxy lifetime), and inference-rate GPU/NPU sweeps.
  *
  * Main types:
  * - DetectorSourceOption: selectable live GPU and synthetic simulation sources in the LCARS SOURCE drawer.
@@ -13,6 +14,7 @@
 package com.gneissfind.app.ui
 
 import android.app.Application
+import android.os.SystemClock
 import android.view.Surface
 import androidx.camera.core.ImageProxy
 import androidx.camera.view.PreviewView
@@ -21,6 +23,7 @@ import androidx.lifecycle.LifecycleOwner
 import com.gneissfind.app.audio.MetalDetectorSonifier
 import com.gneissfind.app.camera.CameraExposureTelemetry
 import com.gneissfind.app.camera.PushBroomCameraController
+import com.gneissfind.app.inference.LiveModelProfile
 import com.gneissfind.app.inference.RfDetrTwoGraphGpuDetector
 import com.gneissfind.app.inference.SyntheticStoneDetector
 import com.gneissfind.app.inference.SyntheticTargetProfile
@@ -35,6 +38,7 @@ import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
+import com.gneissfind.app.tracking.MotionPoseSnapshot
 import com.gneissfind.app.tracking.ProjectedCandidate
 import com.gneissfind.app.tracking.TemporalTargetTracker
 import com.gneissfind.app.vision.ImageProxyYuv420Frame
@@ -44,16 +48,21 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.atan2
 import kotlin.math.roundToInt
 
 /**
  * Selectable detection input sources presented inside the scrollable LCARS `SOURCE` drawer.
  *
- * @property code Short LCARS index prefix displayed on the drawer row (`S-01`..`S-05`).
+ * @property code Short LCARS index prefix displayed on the drawer row (`S-01`..`S-09`).
  * @property title Primary uppercase label shown on the drawer row and collapsed `SOURCE` button.
  * @property subtitle Secondary description displayed inside the expanded selection drawer.
  * @property backend Underlying [DetectorBackend] activated when this source is selected.
+ * @property liveProfile Optional [LiveModelProfile] when [backend] is [DetectorBackend.RF_DETR_NANO_GPU].
  * @property syntheticProfile Optional [SyntheticTargetProfile] when [backend] is synthetic.
  */
 enum class DetectorSourceOption(
@@ -61,38 +70,67 @@ enum class DetectorSourceOption(
     val title: String,
     val subtitle: String,
     val backend: DetectorBackend,
-    val syntheticProfile: SyntheticTargetProfile?
+    val liveProfile: LiveModelProfile? = null,
+    val syntheticProfile: SyntheticTargetProfile? = null
 ) {
     LIVE_CAMERA_GPU(
         code = "S-01",
-        title = "RF-DETR NANO GPU",
-        subtitle = "COCO PROXY • REALTIME CAMERA",
+        title = "RF-DETR 256 B=3 W8-DYN",
+        subtitle = "APACHE-2.0 • 9.2 FPS COLD / 6.6 FPS SOAK",
         backend = DetectorBackend.RF_DETR_NANO_GPU,
-        syntheticProfile = null
+        liveProfile = LiveModelProfile.RFDETR_NANO_256_B3_INTERLEAVED
+    ),
+    LIVE_RFDETR_320_INTERLEAVED(
+        code = "S-02",
+        title = "RF-DETR 320 B=3 W8-DYN",
+        subtitle = "APACHE-2.0 • 100% SMALL RECALL • 7.1 FPS",
+        backend = DetectorBackend.RF_DETR_NANO_GPU,
+        liveProfile = LiveModelProfile.RFDETR_NANO_320_B3_INTERLEAVED
+    ),
+    LIVE_RFDETR_256_FULL_B5(
+        code = "S-03",
+        title = "RF-DETR 256 B=5 W8-DYN",
+        subtitle = "APACHE-2.0 • ALL 5 TILES EVERY SWEEP • 6.3 FPS",
+        backend = DetectorBackend.RF_DETR_NANO_GPU,
+        liveProfile = LiveModelProfile.RFDETR_NANO_256_B5_K100
+    ),
+    LIVE_YOLO26S_384_GPU(
+        code = "S-04",
+        title = "YOLO26-S 384 B=5 GPU",
+        subtitle = "AGPL-3.0 BENCHMARK • 13.1 FPS COLD / 7.8 FPS SOAK",
+        backend = DetectorBackend.RF_DETR_NANO_GPU,
+        liveProfile = LiveModelProfile.YOLO26S_384_B5_GPU
+    ),
+    LIVE_RFDETR_384_BASELINE(
+        code = "S-05",
+        title = "RF-DETR 384 B=5 BASE",
+        subtitle = "APACHE-2.0 • M2 BASELINE (K=300 • 2.8 FPS)",
+        backend = DetectorBackend.RF_DETR_NANO_GPU,
+        liveProfile = LiveModelProfile.RFDETR_NANO_384_BASELINE
     ),
     SIM_MIXED_GRAVEL(
-        code = "S-02",
+        code = "S-06",
         title = "MIXED GRAVEL SIM",
         subtitle = "MULTI-CLASS SYNTHETIC WALK STREAM",
         backend = DetectorBackend.SYNTHETIC_DEMO,
         syntheticProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK
     ),
     SIM_AGATE_20MM(
-        code = "S-03",
+        code = "S-07",
         title = "20MM AGATE (780HZ)",
         subtitle = "SMALL PEBBLE • HIGH-PITCH SONIFIER TEST",
         backend = DetectorBackend.SYNTHETIC_DEMO,
         syntheticProfile = SyntheticTargetProfile.PEBBLE_20MM_HIGH_PITCH
     ),
     SIM_JASPER_55MM(
-        code = "S-04",
+        code = "S-08",
         title = "55MM JASPER (320HZ)",
         subtitle = "LARGE COBBLE • LOW-PITCH SONIFIER TEST",
         backend = DetectorBackend.SYNTHETIC_DEMO,
         syntheticProfile = SyntheticTargetProfile.COBBLE_55MM_LOW_PITCH
     ),
     SIM_CONFUSER_MUTE(
-        code = "S-05",
+        code = "S-09",
         title = "CONFUSER MUTE SIM",
         subtitle = "BASALT / QUARTZITE • SILENT REJECTION",
         backend = DetectorBackend.SYNTHETIC_DEMO,
@@ -102,52 +140,13 @@ enum class DetectorSourceOption(
 
 /**
  * Immutable snapshot of the scanner's complete state consumed by `ScannerScreen`.
- *
- * @property operatingMode Active operating mode ([OperatingMode.SCAN] or [OperatingMode.LOG_DATA]).
- * @property detectorBackend Active inference backend ([DetectorBackend.RF_DETR_NANO_GPU] default).
- * @property syntheticProfile Active simulation scenario when [detectorBackend] is [DetectorBackend.SYNTHETIC_DEMO].
- * @property detectorStatus Human-readable backend status string rendered in the LCARS `SOURCE` drawer.
- * @property enabledClasses Subset of user-alertable [StoneClass]es (`01..04`) currently enabled in the left rail.
- * @property swathTileMode Active horizontal tile swath ([SwathTileMode.FIVE_TILE] `1792x384` or [SwathTileMode.THREE_TILE] `1088x384`).
- * @property shutterClampEnabled Whether manual `<= 1/500 s` shutter clamping (`EXP CLAMP`) is enabled.
- * @property twoXCropEnabled Whether `2.0x` lossless center sensor crop (`2X CROP`) is enabled.
- * @property eisPitchLockEnabled Whether IMU software EIS pitch stabilization (`EIS LOCK`) is enabled.
- * @property exposureBiasEv Active canopy exposure compensation bias in EV stops (`-2.0..+1.0 EV`).
- * @property isAudioMuted Whether `MetalDetectorSonifier` audio output is muted.
- * @property simulatedSpeedOverrideMps Non-null when the synthetic overspeed test (`OVERSPEED SIM`) is active.
- * @property displaySurfaceRotation Active reversible-landscape [Surface] rotation ([Surface.ROTATION_90] or [Surface.ROTATION_270]).
- * @property stripGeometry Active push-broom strip ROI geometry inside the `1920x1080` camera frame.
- * @property rawStripDetections Unconfirmed single-sweep detections in unified strip pixel coordinates.
- * @property confirmedTargets Confirmed targets (with 120 Hz ego-motion-reprojected strip coordinates and visibility flags).
- * @property speedState Current walking speed state ([ScanSpeedState.Normal] or [ScanSpeedState.SpeedWarning]).
- * @property imuPitchDeg Smoothed downward optical pitch in degrees (`0` = horizon, `45` = nominal, `90` = nadir).
- * @property rollDeg Smoothed landscape screen roll angle in degrees.
- * @property referencePitchDeg Active EIS pitch setpoint in degrees (`45.0 deg` default).
- * @property cropY Quantized integer top Y offset (`0..696 px`) of the stabilized `384 px` strip on the `1080p` frame.
- * @property displayCropYFloat Continuous sub-pixel top Y offset (`0f..696f px`) driving 120 Hz GPU `PreviewView.translationY`.
- * @property isPitchClamped `true` when [displayCropYFloat] hits `0` or [StripRoiGeometry.MAX_CROP_Y_PX] (`PITCH LIMIT`).
- * @property verticalFocalLengthPx Calibrated vertical focal length $f_y$ in `1080p` stream pixels.
- * @property slantRangeMeters Estimated optical slant range $R$ in meters along the strip center.
- * @property gsdMmPerPx Estimated ground sample distance in millimeters per pixel (`0.59 mm/px` nominal).
- * @property sweepLatencyMs Wall-clock latency of the most recent inference sweep in milliseconds.
- * @property rollingLatencyMs Exponential moving average of sweep latency in milliseconds.
- * @property sweepHz Smoothed camera analyzer sweep rate in Hz.
- * @property part1LatencyMs Latency of Part 1 (backbone + encoder) in milliseconds.
- * @property bridgeLatencyMs Latency of the Host CPU Top-K query bridge in milliseconds.
- * @property part2LatencyMs Latency of Part 2 (decoder + head) in milliseconds.
- * @property exposureTimeNs Current sensor exposure time in nanoseconds.
- * @property sensorIso Current sensor sensitivity in ISO units.
- * @property activeZoomRatio Current CameraX zoom ratio (`2.0f` or `1.0f`).
- * @property audioPitchHz Current `MetalDetectorSonifier` tone frequency in Hz (`0f` when silent).
- * @property audioCadenceHz Current `MetalDetectorSonifier` ping repetition rate in Hz (`0f` when silent).
- * @property loggedFrameCount Number of lossless PNG strip frames saved in the current `LOG DATA` session.
- * @property fieldLogDirectory Absolute filesystem path of the active (or base) `LOG DATA` session directory.
  */
 data class ScannerUiState(
     val operatingMode: OperatingMode = OperatingMode.SCAN,
     val detectorBackend: DetectorBackend = DetectorBackend.RF_DETR_NANO_GPU,
+    val liveModelProfile: LiveModelProfile = LiveModelProfile.RFDETR_NANO_256_B3_INTERLEAVED,
     val syntheticProfile: SyntheticTargetProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK,
-    val detectorStatus: String = "RF-DETR NANO GPU [COCO PROXY]",
+    val detectorStatus: String = LiveModelProfile.RFDETR_NANO_256_B3_INTERLEAVED.statusBadge,
     val enabledClasses: Set<StoneClass> = StoneClass.alertableClasses.toSet(),
     val swathTileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
     val shutterClampEnabled: Boolean = true,
@@ -184,15 +183,32 @@ data class ScannerUiState(
     val loggedFrameCount: Int = 0,
     val fieldLogDirectory: String = ""
 ) {
-    /** Resolves the currently active [DetectorSourceOption] from [detectorBackend] and [syntheticProfile]. */
+    /** Resolves the currently active [DetectorSourceOption] from [detectorBackend], [liveModelProfile], and [syntheticProfile]. */
     val activeSourceOption: DetectorSourceOption
         get() = if (detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
-            DetectorSourceOption.LIVE_CAMERA_GPU
+            DetectorSourceOption.entries.firstOrNull {
+                it.backend == DetectorBackend.RF_DETR_NANO_GPU && it.liveProfile == liveModelProfile
+            } ?: DetectorSourceOption.LIVE_CAMERA_GPU
         } else {
             DetectorSourceOption.entries.firstOrNull {
                 it.backend == DetectorBackend.SYNTHETIC_DEMO && it.syntheticProfile == syntheticProfile
             } ?: DetectorSourceOption.SIM_MIXED_GRAVEL
         }
+}
+
+/**
+ * Pre-allocated staging slot used by the lock-free producer-consumer handoff between
+ * `GneissFind-Analyzer` (YUV strip extraction) and `GneissFind-Inference` (GPU/NPU execution).
+ */
+private class PreparedSweepSlot {
+    val sweepBuffers = PushBroomSweepBuffers()
+    val inUseByConsumer = AtomicBoolean(false)
+    var poseSnapshot: MotionPoseSnapshot? = null
+    var geometry: StripRoiGeometry = StripRoiGeometry()
+    var exposureTelemetry: CameraExposureTelemetry = CameraExposureTelemetry()
+    var stateSnapshot: ScannerUiState = ScannerUiState()
+    var centerGsdMmPerPx: Float = PushBroomCropper.DEFAULT_GSD_MM_PER_PX
+    var frameTimestampNs: Long = 0L
 }
 
 /**
@@ -202,20 +218,37 @@ data class ScannerUiState(
  * - **120 Hz IMU Display Loop (Main Thread):** [GroundPlaneRaycaster.onRealtimeImuPitchListener] updates
  *   [ScannerUiState.displayCropYFloat] and reprojects [ScannerUiState.confirmedTargets] through the live `3x3`
  *   rotation matrix so the GPU `PreviewView` and target reticles remain ego-motion-locked at display refresh rate.
- * - **Analyzer Sweep Loop (`GneissFind-Analyzer` Thread):** [processCameraFrameOnAnalyzerThread] extracts the
- *   stabilized YUV strip into [sweepBuffers], runs [RfDetrTwoGraphGpuDetector] or [SyntheticStoneDetector],
- *   merges cross-tile boxes via [PushBroomCropper], back-projects 3D world rays at the frame's capture timestamp,
- *   updates [TemporalTargetTracker], and drives [MetalDetectorSonifier].
+ * - **Camera YUV Producer (`GneissFind-Analyzer` Thread):** [processCameraFrameOnAnalyzerThread] extracts the
+ *   stabilized YUV strip into a free [PreparedSweepSlot] in `~3 ms` and **closes [ImageProxy] immediately** so
+ *   Camera2's Gralloc queue is never blocked during GPU inference.
+ * - **GPU/NPU Inference Consumer (`GneissFind-Inference` Thread):** [drainLatestSweepOnInferenceThread] consumes
+ *   the newest prepared slot with zero wait time, runs [RfDetrTwoGraphGpuDetector] or [SyntheticStoneDetector],
+ *   merges cross-tile boxes, back-projects 3D world rays, updates [TemporalTargetTracker], and drives [MetalDetectorSonifier].
  */
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appContext = application.applicationContext
 
     private val cropper = PushBroomCropper(applyImageNetNormalization = false)
-    private val sweepBuffers = PushBroomSweepBuffers()
+
+    // 3-buffer ring so the camera analyzer thread and GPU inference thread never contend or allocate
+    private val slotRing = Array(3) { PreparedSweepSlot() }
+    private val latestReadySlot = AtomicReference<PreparedSweepSlot?>(null)
+    private val inferenceRunning = AtomicBoolean(false)
+    private val isShuttingDown = AtomicBoolean(false)
+    private var lastProducerExtractWallMs: Long = 0L
+
+    private val inferenceExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "GneissFind-Inference").apply {
+            priority = Thread.MAX_PRIORITY - 1
+        }
+    }
 
     private val syntheticDetector = SyntheticStoneDetector()
-    private val rfDetrGpuDetector = RfDetrTwoGraphGpuDetector(appContext)
+    private val rfDetrGpuDetector = RfDetrTwoGraphGpuDetector(
+        appContext = appContext,
+        initialProfile = LiveModelProfile.RFDETR_NANO_256_B3_INTERLEAVED
+    )
 
     private val raycaster = GroundPlaneRaycaster(appContext)
     private val tracker = TemporalTargetTracker()
@@ -227,7 +260,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         onFrameAvailable = ::processCameraFrameOnAnalyzerThread
     )
 
-    private var lastFrameTimestampNs: Long = 0L
+    private var lastCompletedSweepWallNs: Long = 0L
     private var smoothedSweepHz: Float = 0f
     private val displayRotationMatrixScratch = FloatArray(9)
 
@@ -340,8 +373,6 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Switches between [OperatingMode.SCAN] and [OperatingMode.LOG_DATA].
-     * Entering [OperatingMode.LOG_DATA] automatically enables the shutter clamp and opens a new [FieldDataLogger] session;
-     * returning to [OperatingMode.SCAN] closes the active logging session.
      */
     fun setOperatingMode(mode: OperatingMode) {
         if (mode == OperatingMode.LOG_DATA) {
@@ -369,6 +400,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     /** Switches the active [DetectorBackend] and resets [TemporalTargetTracker] tracks. */
     fun setDetectorBackend(backend: DetectorBackend) {
         tracker.reset()
+        lastCompletedSweepWallNs = 0L
+        smoothedSweepHz = 0f
         _uiState.update { it.copy(detectorBackend = backend) }
     }
 
@@ -376,6 +409,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun setSyntheticProfile(profile: SyntheticTargetProfile) {
         syntheticDetector.profile = profile
         tracker.reset()
+        lastCompletedSweepWallNs = 0L
+        smoothedSweepHz = 0f
         _uiState.update {
             it.copy(
                 detectorBackend = DetectorBackend.SYNTHETIC_DEMO,
@@ -390,13 +425,20 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
      */
     fun selectSourceOption(option: DetectorSourceOption) {
         tracker.reset()
+        lastCompletedSweepWallNs = 0L
+        smoothedSweepHz = 0f
+        option.liveProfile?.let { profile ->
+            rfDetrGpuDetector.setLiveModelProfile(profile)
+        }
         option.syntheticProfile?.let { profile ->
             syntheticDetector.profile = profile
         }
         _uiState.update { prev ->
             prev.copy(
                 detectorBackend = option.backend,
-                syntheticProfile = option.syntheticProfile ?: prev.syntheticProfile
+                liveModelProfile = option.liveProfile ?: prev.liveModelProfile,
+                syntheticProfile = option.syntheticProfile ?: prev.syntheticProfile,
+                detectorStatus = option.liveProfile?.statusBadge ?: prev.detectorStatus
             )
         }
     }
@@ -528,201 +570,285 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Executes one full perception-and-tracking sweep on the single-threaded `GneissFind-Analyzer` worker
-     * for each incoming `1920x1080` `YUV_420_888` [imageProxy] and always closes [imageProxy] in `finally`.
+     * Producer stage on `GneissFind-Analyzer`: extracts the pitch-stabilized YUV strip into a free
+     * [PreparedSweepSlot] in `~3 ms`, **closes [imageProxy] immediately**, and triggers the
+     * decoupled `GneissFind-Inference` worker.
      */
     private fun processCameraFrameOnAnalyzerThread(
         imageProxy: ImageProxy,
         exposureTelemetry: CameraExposureTelemetry
     ) {
+        val slot: PreparedSweepSlot
+        val stateSnapshot: ScannerUiState
+        val isLoggingMode: Boolean
+        val tileMode: SwathTileMode
+        val poseSnapshot: MotionPoseSnapshot
+        val centerGsdMmPerPx: Float
+        val geometry: StripRoiGeometry
+        val frameTs: Long
+
         try {
-            val stateSnapshot = _uiState.value
-            val isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
-            val tileMode = stateSnapshot.swathTileMode
-            val frameTs = imageProxy.imageInfo.timestamp
-
-            if (lastFrameTimestampNs != 0L && frameTs > lastFrameTimestampNs) {
-                val dtSec = (frameTs - lastFrameTimestampNs) * 1e-9f
-                if (dtSec in 0.005f..1.0f) {
-                    val instHz = 1.0f / dtSec
-                    smoothedSweepHz = if (smoothedSweepHz <= 0.1f) {
-                        instHz
-                    } else {
-                        smoothedSweepHz * 0.80f + instHz * 0.20f
-                    }
-                }
+            if (isShuttingDown.get()) return
+            val nowWallMs = SystemClock.elapsedRealtime()
+            // Avoid redundant 30 Hz CPU YUV decoding if an unread frame is already staged and < 22 ms old
+            if (inferenceRunning.get() &&
+                latestReadySlot.get() != null &&
+                (nowWallMs - lastProducerExtractWallMs) < 22L
+            ) {
+                return
             }
-            lastFrameTimestampNs = frameTs
 
-            // 1. Capture timestamp-matched IMU pose, stabilized cropY in [0..696], slant range R, & speed
-            val poseSnapshot = raycaster.capturePoseSnapshot(
+            val freeSlot = slotRing.firstOrNull { candidate ->
+                !candidate.inUseByConsumer.get() && candidate !== latestReadySlot.get()
+            } ?: return
+
+            slot = freeSlot
+            lastProducerExtractWallMs = nowWallMs
+            stateSnapshot = _uiState.value
+            isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
+            tileMode = stateSnapshot.swathTileMode
+            frameTs = imageProxy.imageInfo.timestamp
+
+            poseSnapshot = raycaster.capturePoseSnapshot(
                 arFrame = null,
                 fallbackTimestampNs = frameTs,
                 verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
             )
             val activeZoom = exposureTelemetry.activeZoomRatio
-            val centerGsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(
+            centerGsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(
                 slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
                 zoomRatio = activeZoom
             )
 
-            // 2. Zero-copy YUV_420_888 stabilized strip extraction (1792x384 5-tile or 1088x384 3-tile)
             val yuvFrame = ImageProxyYuv420Frame(imageProxy)
-            val geometry = cropper.extractTiles(
+            geometry = cropper.extractTiles(
                 frame = yuvFrame,
-                outBuffers = sweepBuffers,
+                outBuffers = slot.sweepBuffers,
                 cropY = poseSnapshot.cropY,
                 tileMode = tileMode,
                 isPitchClamped = poseSnapshot.isPitchClamped,
                 populateArgbStrip = isLoggingMode
             )
+        } finally {
+            // Release Camera2 ImageReader Gralloc buffer immediately after ~3 ms CPU YUV extraction!
+            imageProxy.close()
+        }
 
-            // 3. Optional LOG DATA lossless strip + metadata.jsonl persistence (4 Hz)
-            if (isLoggingMode && sweepBuffers.hasArgbPixels) {
-                fieldLogger.maybeRecordStripFrame(
-                    stripArgbPixels = sweepBuffers.stripArgbPixels,
-                    metadata = FieldStripMetadata(
-                        timestampNs = yuvFrame.timestampNs,
-                        wallTimeMs = System.currentTimeMillis(),
-                        stripWidthPx = tileMode.stripWidthPx,
-                        stripHeightPx = StripRoiGeometry.STRIP_HEIGHT_PX,
-                        tileCount = tileMode.tileCount,
-                        zoomRatio = activeZoom,
-                        exposureTimeNs = exposureTelemetry.exposureTimeNs,
-                        sensorIso = exposureTelemetry.sensorIso,
-                        shutterClamped = stateSnapshot.shutterClampEnabled,
-                        exposureBiasEv = stateSnapshot.exposureBiasEv,
-                        imuPitchDeg = poseSnapshot.forwardPitchDeg,
-                        referencePitchDeg = poseSnapshot.referencePitchDeg,
-                        cropY = poseSnapshot.cropY,
-                        isPitchClamped = poseSnapshot.isPitchClamped,
-                        slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
-                        gsdMmPerPx = centerGsdMmPerPx,
-                        horizontalSpeedMps = poseSnapshot.horizontalSpeedMps
-                    )
-                )
-            }
-
-            // 4. Run active StoneDetector across the 5 (or 3) tiles
-            val activeDetector = when (stateSnapshot.detectorBackend) {
-                DetectorBackend.SYNTHETIC_DEMO -> syntheticDetector
-                DetectorBackend.RF_DETR_NANO_GPU -> rfDetrGpuDetector
-            }
-            val inferenceResult = activeDetector.detectSweep(sweepBuffers)
-
-            // 5. Map tile boxes to unified strip, run Cross-Tile NMS (IoU >= 0.45),
-            //    mute Class 4 (hard_confuser), and enforce >= 20 mm physical diameter
-            val filteredDetections = cropper.mergeAndFilterTileDetections(
-                tileDetections = inferenceResult.tileDetections,
-                tileMode = tileMode,
-                gsdMmPerPx = centerGsdMmPerPx,
-                enabledClasses = stateSnapshot.enabledClasses
-            )
-
-            // 6. Raycast detections onto ground plane & update 3-of-6 spatial voting + 1.10 m/s speed gate
-            val anchorWorldRays = stateSnapshot.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU
-            val projectedCandidates = filteredDetections.map { det ->
-                val raycast = raycaster.raycastStripDetection(
-                    detection = det,
-                    geometry = geometry,
-                    poseSnapshot = poseSnapshot,
-                    zoomRatio = activeZoom
-                )
-                ProjectedCandidate(
-                    stripDetection = det,
-                    worldPosition = raycast.worldPoint,
-                    slantRangeMeters = raycast.slantRangeMeters,
-                    refinedDiameterMm = det.maxSpanPx * raycast.gsdMmPerPx,
-                    worldRay = if (anchorWorldRays) raycast.worldRay else null,
-                    angularWidthRad = if (anchorWorldRays) raycast.angularWidthRad else 0f,
-                    angularHeightRad = if (anchorWorldRays) raycast.angularHeightRad else 0f
-                )
-            }
-
-            val trackerOutput = tracker.updateSweep(
-                candidates = projectedCandidates,
-                timestampNs = yuvFrame.timestampNs,
-                cameraWorldPos = poseSnapshot.cameraWorldPosition,
-                currentSpeedMps = poseSnapshot.horizontalSpeedMps
-            )
-
-            // Reproject confirmed targets from frame capture time (t_capture) to current live
-            // display orientation (t_now) so ~390 ms GPU inference latency does not offset reticles.
-            val useLiveImuDisplay = raycaster.hasLiveImuStream
-            val currentDisplayCropY = if (useLiveImuDisplay) {
-                _uiState.value.displayCropYFloat
-            } else {
-                poseSnapshot.cropY.toFloat()
-            }
-            val reprojectedConfirmed = if (anchorWorldRays && trackerOutput.confirmedTargets.isNotEmpty()) {
-                raycaster.reprojectConfirmedTargetsToCurrentPose(
-                    targets = trackerOutput.confirmedTargets,
-                    stripGeometry = geometry,
-                    currentCropYFloat = currentDisplayCropY,
-                    currentFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
-                )
-            } else {
-                trackerOutput.confirmedTargets
-            }
-
-            // 7. Drive AudioTrack sonifier (strictly reserved for stone pings & overspeed warning)
-            sonifier.updateTargets(
-                confirmedTargets = reprojectedConfirmed.filter { it.isVisibleInStrip },
-                speedState = trackerOutput.speedState
-            )
-            val audioTel = sonifier.latestTelemetry
-
-            _uiState.update { prev ->
-                prev.copy(
-                    detectorStatus = activeDetector.statusSummary,
-                    stripGeometry = geometry,
-                    rawStripDetections = filteredDetections,
-                    confirmedTargets = reprojectedConfirmed,
-                    speedState = trackerOutput.speedState,
-                    imuPitchDeg = if (useLiveImuDisplay) prev.imuPitchDeg else poseSnapshot.forwardPitchDeg,
-                    rollDeg = if (useLiveImuDisplay) prev.rollDeg else poseSnapshot.rollDeg,
-                    referencePitchDeg = if (useLiveImuDisplay) prev.referencePitchDeg else poseSnapshot.referencePitchDeg,
-                    cropY = if (useLiveImuDisplay) prev.cropY else poseSnapshot.cropY,
-                    displayCropYFloat = if (useLiveImuDisplay) {
-                        prev.displayCropYFloat
-                    } else {
-                        poseSnapshot.cropY.toFloat()
-                    },
-                    isPitchClamped = if (useLiveImuDisplay) prev.isPitchClamped else poseSnapshot.isPitchClamped,
-                    verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx,
-                    slantRangeMeters = if (useLiveImuDisplay) prev.slantRangeMeters else poseSnapshot.centerSlantRangeMeters,
-                    gsdMmPerPx = if (useLiveImuDisplay) {
-                        PushBroomCropper.computeGsdMmPerPx(prev.slantRangeMeters, activeZoom)
-                    } else {
-                        centerGsdMmPerPx
-                    },
-                    sweepLatencyMs = inferenceResult.totalSweepLatencyMs,
-                    rollingLatencyMs = inferenceResult.rollingAvgLatencyMs,
-                    sweepHz = smoothedSweepHz,
-                    part1LatencyMs = inferenceResult.part1LatencyMs,
-                    bridgeLatencyMs = inferenceResult.hostTopKBridgeLatencyMs,
-                    part2LatencyMs = inferenceResult.part2LatencyMs,
+        // Optional LOG DATA lossless strip + metadata.jsonl persistence (4 Hz)
+        if (isLoggingMode && slot.sweepBuffers.hasArgbPixels) {
+            fieldLogger.maybeRecordStripFrame(
+                stripArgbPixels = slot.sweepBuffers.stripArgbPixels,
+                metadata = FieldStripMetadata(
+                    timestampNs = frameTs,
+                    wallTimeMs = System.currentTimeMillis(),
+                    stripWidthPx = tileMode.stripWidthPx,
+                    stripHeightPx = StripRoiGeometry.STRIP_HEIGHT_PX,
+                    tileCount = tileMode.tileCount,
+                    zoomRatio = exposureTelemetry.activeZoomRatio,
                     exposureTimeNs = exposureTelemetry.exposureTimeNs,
                     sensorIso = exposureTelemetry.sensorIso,
-                    activeZoomRatio = activeZoom,
-                    audioPitchHz = audioTel.currentPitchHz,
-                    audioCadenceHz = audioTel.currentPingCadenceHz,
-                    loggedFrameCount = fieldLogger.savedFrameCount,
-                    fieldLogDirectory = fieldLogger.currentSessionPath
+                    shutterClamped = stateSnapshot.shutterClampEnabled,
+                    exposureBiasEv = stateSnapshot.exposureBiasEv,
+                    imuPitchDeg = poseSnapshot.forwardPitchDeg,
+                    referencePitchDeg = poseSnapshot.referencePitchDeg,
+                    cropY = poseSnapshot.cropY,
+                    isPitchClamped = poseSnapshot.isPitchClamped,
+                    slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
+                    gsdMmPerPx = centerGsdMmPerPx,
+                    horizontalSpeedMps = poseSnapshot.horizontalSpeedMps
                 )
+            )
+        }
+
+        slot.poseSnapshot = poseSnapshot
+        slot.geometry = geometry
+        slot.exposureTelemetry = exposureTelemetry
+        slot.stateSnapshot = stateSnapshot
+        slot.centerGsdMmPerPx = centerGsdMmPerPx
+        slot.frameTimestampNs = frameTs
+
+        latestReadySlot.set(slot)
+        scheduleInferenceDrainIfNeeded()
+    }
+
+    /** Schedules [drainLatestSweepOnInferenceThread] on [inferenceExecutor] when idle. */
+    private fun scheduleInferenceDrainIfNeeded() {
+        if (isShuttingDown.get()) return
+        if (inferenceRunning.compareAndSet(false, true)) {
+            try {
+                inferenceExecutor.execute(::drainLatestSweepOnInferenceThread)
+            } catch (_: Throwable) {
+                inferenceRunning.set(false)
+            }
+        }
+    }
+
+    /**
+     * Consumer stage on `GneissFind-Inference`: continuously drains the newest [PreparedSweepSlot]
+     * from [latestReadySlot], running GPU/NPU inference, cross-tile NMS, 3D raycasting, temporal
+     * tracking, and audio sonification without waiting for the next camera frame arrival.
+     */
+    private fun drainLatestSweepOnInferenceThread() {
+        try {
+            while (!isShuttingDown.get()) {
+                val slot = latestReadySlot.getAndSet(null) ?: break
+                slot.inUseByConsumer.set(true)
+                try {
+                    runInferenceSweepForSlot(slot)
+                } finally {
+                    slot.inUseByConsumer.set(false)
+                }
             }
         } finally {
-            imageProxy.close()
+            inferenceRunning.set(false)
+            if (!isShuttingDown.get() && latestReadySlot.get() != null) {
+                scheduleInferenceDrainIfNeeded()
+            }
+        }
+    }
+
+    /** Executes inference, cross-tile stitch, 3D raycast, tracking, and UI update for [slot]. */
+    private fun runInferenceSweepForSlot(slot: PreparedSweepSlot) {
+        val stateSnapshot = slot.stateSnapshot
+        val poseSnapshot = slot.poseSnapshot ?: return
+        val geometry = slot.geometry
+        val exposureTelemetry = slot.exposureTelemetry
+        val tileMode = stateSnapshot.swathTileMode
+        val activeZoom = exposureTelemetry.activeZoomRatio
+        val centerGsdMmPerPx = slot.centerGsdMmPerPx
+
+        val activeDetector = when (stateSnapshot.detectorBackend) {
+            DetectorBackend.SYNTHETIC_DEMO -> syntheticDetector
+            DetectorBackend.RF_DETR_NANO_GPU -> rfDetrGpuDetector
+        }
+        val inferenceResult = activeDetector.detectSweep(slot.sweepBuffers)
+
+        // Compute true completed inference sweep rate (Hz) from wall-clock completion delta
+        val nowWallNs = System.nanoTime()
+        if (lastCompletedSweepWallNs != 0L && nowWallNs > lastCompletedSweepWallNs) {
+            val dtSec = (nowWallNs - lastCompletedSweepWallNs) * 1e-9f
+            if (dtSec in 0.005f..2.0f) {
+                val instHz = 1.0f / dtSec
+                smoothedSweepHz = if (smoothedSweepHz <= 0.1f) {
+                    instHz
+                } else {
+                    smoothedSweepHz * 0.80f + instHz * 0.20f
+                }
+            }
+        }
+        lastCompletedSweepWallNs = nowWallNs
+
+        val filteredDetections = cropper.mergeAndFilterTileDetections(
+            tileDetections = inferenceResult.tileDetections,
+            tileMode = tileMode,
+            gsdMmPerPx = centerGsdMmPerPx,
+            enabledClasses = _uiState.value.enabledClasses
+        )
+
+        val anchorWorldRays = stateSnapshot.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU
+        val projectedCandidates = filteredDetections.map { det ->
+            val raycast = raycaster.raycastStripDetection(
+                detection = det,
+                geometry = geometry,
+                poseSnapshot = poseSnapshot,
+                zoomRatio = activeZoom
+            )
+            ProjectedCandidate(
+                stripDetection = det,
+                worldPosition = raycast.worldPoint,
+                slantRangeMeters = raycast.slantRangeMeters,
+                refinedDiameterMm = det.maxSpanPx * raycast.gsdMmPerPx,
+                worldRay = if (anchorWorldRays) raycast.worldRay else null,
+                angularWidthRad = if (anchorWorldRays) raycast.angularWidthRad else 0f,
+                angularHeightRad = if (anchorWorldRays) raycast.angularHeightRad else 0f
+            )
+        }
+
+        val trackerOutput = tracker.updateSweep(
+            candidates = projectedCandidates,
+            timestampNs = slot.frameTimestampNs,
+            cameraWorldPos = poseSnapshot.cameraWorldPosition,
+            currentSpeedMps = poseSnapshot.horizontalSpeedMps
+        )
+
+        val useLiveImuDisplay = raycaster.hasLiveImuStream
+        val currentDisplayCropY = if (useLiveImuDisplay) {
+            _uiState.value.displayCropYFloat
+        } else {
+            poseSnapshot.cropY.toFloat()
+        }
+        val reprojectedConfirmed = if (anchorWorldRays && trackerOutput.confirmedTargets.isNotEmpty()) {
+            raycaster.reprojectConfirmedTargetsToCurrentPose(
+                targets = trackerOutput.confirmedTargets,
+                stripGeometry = geometry,
+                currentCropYFloat = currentDisplayCropY,
+                currentFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
+            )
+        } else {
+            trackerOutput.confirmedTargets
+        }
+
+        sonifier.updateTargets(
+            confirmedTargets = reprojectedConfirmed.filter { it.isVisibleInStrip },
+            speedState = trackerOutput.speedState
+        )
+        val audioTel = sonifier.latestTelemetry
+
+        _uiState.update { prev ->
+            prev.copy(
+                detectorStatus = activeDetector.statusSummary,
+                stripGeometry = geometry,
+                rawStripDetections = filteredDetections,
+                confirmedTargets = reprojectedConfirmed,
+                speedState = trackerOutput.speedState,
+                imuPitchDeg = if (useLiveImuDisplay) prev.imuPitchDeg else poseSnapshot.forwardPitchDeg,
+                rollDeg = if (useLiveImuDisplay) prev.rollDeg else poseSnapshot.rollDeg,
+                referencePitchDeg = if (useLiveImuDisplay) prev.referencePitchDeg else poseSnapshot.referencePitchDeg,
+                cropY = if (useLiveImuDisplay) prev.cropY else poseSnapshot.cropY,
+                displayCropYFloat = if (useLiveImuDisplay) {
+                    prev.displayCropYFloat
+                } else {
+                    poseSnapshot.cropY.toFloat()
+                },
+                isPitchClamped = if (useLiveImuDisplay) prev.isPitchClamped else poseSnapshot.isPitchClamped,
+                verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx,
+                slantRangeMeters = if (useLiveImuDisplay) prev.slantRangeMeters else poseSnapshot.centerSlantRangeMeters,
+                gsdMmPerPx = if (useLiveImuDisplay) {
+                    PushBroomCropper.computeGsdMmPerPx(prev.slantRangeMeters, activeZoom)
+                } else {
+                    centerGsdMmPerPx
+                },
+                sweepLatencyMs = inferenceResult.totalSweepLatencyMs,
+                rollingLatencyMs = inferenceResult.rollingAvgLatencyMs,
+                sweepHz = smoothedSweepHz,
+                part1LatencyMs = inferenceResult.part1LatencyMs,
+                bridgeLatencyMs = inferenceResult.hostTopKBridgeLatencyMs,
+                part2LatencyMs = inferenceResult.part2LatencyMs,
+                exposureTimeNs = exposureTelemetry.exposureTimeNs,
+                sensorIso = exposureTelemetry.sensorIso,
+                activeZoomRatio = activeZoom,
+                audioPitchHz = audioTel.currentPitchHz,
+                audioCadenceHz = audioTel.currentPingCadenceHz,
+                loggedFrameCount = fieldLogger.savedFrameCount,
+                fieldLogDirectory = fieldLogger.currentSessionPath
+            )
         }
     }
 
     override fun onCleared() {
         super.onCleared()
+        isShuttingDown.set(true)
+        latestReadySlot.set(null)
         sonifier.close()
         raycaster.close()
         fieldLogger.close()
         cameraController.close()
-        syntheticDetector.close()
-        rfDetrGpuDetector.close()
+        runCatching {
+            inferenceExecutor.submit {
+                syntheticDetector.close()
+                rfDetrGpuDetector.close()
+            }.get(2, TimeUnit.SECONDS)
+        }
+        inferenceExecutor.shutdownNow()
     }
 }

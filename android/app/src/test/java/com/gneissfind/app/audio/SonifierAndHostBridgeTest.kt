@@ -21,6 +21,7 @@ package com.gneissfind.app.audio
 import android.media.AudioAttributes
 import android.view.Surface
 import com.gneissfind.app.camera.PushBroomCameraController
+import com.gneissfind.app.inference.CocoStandInMetadata
 import com.gneissfind.app.inference.RfDetrTwoGraphGpuDetector
 import com.gneissfind.app.logging.FieldDataLogger
 import com.gneissfind.app.logging.FieldStripMetadata
@@ -342,4 +343,50 @@ class SonifierAndHostBridgeTest {
         assertThat(parsed.getDouble("slant_range_m")).isWithin(0.02).of(1.50)
         assertThat(parsed.getDouble("gsd_mm_px")).isWithin(0.02).of(0.59)
     }
+
+    @Test
+    fun contiguous80ClassLutAndIntraTileNms_suppressDuplicateYoloAnchorsAndMapStandIns() {
+        val lut80 = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(numClasses = 80)
+        assertThat(lut80[41]).isEqualTo(StoneClass.CHALCEDONY_AGATE.id)
+        assertThat(lut80[47]).isEqualTo(StoneClass.JASPER_RED_YELLOW.id)
+        assertThat(lut80[79]).isEqualTo(StoneClass.GREEN_GEM_ROCK.id)
+        assertThat(lut80[65]).isEqualTo(StoneClass.PETRIFIED_WOOD.id)
+        assertThat(lut80[0]).isEqualTo(StoneClass.HARD_CONFUSER.id)
+
+        val yoloMeta = CocoStandInMetadata(
+            modelName = "yolo26s_b5_384",
+            numQueries = 3024,
+            numClasses = 80,
+            cocoClassIdToStoneClassId = lut80
+        )
+        val boxes = FloatArray(3024 * 4)
+        val scores = FloatArray(3024 * 80)
+
+        // Two nearly identical overlapping anchors for apple (class 47 -> JASPER_RED_YELLOW)
+        boxes[0] = 0.50f; boxes[1] = 0.50f; boxes[2] = 0.12f; boxes[3] = 0.12f
+        scores[0 * 80 + 47] = 0.88f
+
+        boxes[4] = 0.51f; boxes[5] = 0.50f; boxes[6] = 0.13f; boxes[7] = 0.12f
+        scores[1 * 80 + 47] = 0.72f
+
+        // Disjoint anchor for cup (class 41 -> CHALCEDONY_AGATE)
+        boxes[8] = 0.20f; boxes[9] = 0.20f; boxes[10] = 0.10f; boxes[11] = 0.10f
+        scores[2 * 80 + 41] = 0.81f
+
+        val decoded = ArrayList<TileDetection>()
+        RfDetrTwoGraphGpuDetector.decodeCocoSingleTilePredictions(
+            tileIndex = 2,
+            batchElementIndex = 0,
+            boxesCxCyWhNorm = boxes,
+            classScores = scores,
+            metadata = yoloMeta,
+            outDetections = decoded
+        )
+
+        assertThat(decoded).hasSize(2)
+        assertThat(decoded[0].classId).isEqualTo(StoneClass.JASPER_RED_YELLOW.id)
+        assertThat(decoded[0].confidence).isWithin(0.001f).of(0.88f)
+        assertThat(decoded[1].classId).isEqualTo(StoneClass.CHALCEDONY_AGATE.id)
+    }
 }
+

@@ -7,7 +7,7 @@ activityCompose = "1.10.1"
 composeBom = "2025.12.01"
 camerax = "1.5.3"
 arcore = "1.57.0"
-litert = "2.3.0"
+litert = "2.3.2"
 coroutines = "1.10.2"
 junit = "4.13.2"
 truth = "1.4.4"
@@ -35,7 +35,9 @@ androidx-camera-view = { group = "androidx.camera", name = "camera-view", versio
 
 google-ar-core = { group = "com.google.ar", name = "core", version.ref = "arcore" }
 litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "litert" }
+litert-api = { group = "com.google.ai.edge.litert", name = "litert-api", version.ref = "litert" }
 litert-gpu = { group = "com.google.ai.edge.litert", name = "litert-gpu", version.ref = "litert" }
+litert-npu-google-tensor = { group = "com.google.ai.edge.litert", name = "litert-npu-runtime-google-tensor", version.ref = "litert" }
 
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
