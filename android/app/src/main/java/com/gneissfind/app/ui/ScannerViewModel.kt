@@ -46,6 +46,7 @@ import com.gneissfind.app.model.WorldPoint3D
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
 import com.gneissfind.app.tracking.LockOnPinpointController
 import com.gneissfind.app.tracking.MotionPoseSnapshot
+import com.gneissfind.app.tracking.OpenCvConstellationTracker
 import com.gneissfind.app.tracking.PatrolDutyCycleController
 import com.gneissfind.app.tracking.ProjectedCandidate
 import com.gneissfind.app.tracking.TemporalTargetTracker
@@ -224,6 +225,8 @@ private class PreparedSweepSlot {
     var isLockOnSlot: Boolean = false
     var lockOnCropLeftPx: Int = 0
     var lockOnCropTopPx: Int = 0
+    var lockOnCropSizePx: Int = PushBroomCropper.LOCK_ON_CROP_SIZE_PX
+    val lockOnCamPosEnu = FloatArray(3)
     var poseSnapshot: MotionPoseSnapshot? = null
     var geometry: StripRoiGeometry = StripRoiGeometry()
     var exposureTelemetry: CameraExposureTelemetry = CameraExposureTelemetry()
@@ -989,7 +992,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 fallbackTimestampNs = frameTs,
                 verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
             )
-            val (predCx, predCy) = lockOnController.predictCurrentCropCenterPx(
+            val (predCx, predCy, predCropSize) = lockOnController.predictCurrentCropWindow(
                 rotationMatrix = poseSnapshot.rotationMatrix,
                 focalLengthPx = exposureTelemetry.verticalFocalLengthPx
             )
@@ -1000,25 +1003,27 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 outCrop320RgbFloats = analyzerCrop320Scratch,
                 cropCenterXPx = predCx,
                 cropCenterYPx = predCy,
+                sourceCropSizePx = predCropSize,
                 extractRgbCrop = true
             )
         } finally {
             imageProxy.close()
         }
 
+        val nowMonoNs = System.nanoTime()
         val directive = lockOnController.onCameraLumaFrame(
             lumaBytes = analyzerLumaScratch,
             widthPx = extraction.uprightWidthPx,
             heightPx = extraction.uprightHeightPx,
             poseSnapshot = poseSnapshot,
-            timestampNs = frameTs
+            timestampNs = nowMonoNs
         )
 
         if (directive.autoExitedToPatrol || directive.hudState.stage == AcquisitionStage.PATROL) {
             val nextPower = patrolDutyController.onContextChanged(
                 operatingMode = _uiState.value.operatingMode,
                 acquisitionStage = AcquisitionStage.PATROL,
-                nowNs = System.nanoTime()
+                nowNs = nowMonoNs
             )
             cameraController.setTargetCameraFps(nextPower.targetCameraFps)
             sonifier.updateTargets(emptyList(), ScanSpeedState.Normal(0f))
@@ -1043,8 +1048,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         )
         val audioTel = sonifier.latestTelemetry
         val useAkazeTelemetry = directive.hudState.stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+            directive.hudState.akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS &&
             directive.openCvLatencyMs > 0f
         _uiState.update { prev ->
+            val updatedRollingMs = if (useAkazeTelemetry) {
+                if (prev.rollingLatencyMs <= 0f || prev.rollingLatencyMs > 25f) {
+                    directive.openCvLatencyMs
+                } else {
+                    prev.rollingLatencyMs * 0.85f + directive.openCvLatencyMs * 0.15f
+                }
+            } else {
+                prev.rollingLatencyMs
+            }
             prev.copy(
                 acquisitionStage = directive.hudState.stage,
                 lockOnHudState = directive.hudState,
@@ -1059,6 +1074,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     exposureTelemetry.activeZoomRatio
                 ),
                 sweepLatencyMs = if (useAkazeTelemetry) directive.openCvLatencyMs else prev.sweepLatencyMs,
+                rollingLatencyMs = updatedRollingMs,
                 sweepHz = if (useAkazeTelemetry) exposureTelemetry.measuredCameraFps else prev.sweepHz,
                 audioPitchHz = audioTel.currentPitchHz,
                 audioCadenceHz = audioTel.currentPingCadenceHz
@@ -1079,6 +1095,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             freeSlot.isLockOnSlot = true
             freeSlot.lockOnCropLeftPx = extraction.cropLeftPx
             freeSlot.lockOnCropTopPx = extraction.cropTopPx
+            freeSlot.lockOnCropSizePx = extraction.cropSizePx
+            lockOnController.copyCurrentCamPosEnu(freeSlot.lockOnCamPosEnu)
             freeSlot.poseSnapshot = poseSnapshot
             freeSlot.exposureTelemetry = exposureTelemetry
             freeSlot.stateSnapshot = stateSnapshot
@@ -1343,6 +1361,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         lastCompletedSweepWallNs = nowWallNs
+        val liveRotMat = raycaster.copyLatestRotationMatrix()
 
         val updatedHud = lockOnController.onNeuralB1Detections(
             cropDetections = lockResult.tileDetections,
@@ -1350,7 +1369,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             cropTopPx = slot.lockOnCropTopPx,
             poseSnapshot = poseSnapshot,
             zoomRatio = exposureTelemetry.activeZoomRatio,
-            timestampNs = slot.frameTimestampNs
+            timestampNs = nowWallNs,
+            captureCamPosEnu = slot.lockOnCamPosEnu,
+            displayRotationMatrix = liveRotMat,
+            cropSizePx = slot.lockOnCropSizePx
         )
 
         if (updatedHud.stage == AcquisitionStage.PATROL) {
@@ -1388,7 +1410,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 lockOnHudState = updatedHud,
                 detectorStatus = if (showNeuralTiming) "RF-DETR 320 B=1 W8-DYN" else "PINPOINT AKAZE + 1HZ B=1",
                 sweepLatencyMs = if (showNeuralTiming) lockResult.totalSweepLatencyMs else prev.sweepLatencyMs,
-                rollingLatencyMs = lockResult.rollingAvgLatencyMs,
+                rollingLatencyMs = if (showNeuralTiming) lockResult.rollingAvgLatencyMs else prev.rollingLatencyMs,
                 sweepHz = if (showNeuralTiming) smoothedSweepHz else prev.sweepHz,
                 part1LatencyMs = lockResult.part1LatencyMs,
                 bridgeLatencyMs = lockResult.hostTopKBridgeLatencyMs,

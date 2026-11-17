@@ -2,10 +2,11 @@
  * Stateful 3-stage acquisition funnel controller (PATROL -> LOCK_ON_NEURAL -> PINPOINT_CONSTELLATION).
  *
  * Coordinates target selection (tap-to-lock and LOCK NEAREST), 16:9 full-frame 3D pinhole
- * reprojection, OpenCV ground-patch visual odometry, multi-view ray-bundle + Calib3d triangulation
- * (sigma3dMm sphere-of-confusion), automatic handover to 30 FPS AKAZE gravel-constellation
- * homography with 1 Hz B=1 neural confidence refresh, off-screen directional edge chevrons, and
- * the 15.0-second lost-track grace window.
+ * reprojection, rotation-gated OpenCV ground-patch visual odometry, multi-view ray-bundle +
+ * Calib3d triangulation (sigma3dMm sphere-of-confusion), automatic handover to 30 FPS AKAZE
+ * gravel-constellation similarity tracking with 1 Hz B=1 neural confidence refresh, 3D-anchored
+ * neural detector box tracking, off-screen directional edge chevrons, and the 15.0-second
+ * lost-track grace window.
  */
 package com.gneissfind.app.tracking
 
@@ -24,18 +25,20 @@ import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
  * Per-frame directive emitted by [LockOnPinpointController.onCameraLumaFrame] telling
  * `ScannerViewModel` whether to schedule `B=1` `rf_detr_nano_320_b1_w8dyn` GPU inference on the
- * current camera frame and where to center the clamped `320x320` RGB crop.
+ * current camera frame and where to center the clamped square RGB crop.
  *
  * @property hudState Updated [LockOnHudState] snapshot (`stage == PATROL` if the `15.0 s` grace window expired).
  * @property shouldRunNeuralB1 True when `GneissFind-Inference` should evaluate `detectLockOnCrop320` on this frame.
- * @property desiredCropCenterXPx Target horizontal center (`[0..1920]`) for the `320x320` neural crop.
- * @property desiredCropCenterYPx Target vertical center (`[0..1080]`) for the `320x320` neural crop.
+ * @property desiredCropCenterXPx Target horizontal center (`[0..1920]`) for the neural crop.
+ * @property desiredCropCenterYPx Target vertical center (`[0..1080]`) for the neural crop.
+ * @property desiredCropSizePx Source square ROI width/height in `1920x1080` pixels (`[320..640]`).
  * @property autoExitedToPatrol True when the `15.0 s` continuous lost-track timeout expired on this frame.
  * @property openCvLatencyMs CPU execution latency (ms) of OpenCV KLT / `AKAZE` on this frame.
  */
@@ -44,6 +47,7 @@ data class LockOnFrameDirective(
     val shouldRunNeuralB1: Boolean,
     val desiredCropCenterXPx: Float,
     val desiredCropCenterYPx: Float,
+    val desiredCropSizePx: Int = PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
     val autoExitedToPatrol: Boolean = false,
     val openCvLatencyMs: Float = 0f
 )
@@ -73,7 +77,7 @@ class TriangulationViewObservation(
  *
  * @property targetEnuM 3-element `(eastM, northM, upM)` estimated 3D stone center in meters.
  * @property sigma3dMm 3D sphere-of-confusion radius in millimeters (combining ray residual and baseline geometry).
- * @property maxParallaxDeg Maximum pairwise ray parallax angle in degrees across stored viewpoints.
+ * @property maxParallaxDeg Maximum pairwise ray parallax angle in degrees across baseline-separated viewpoints.
  * @property viewCount Number of distinct viewpoints contributing to the estimate.
  */
 class MultiViewTriangulationResult(
@@ -89,6 +93,7 @@ class MultiViewTriangulationResult(
  * Threading: All state transitions and frame updates are synchronized on [stateLock] so UI actions
  * (Main thread), 120 Hz IMU display reprojections (Main thread), 30 Hz OpenCV updates
  * (`GneissFind-Analyzer`), and `B=1` neural updates (`GneissFind-Inference`) never race.
+ * All timestamps passed to this controller must use the same monotonic clock (`System.nanoTime()`).
  *
  * @param openCvTracker Native OpenCV KLT / triangulation / `AKAZE` constellation engine.
  * @param waistHeightMeters Nominal initial camera height above the gravel plane in meters (`1.06 m`).
@@ -116,12 +121,21 @@ class LockOnPinpointController(
     private var angularWidthRad: Float = 0.03f
     private var angularHeightRad: Float = 0.03f
 
+    // Separate 3D-anchored neural detector bounding box so 1 Hz neural box stays world-locked on screen
+    private var hasNeuralDetBox: Boolean = false
+    private val neuralBoxPosEnu = floatArrayOf(0f, 1.0f, 0f)
+    private var neuralAngularWidthRad: Float = 0.03f
+    private var neuralAngularHeightRad: Float = 0.03f
+    private var missedNeuralCropCount: Int = 0
+
     private var sigma3dMm: Float = INITIAL_SIGMA_3D_MM
     private var maxParallaxDeg: Float = 0f
     private val viewObservations = ArrayList<TriangulationViewObservation>(MAX_TRIANGULATION_VIEWS)
 
     private var pinpointAnchorRangeM: Float = 1.0f
+    private var smoothedPinpointRangeM: Float = 1.0f
     private var akazeInliers: Int = 0
+    private var consecutiveAkazeSpikeFrames: Int = 0
     private var lastPinpointNeuralRefreshNs: Long = 0L
 
     private var latestFrameLeftPx: Float = 900f
@@ -129,6 +143,7 @@ class LockOnPinpointController(
     private var latestFrameRightPx: Float = 1020f
     private var latestFrameBottomPx: Float = 600f
     private var isTargetInFrame: Boolean = true
+    private var wasTargetOffScreen: Boolean = false
 
     private var lostTrackStartNs: Long = 0L
     private var latestLumaSnapshot: ByteArray? = null
@@ -140,6 +155,19 @@ class LockOnPinpointController(
         get() = synchronized(stateLock) { stage }
 
     /**
+     * Copies the current estimated metric ENU camera center `(eastM, northM, upM)` into [outEnu]
+     * so `GneissFind-Analyzer` can attach capture-time camera translation to a queued neural slot.
+     */
+    fun copyCurrentCamPosEnu(outEnu: FloatArray = FloatArray(3)): FloatArray = synchronized(stateLock) {
+        if (outEnu.size >= 3) {
+            outEnu[0] = camPosEnu[0]
+            outEnu[1] = camPosEnu[1]
+            outEnu[2] = camPosEnu[2]
+        }
+        outEnu
+    }
+
+    /**
      * Enters Stage 2 (`LOCK_ON_NEURAL`) locked onto [target], anchoring its 3D ENU position from
      * the current camera orientation and slant range.
      *
@@ -148,7 +176,7 @@ class LockOnPinpointController(
      * @param currentCropYFloat Active continuous EIS `cropY` offset when the target was selected.
      * @param currentFocalLengthPx Calibrated vertical pinhole focal length in `1080p` pixels.
      * @param currentRotationMatrix Current `3x3` `R_world_from_scr` rotation matrix.
-     * @param timestampNs Monotonic timestamp in nanoseconds.
+     * @param timestampNs Monotonic wall timestamp in nanoseconds (`System.nanoTime()`).
      * @return Initial [LockOnHudState] for Stage 2 (`LOCK_ON_NEURAL`).
      */
     fun lockOntoTarget(
@@ -201,10 +229,21 @@ class LockOnPinpointController(
         angularWidthRad = if (target.angularWidthRad > 0.002f) target.angularWidthRad else initW / f
         angularHeightRad = if (target.angularHeightRad > 0.002f) target.angularHeightRad else initH / f
 
+        // Initialize 3D-anchored neural detector box from the PATROL lock-on detection
+        hasNeuralDetBox = true
+        System.arraycopy(targetPosEnu, 0, neuralBoxPosEnu, 0, 3)
+        neuralAngularWidthRad = angularWidthRad
+        neuralAngularHeightRad = angularHeightRad
+        missedNeuralCropCount = 0
+
         sigma3dMm = max(85f, r0 * 110f)
         maxParallaxDeg = 0f
+        pinpointAnchorRangeM = r0
+        smoothedPinpointRangeM = r0
         akazeInliers = 0
+        consecutiveAkazeSpikeFrames = 0
         lastPinpointNeuralRefreshNs = 0L
+        wasTargetOffScreen = false
         lostTrackStartNs = 0L
 
         // Record initial Lock-On viewpoint t=0 as the first baseline ray
@@ -245,7 +284,7 @@ class LockOnPinpointController(
      *
      * @param currentRotationMatrix Live `3x3` `R_world_from_scr` rotation matrix.
      * @param currentFocalLengthPx Calibrated vertical pinhole focal length in `1080p` pixels.
-     * @param nowTimestampNs Monotonic timestamp in nanoseconds.
+     * @param nowTimestampNs Monotonic wall timestamp in nanoseconds (`System.nanoTime()`).
      * @return Updated [LockOnHudState] (`stage == PATROL` if the `15.0 s` countdown expired).
      */
     fun reprojectForDisplay120Hz(
@@ -259,11 +298,7 @@ class LockOnPinpointController(
         if (checkAndExpireGraceWindowLocked(nowTimestampNs)) {
             return LockOnHudState(stage = AcquisitionStage.PATROL)
         }
-        val badge = when {
-            lostTrackStartNs != 0L -> "STANDBY"
-            stage == AcquisitionStage.PINPOINT_CONSTELLATION && akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS -> "AKAZE"
-            else -> "RF-DETR B=1"
-        }
+        val badge = resolveSourceBadgeLocked()
         buildProjectedHudStateLocked(
             rWorldFromScr = currentRotationMatrix,
             focalLengthPx = currentFocalLengthPx,
@@ -274,25 +309,29 @@ class LockOnPinpointController(
 
     /**
      * Returns the current predicted `(centerXPx, centerYPx)` in `1920x1080` coordinates around
-     * which `GneissFind-Analyzer` should extract the clamped `320x320` neural crop.
+     * which `GneissFind-Analyzer` should extract the clamped neural crop.
      */
     fun predictCurrentCropCenterPx(
         rotationMatrix: FloatArray,
         focalLengthPx: Float
-    ): Pair<Float, Float> = synchronized(stateLock) {
+    ): Pair<Float, Float> {
+        val (cx, cy, _) = predictCurrentCropWindow(rotationMatrix, focalLengthPx)
+        return Pair(cx, cy)
+    }
+
+    /**
+     * Returns the current predicted `(centerXPx, centerYPx, sourceCropSizePx)` in `1920x1080`
+     * coordinates for extracting the adaptive `[320..640]` -> `320x320` neural crop.
+     */
+    fun predictCurrentCropWindow(
+        rotationMatrix: FloatArray,
+        focalLengthPx: Float
+    ): Triple<Float, Float, Int> = synchronized(stateLock) {
         if (stage == AcquisitionStage.PATROL) {
-            return Pair(
+            return Triple(
                 StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX * 0.5f,
-                StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX * 0.5f
-            )
-        }
-        if (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
-            akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS &&
-            isTargetInFrame
-        ) {
-            return Pair(
-                (latestFrameLeftPx + latestFrameRightPx) * 0.5f,
-                (latestFrameTopPx + latestFrameBottomPx) * 0.5f
+                StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX * 0.5f,
+                PushBroomCropper.LOCK_ON_CROP_SIZE_PX
             )
         }
         val proj = projectEnuToFrame(
@@ -301,22 +340,24 @@ class LockOnPinpointController(
             rWorldFromScr = rotationMatrix,
             focalLengthPx = focalLengthPx
         )
-        Pair(
+        Triple(
             proj.uPx.coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat()),
-            proj.vPx.coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat())
+            proj.vPx.coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat()),
+            desiredCropSizePxLocked(focalLengthPx)
         )
     }
 
     /**
      * Runs on each `30 FPS` camera frame (after `imageProxy.close()`) to update metric camera
-     * translation from background gravel optical flow and—when in Stage 3 (`PINPOINT_CONSTELLATION`)—
-     * execute `< 5 ms` OpenCV `AKAZE` constellation homography tracking.
+     * translation from background gravel optical flow (gated against fast pure-rotation pans) and—
+     * when in Stage 3 (`PINPOINT_CONSTELLATION`)—execute `< 5 ms` OpenCV `AKAZE` constellation
+     * similarity tracking.
      *
      * @param lumaBytes Upright `1920x1080` single-channel luminance buffer.
      * @param widthPx Upright frame width in pixels (`1920`).
      * @param heightPx Upright frame height in pixels (`1080`).
-     * @param poseSnapshot Synchronized IMU/camera pose at [timestampNs].
-     * @param timestampNs Frame capture timestamp in nanoseconds.
+     * @param poseSnapshot Synchronized IMU/camera pose for the frame.
+     * @param timestampNs Monotonic wall timestamp in nanoseconds (`System.nanoTime()`).
      * @return [LockOnFrameDirective] specifying updated HUD state and whether `B=1` GPU inference is needed.
      */
     fun onCameraLumaFrame(
@@ -345,7 +386,14 @@ class LockOnPinpointController(
         val focalPx = poseSnapshot.verticalFocalLengthPx.coerceAtLeast(100f)
         val rotScr = poseSnapshot.rotationMatrix
 
-        // 1. Update metric 3D camera center C_enu via OpenCV background gravel KLT + 3D ray-ground solver
+        // 1. Update metric 3D camera center C_enu via OpenCV background gravel KLT + 3D ray-ground solver,
+        //    gated against fast pure-rotation tilts/pans AND frozen whenever the target is off-screen or
+        //    unanchored so panning across non-ground clutter never drifts camPosEnu.
+        val allowGroundVoIntegration = isTargetInFrame &&
+            lostTrackStartNs == 0L &&
+            missedNeuralCropCount < 2 &&
+            (stage == AcquisitionStage.LOCK_ON_NEURAL ||
+                akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS)
         val gravelFlow = openCvTracker.trackGravelFlowCorrespondences(
             lumaBytes = snapshotBuf,
             widthPx = widthPx,
@@ -355,33 +403,39 @@ class LockOnPinpointController(
             excludeRightPx = latestFrameRightPx,
             excludeBottomPx = latestFrameBottomPx
         )
-        if (hasPrevAnalyzerPose && gravelFlow != null && gravelFlow.inlierCount >= 10) {
-            val solvedCam = solveCameraPositionFromGravelFlow(
-                prevCamPosEnu = prevFrameCamPosEnu,
-                prevRotationScr = prevFrameRotationScr,
-                currRotationScr = rotScr,
-                prevPointsXY = gravelFlow.prevFramePointsXY,
-                currPointsXY = gravelFlow.currFramePointsXY,
-                count = gravelFlow.inlierCount,
-                focalLengthPx = focalPx,
-                frameWidthPx = widthPx,
-                frameHeightPx = heightPx
-            )
-            if (solvedCam != null) {
-                // Clamp per-frame displacement to physically plausible handheld motion (<= 0.16 m/frame at 30 Hz)
-                val stepEast = (solvedCam[0] - camPosEnu[0]).coerceIn(-0.16f, 0.16f)
-                val stepNorth = (solvedCam[1] - camPosEnu[1]).coerceIn(-0.16f, 0.16f)
-                val stepUp = (solvedCam[2] - camPosEnu[2]).coerceIn(-0.10f, 0.10f)
-                camPosEnu[0] += stepEast
-                camPosEnu[1] += stepNorth
-                camPosEnu[2] = (camPosEnu[2] + stepUp).coerceIn(0.18f, 2.00f)
+        if (allowGroundVoIntegration && hasPrevAnalyzerPose && gravelFlow != null && gravelFlow.inlierCount >= 12) {
+            val rotStepDeg = rotationAngleBetweenMatricesDeg(prevFrameRotationScr, rotScr)
+            if (rotStepDeg <= MAX_VO_ROTATION_STEP_DEG) {
+                val solvedCam = solveCameraPositionFromGravelFlow(
+                    prevCamPosEnu = prevFrameCamPosEnu,
+                    prevRotationScr = prevFrameRotationScr,
+                    currRotationScr = rotScr,
+                    prevPointsXY = gravelFlow.prevFramePointsXY,
+                    currPointsXY = gravelFlow.currFramePointsXY,
+                    count = gravelFlow.inlierCount,
+                    focalLengthPx = focalPx,
+                    frameWidthPx = widthPx,
+                    frameHeightPx = heightPx
+                )
+                if (solvedCam != null) {
+                    val rotDamp = (1.0f - (rotStepDeg / 1.6f)).coerceIn(0.25f, 1.0f)
+                    val stepEast = ((solvedCam[0] - camPosEnu[0]) * rotDamp)
+                        .coerceIn(-MAX_VO_HORIZONTAL_STEP_M, MAX_VO_HORIZONTAL_STEP_M)
+                    val stepNorth = ((solvedCam[1] - camPosEnu[1]) * rotDamp)
+                        .coerceIn(-MAX_VO_HORIZONTAL_STEP_M, MAX_VO_HORIZONTAL_STEP_M)
+                    val stepUp = ((solvedCam[2] - camPosEnu[2]) * rotDamp)
+                        .coerceIn(-MAX_VO_VERTICAL_STEP_M, MAX_VO_VERTICAL_STEP_M)
+                    camPosEnu[0] += stepEast
+                    camPosEnu[1] += stepNorth
+                    camPosEnu[2] = (camPosEnu[2] + stepUp).coerceIn(0.18f, 1.90f)
+                }
             }
         }
         System.arraycopy(camPosEnu, 0, prevFrameCamPosEnu, 0, 3)
         System.arraycopy(rotScr, 0, prevFrameRotationScr, 0, 9)
         hasPrevAnalyzerPose = true
 
-        // 2. Stage 3: 30 FPS OpenCV AKAZE gravel-constellation homography guidance (< 5 ms CPU)
+        // 2. Stage 3: 30 FPS OpenCV AKAZE gravel-constellation similarity guidance (< 5 ms CPU)
         var openCvMs = 0f
         if (stage == AcquisitionStage.PINPOINT_CONSTELLATION) {
             val predProjection = projectEnuToFrame(
@@ -392,79 +446,99 @@ class LockOnPinpointController(
                 frameWidthPx = widthPx,
                 frameHeightPx = heightPx
             )
-            val predX = if (akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS && isTargetInFrame) {
-                (latestFrameLeftPx + latestFrameRightPx) * 0.5f
-            } else {
-                predProjection.uPx.coerceIn(0f, widthPx.toFloat())
-            }
-            val predY = if (akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS && isTargetInFrame) {
-                (latestFrameTopPx + latestFrameBottomPx) * 0.5f
-            } else {
-                predProjection.vPx.coerceIn(0f, heightPx.toFloat())
-            }
+            // Only search AKAZE when the predicted target lies within or near the visible viewport
+            val nearViewport = predProjection.inFront &&
+                predProjection.uPx in -160f..(widthPx + 160f) &&
+                predProjection.vPx in -160f..(heightPx + 160f)
 
-            val match = openCvTracker.matchConstellationFrame(
-                lumaBytes = null, // Already uploaded into fullGrayMat above
-                widthPx = widthPx,
-                heightPx = heightPx,
-                predictedCenterXPx = predX,
-                predictedCenterYPx = predY
-            )
-            openCvMs = match.latencyMs
-
-            if (match.matched && match.inliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS) {
-                akazeInliers = match.inliers
-                latestFrameLeftPx = match.frameLeftPx
-                latestFrameTopPx = match.frameTopPx
-                latestFrameRightPx = match.frameRightPx
-                latestFrameBottomPx = match.frameBottomPx
-                lostTrackStartNs = 0L
+            if (nearViewport) {
+                val predX = predProjection.uPx.coerceIn(0f, widthPx.toFloat())
+                val predY = predProjection.vPx.coerceIn(0f, heightPx.toFloat())
+                val match = openCvTracker.matchConstellationFrame(
+                    lumaBytes = null, // Already uploaded into fullGrayMat above
+                    widthPx = widthPx,
+                    heightPx = heightPx,
+                    predictedCenterXPx = predX,
+                    predictedCenterYPx = predY
+                )
+                openCvMs = match.latencyMs
 
                 val matchCx = (match.frameLeftPx + match.frameRightPx) * 0.5f
                 val matchCy = (match.frameTopPx + match.frameBottomPx) * 0.5f
-                val updatedRangeM = (pinpointAnchorRangeM / match.cumulativeScale).coerceIn(0.18f, 3.50f)
-                val updatedRay = GroundPlaneRaycaster.pixelToWorldRay(
-                    frameXPx = matchCx,
-                    frameYPx = matchCy,
-                    focalLengthPx = focalPx,
-                    rotationMatrix = rotScr,
-                    frameWidthPx = widthPx,
-                    frameHeightPx = heightPx
-                )
-                targetPosEnu[0] = camPosEnu[0] + updatedRangeM * updatedRay.eastX
-                targetPosEnu[1] = camPosEnu[1] + updatedRangeM * updatedRay.northY
-                targetPosEnu[2] = camPosEnu[2] + updatedRangeM * updatedRay.upZ
-                angularWidthRad = ((match.frameRightPx - match.frameLeftPx).coerceAtLeast(12f)) / focalPx
-                angularHeightRad = ((match.frameBottomPx - match.frameTopPx).coerceAtLeast(12f)) / focalPx
+                val matchInFrame = matchCx in 0f..widthPx.toFloat() && matchCy in 0f..heightPx.toFloat()
 
-                val needs1HzRefresh = lastPinpointNeuralRefreshNs == 0L ||
-                    (timestampNs - lastPinpointNeuralRefreshNs) >= PINPOINT_NEURAL_REFRESH_INTERVAL_NS
-                if (needs1HzRefresh) {
-                    lastPinpointNeuralRefreshNs = timestampNs
+                if (match.matched &&
+                    match.inliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS &&
+                    matchInFrame
+                ) {
+                    akazeInliers = match.inliers
+                    wasTargetOffScreen = false
+                    lostTrackStartNs = 0L
+                    missedNeuralCropCount = 0
+
+                    val currRay = currentTargetRayLocked()
+                    val rawRay = GroundPlaneRaycaster.pixelToWorldRay(
+                        frameXPx = matchCx,
+                        frameYPx = matchCy,
+                        focalLengthPx = focalPx,
+                        rotationMatrix = rotScr,
+                        frameWidthPx = widthPx,
+                        frameHeightPx = heightPx
+                    )
+                    val deltaDeg = currRay.angularDistanceDegTo(rawRay)
+                    val rayAlpha = if (deltaDeg > 4.5f && consecutiveAkazeSpikeFrames == 0 && match.inliers < 26) {
+                        consecutiveAkazeSpikeFrames = 1
+                        0.12f
+                    } else {
+                        consecutiveAkazeSpikeFrames = 0
+                        when {
+                            deltaDeg < 0.25f -> 0.16f
+                            deltaDeg < 1.20f -> 0.48f
+                            else -> 0.82f
+                        }
+                    }
+                    val smoothedRay = blendWorldRays(currRay, rawRay, rayAlpha)
+
+                    val rawRangeM = (pinpointAnchorRangeM / match.cumulativeScale).coerceIn(0.18f, 3.50f)
+                    smoothedPinpointRangeM = (smoothedPinpointRangeM * 0.78f + rawRangeM * 0.22f)
+                        .coerceIn(0.18f, 3.50f)
+
+                    targetPosEnu[0] = camPosEnu[0] + smoothedPinpointRangeM * smoothedRay.eastX
+                    targetPosEnu[1] = camPosEnu[1] + smoothedPinpointRangeM * smoothedRay.northY
+                    targetPosEnu[2] = camPosEnu[2] + smoothedPinpointRangeM * smoothedRay.upZ
+
+                    val rawAngW = ((match.frameRightPx - match.frameLeftPx).coerceAtLeast(12f)) / focalPx
+                    val rawAngH = ((match.frameBottomPx - match.frameTopPx).coerceAtLeast(12f)) / focalPx
+                    angularWidthRad = angularWidthRad * 0.78f + rawAngW * 0.22f
+                    angularHeightRad = angularHeightRad * 0.78f + rawAngH * 0.22f
+
+                    val needs1HzRefresh = lastPinpointNeuralRefreshNs == 0L ||
+                        (timestampNs - lastPinpointNeuralRefreshNs) >= PINPOINT_NEURAL_REFRESH_INTERVAL_NS
+                    if (needs1HzRefresh) {
+                        lastPinpointNeuralRefreshNs = timestampNs
+                    }
+
+                    val hud = buildProjectedHudStateLocked(
+                        rWorldFromScr = rotScr,
+                        focalLengthPx = focalPx,
+                        nowNs = timestampNs,
+                        sourceBadge = "AKAZE"
+                    )
+                    val cropCx = ((hud.frameLeftPx + hud.frameRightPx) * 0.5f).coerceIn(0f, widthPx.toFloat())
+                    val cropCy = ((hud.frameTopPx + hud.frameBottomPx) * 0.5f).coerceIn(0f, heightPx.toFloat())
+                    return LockOnFrameDirective(
+                        hudState = hud,
+                        shouldRunNeuralB1 = needs1HzRefresh,
+                        desiredCropCenterXPx = cropCx,
+                        desiredCropCenterYPx = cropCy,
+                        desiredCropSizePx = hud.cropSizePx,
+                        openCvLatencyMs = openCvMs
+                    )
+                } else {
+                    akazeInliers = if (matchInFrame) match.inliers else 0
                 }
-
-                val hud = buildDirectBoxHudStateLocked(
-                    boxLeftPx = match.frameLeftPx,
-                    boxTopPx = match.frameTopPx,
-                    boxRightPx = match.frameRightPx,
-                    boxBottomPx = match.frameBottomPx,
-                    slantRangeM = updatedRangeM,
-                    focalLengthPx = focalPx,
-                    frameWidthPx = widthPx,
-                    frameHeightPx = heightPx,
-                    nowNs = timestampNs,
-                    sourceBadge = "AKAZE"
-                )
-                return LockOnFrameDirective(
-                    hudState = hud,
-                    shouldRunNeuralB1 = needs1HzRefresh,
-                    desiredCropCenterXPx = matchCx,
-                    desiredCropCenterYPx = matchCy,
-                    openCvLatencyMs = openCvMs
-                )
             } else {
-                // AKAZE inliers dipped < 12 -> immediately request full-rate B=1 neural re-acquisition
-                akazeInliers = match.inliers
+                akazeInliers = 0
             }
         }
 
@@ -483,34 +557,47 @@ class LockOnPinpointController(
             rWorldFromScr = rotScr,
             focalLengthPx = focalPx,
             nowNs = timestampNs,
-            sourceBadge = if (lostTrackStartNs != 0L) "STANDBY" else "RF-DETR B=1"
+            sourceBadge = resolveSourceBadgeLocked()
         )
-        val cropCx = ((hud.frameLeftPx + hud.frameRightPx) * 0.5f).coerceIn(0f, widthPx.toFloat())
-        val cropCy = ((hud.frameTopPx + hud.frameBottomPx) * 0.5f).coerceIn(0f, heightPx.toFloat())
+        val rawCenterX = (hud.frameLeftPx + hud.frameRightPx) * 0.5f
+        val rawCenterY = (hud.frameTopPx + hud.frameBottomPx) * 0.5f
+        val reachMarginPx = hud.cropSizePx * 0.55f
+        // Only run GPU B=1 crop inference when the projected target is inside or reachable by the edge crop
+        val canReachInEdgeCrop = hud.isTargetInFrame || (
+            rawCenterX in -reachMarginPx..(widthPx + reachMarginPx) &&
+                rawCenterY in -reachMarginPx..(heightPx + reachMarginPx) &&
+                (hud.offScreenChevron?.angularOffsetDeg ?: 0f) <= 45f
+            )
+        val cropCx = rawCenterX.coerceIn(0f, widthPx.toFloat())
+        val cropCy = rawCenterY.coerceIn(0f, heightPx.toFloat())
         return LockOnFrameDirective(
             hudState = hud,
-            shouldRunNeuralB1 = true,
+            shouldRunNeuralB1 = canReachInEdgeCrop,
             desiredCropCenterXPx = cropCx,
             desiredCropCenterYPx = cropCy,
+            desiredCropSizePx = hud.cropSizePx,
             openCvLatencyMs = openCvMs
         )
     }
 
     /**
      * Updates Lock-On / Pinpoint state with detections from `rf_detr_nano_320_b1_w8dyn` evaluated
-     * on the clamped `320x320` crop at `(cropLeftPx, cropTopPx)`.
+     * on the clamped `[cropSizePx x cropSizePx]` ROI (sampled into `320x320`) at `(cropLeftPx, cropTopPx)`.
      *
-     * Performs multi-view ray-bundle + OpenCV `Calib3d.triangulatePoints` triangulation, updates
-     * `sigma3dMm`, triggers Stage 2 -> Stage 3 `AKAZE` handover when `sigma3dMm < 0.5 * D`
-     * (`>= 4` views and `>= 3.0 deg` parallax), and manages the `15.0 s` lost-track grace window.
+     * Uses [poseSnapshot] (and [captureCamPosEnu] when provided) from capture time to back-project
+     * detections into 3D ENU coordinates—eliminating GPU inference latency lag—and projects the
+     * returned [LockOnHudState] with [displayRotationMatrix] at [timestampNs].
      *
-     * @param cropDetections Detections in `[0..320]` crop-local pixel coordinates.
-     * @param cropLeftPx Left X origin of the `320x320` crop in `1920x1080` pixels.
-     * @param cropTopPx Top Y origin of the `320x320` crop in `1920x1080` pixels.
-     * @param poseSnapshot Synchronized IMU/camera pose at [timestampNs].
+     * @param cropDetections Detections in `[0..320]` tensor-local pixel coordinates.
+     * @param cropLeftPx Left X origin of the source square ROI in `1920x1080` pixels.
+     * @param cropTopPx Top Y origin of the source square ROI in `1920x1080` pixels.
+     * @param poseSnapshot Synchronized IMU/camera pose at crop capture time.
      * @param zoomRatio Active zoom ratio (`2.0f` default).
-     * @param timestampNs Frame capture timestamp in nanoseconds.
+     * @param timestampNs Monotonic wall timestamp in nanoseconds (`System.nanoTime()`).
      * @param syntheticCameraStepEnu Optional explicit camera position override for pure-JVM unit tests.
+     * @param captureCamPosEnu Optional camera ENU position captured when the crop was extracted.
+     * @param displayRotationMatrix Optional live `3x3` `R_world_from_scr` rotation matrix at completion time.
+     * @param cropSizePx Source square ROI width/height in `1920x1080` pixels (`[320..640]`).
      * @return Updated [LockOnHudState] (`stage == PATROL` if the `15.0 s` grace window expired).
      */
     fun onNeuralB1Detections(
@@ -520,7 +607,10 @@ class LockOnPinpointController(
         poseSnapshot: MotionPoseSnapshot,
         zoomRatio: Float = PushBroomCropper.DEFAULT_ZOOM_RATIO,
         timestampNs: Long,
-        syntheticCameraStepEnu: FloatArray? = null
+        syntheticCameraStepEnu: FloatArray? = null,
+        captureCamPosEnu: FloatArray? = null,
+        displayRotationMatrix: FloatArray = poseSnapshot.rotationMatrix,
+        cropSizePx: Int = PushBroomCropper.LOCK_ON_CROP_SIZE_PX
     ): LockOnHudState = synchronized(stateLock) {
         if (stage == AcquisitionStage.PATROL) {
             return LockOnHudState(stage = AcquisitionStage.PATROL)
@@ -531,12 +621,27 @@ class LockOnPinpointController(
             camPosEnu[2] = syntheticCameraStepEnu[2]
         }
 
+        val obsCamPos = if (syntheticCameraStepEnu != null && syntheticCameraStepEnu.size >= 3) {
+            camPosEnu
+        } else if (captureCamPosEnu != null && captureCamPosEnu.size >= 3) {
+            captureCamPosEnu
+        } else {
+            camPosEnu
+        }
+
+        val effectiveCropSizePx = cropSizePx.coerceIn(
+            PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
+            PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX
+        )
+        val cropScale = effectiveCropSizePx.toFloat() / PushBroomCropper.LOCK_ON_CROP_SIZE_PX.toFloat()
+        val gateDistPx = max(MAX_GATE_DISTANCE_PX, effectiveCropSizePx * 0.52f)
+
         val focalPx = poseSnapshot.verticalFocalLengthPx.coerceAtLeast(100f)
-        val rotScr = poseSnapshot.rotationMatrix
+        val captureRotScr = poseSnapshot.rotationMatrix
         val expectedProj = projectEnuToFrame(
             targetEnu = targetPosEnu,
-            camPosEnu = camPosEnu,
-            rWorldFromScr = rotScr,
+            camPosEnu = obsCamPos,
+            rWorldFromScr = captureRotScr,
             focalLengthPx = focalPx
         )
 
@@ -544,10 +649,15 @@ class LockOnPinpointController(
             cropDetections = cropDetections,
             cropLeftPx = cropLeftPx,
             cropTopPx = cropTopPx,
+            cropScale = cropScale,
+            maxGateDistancePx = gateDistPx,
             lockedClass = stoneClass,
             expectedFrameX = expectedProj.uPx,
             expectedFrameY = expectedProj.vPx
         )
+
+        val akazeActivelyLocked = stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+            akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
 
         if (matchedDet != null) {
             val detClass = StoneClass.fromId(matchedDet.classId)
@@ -557,149 +667,247 @@ class LockOnPinpointController(
                 }
             }
             smoothedConfidence = smoothedConfidence * 0.65f + matchedDet.confidence * 0.35f
+            missedNeuralCropCount = 0
+            wasTargetOffScreen = false
             lostTrackStartNs = 0L
 
-            val fLeft = (cropLeftPx + matchedDet.leftPx)
+            val fLeft = (cropLeftPx + matchedDet.leftPx * cropScale)
                 .coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat())
-            val fTop = (cropTopPx + matchedDet.topPx)
+            val fTop = (cropTopPx + matchedDet.topPx * cropScale)
                 .coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat())
-            val fRight = (cropLeftPx + matchedDet.rightPx)
+            val fRight = (cropLeftPx + matchedDet.rightPx * cropScale)
                 .coerceIn(fLeft + 4f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat())
-            val fBottom = (cropTopPx + matchedDet.bottomPx)
+            val fBottom = (cropTopPx + matchedDet.bottomPx * cropScale)
                 .coerceIn(fTop + 4f, StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat())
-
-            latestFrameLeftPx = fLeft
-            latestFrameTopPx = fTop
-            latestFrameRightPx = fRight
-            latestFrameBottomPx = fBottom
 
             val obsU = (fLeft + fRight) * 0.5f
             val obsV = (fTop + fBottom) * 0.5f
             val boxW = fRight - fLeft
             val boxH = fBottom - fTop
             val boxSpan = max(boxW, boxH)
-            angularWidthRad = boxW / focalPx
-            angularHeightRad = boxH / focalPx
+            val isBoxUnclipped = matchedDet.leftPx > 8f &&
+                matchedDet.topPx > 8f &&
+                matchedDet.rightPx < 312f &&
+                matchedDet.bottomPx < 312f
 
             val obsRay = GroundPlaneRaycaster.pixelToWorldRay(
                 frameXPx = obsU,
                 frameYPx = obsV,
                 focalLengthPx = focalPx,
-                rotationMatrix = rotScr
-            )
-            val obsRCv = scrRotationToCvFromWorld(rotScr)
-
-            appendObservationIfNewBaselineLocked(
-                TriangulationViewObservation(
-                    camPosEnu = camPosEnu.clone(),
-                    rCvFromWorld = obsRCv,
-                    rayEnu = obsRay,
-                    pixelU = obsU,
-                    pixelV = obsV,
-                    boxSpanPx = boxSpan
-                )
+                rotationMatrix = captureRotScr
             )
 
-            if (viewObservations.size >= 2) {
-                val tri = triangulateMultiViewObservations(
-                    observations = viewObservations,
-                    priorTargetEnu = targetPosEnu,
-                    focalLengthPx = focalPx,
-                    openCvTracker = openCvTracker
-                )
-                if (tri != null && tri.maxParallaxDeg >= MIN_PARALLAX_FOR_3D_UPDATE_DEG) {
-                    targetPosEnu[0] = tri.targetEnuM[0]
-                    targetPosEnu[1] = tri.targetEnuM[1]
-                    targetPosEnu[2] = tri.targetEnuM[2]
-                    sigma3dMm = tri.sigma3dMm
-                    maxParallaxDeg = tri.maxParallaxDeg
-                } else if (tri != null) {
-                    maxParallaxDeg = max(maxParallaxDeg, tri.maxParallaxDeg)
+            if (akazeActivelyLocked) {
+                // Stage 3 1 Hz neural refresh: update 3D-anchored neural detector box + gentle drift correction
+                // WITHOUT yanking the 30 FPS AKAZE Pinpoint reticle to 145ms-stale capture coordinates!
+                val anchorRange = smoothedPinpointRangeM.coerceIn(0.18f, 3.50f)
+                hasNeuralDetBox = true
+                neuralBoxPosEnu[0] = obsCamPos[0] + anchorRange * obsRay.eastX
+                neuralBoxPosEnu[1] = obsCamPos[1] + anchorRange * obsRay.northY
+                neuralBoxPosEnu[2] = obsCamPos[2] + anchorRange * obsRay.upZ
+                neuralAngularWidthRad = boxW / focalPx
+                neuralAngularHeightRad = boxH / focalPx
+
+                val currAkazeRay = currentTargetRayLocked()
+                if (currAkazeRay.angularDistanceDegTo(obsRay) <= 2.5f) {
+                    val nudgedEast = obsCamPos[0] + anchorRange * obsRay.eastX
+                    val nudgedNorth = obsCamPos[1] + anchorRange * obsRay.northY
+                    val nudgedUp = obsCamPos[2] + anchorRange * obsRay.upZ
+                    targetPosEnu[0] = targetPosEnu[0] * 0.92f + nudgedEast * 0.08f
+                    targetPosEnu[1] = targetPosEnu[1] * 0.92f + nudgedNorth * 0.08f
+                    targetPosEnu[2] = targetPosEnu[2] * 0.92f + nudgedUp * 0.08f
                 }
-            }
 
-            // If camera has not translated yet, keep 3D bearing ray locked to the live detection
-            if (maxParallaxDeg < MIN_PARALLAX_FOR_3D_UPDATE_DEG) {
-                val curRange = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.25f, 4.0f)
-                targetPosEnu[0] = camPosEnu[0] + curRange * obsRay.eastX
-                targetPosEnu[1] = camPosEnu[1] + curRange * obsRay.northY
-                targetPosEnu[2] = camPosEnu[2] + curRange * obsRay.upZ
-            }
-
-            val currentRangeM = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.18f, 4.0f)
-            val gsd = PushBroomCropper.computeGsdMmPerPx(currentRangeM, zoomRatio)
-            estimatedDiameterMm = (estimatedDiameterMm * 0.70f + (boxSpan * gsd) * 0.30f)
-                .coerceIn(18f, 250f)
-
-            // Check Stage 2 -> Stage 3 handover criterion: sigma_3D < 0.5 * D, >= 4 views, >= 3.0 deg parallax
-            if (stage == AcquisitionStage.LOCK_ON_NEURAL &&
-                viewObservations.size >= MIN_VIEWS_FOR_PINPOINT_HANDOVER &&
-                maxParallaxDeg >= MIN_PARALLAX_DEG_FOR_PINPOINT_HANDOVER &&
-                sigma3dMm < HANDOVER_SIGMA_TO_DIAMETER_RATIO * estimatedDiameterMm
-            ) {
-                val seeded = openCvTracker.seedConstellationCollar(
-                    lumaBytes = latestLumaSnapshot,
-                    widthPx = latestLumaWidth,
-                    heightPx = latestLumaHeight,
-                    stoneLeftPx = fLeft,
-                    stoneTopPx = fTop,
-                    stoneRightPx = fRight,
-                    stoneBottomPx = fBottom,
-                    baseScale = 1.0f
-                )
-                stage = AcquisitionStage.PINPOINT_CONSTELLATION
-                pinpointAnchorRangeM = currentRangeM
-                lastPinpointNeuralRefreshNs = timestampNs
-                if (seeded) {
-                    akazeInliers = OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
+                if (isBoxUnclipped) {
+                    val gsd = PushBroomCropper.computeGsdMmPerPx(anchorRange, zoomRatio)
+                    estimatedDiameterMm = (estimatedDiameterMm * 0.80f + (boxSpan * gsd) * 0.20f)
+                        .coerceIn(18f, 250f)
                 }
-            } else if (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
-                akazeInliers < OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
-            ) {
-                // Neural B=1 re-acquired stone after temporary occlusion -> re-seed AKAZE collar!
-                val reseeded = openCvTracker.seedConstellationCollar(
-                    lumaBytes = latestLumaSnapshot,
-                    widthPx = latestLumaWidth,
-                    heightPx = latestLumaHeight,
-                    stoneLeftPx = fLeft,
-                    stoneTopPx = fTop,
-                    stoneRightPx = fBottom.coerceAtLeast(fTop + 8f).let { fRight },
-                    stoneBottomPx = fBottom,
-                    baseScale = 1.0f
-                )
-                pinpointAnchorRangeM = currentRangeM
-                lastPinpointNeuralRefreshNs = timestampNs
-                if (reseeded) {
-                    akazeInliers = OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
-                }
-            }
 
-            val badge = if (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
-                akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
-            ) {
-                "AKAZE"
+                // Proactive keyframe refresh when AKAZE inliers dip near floor (12..15) so texture lock stays crisp
+                if (akazeInliers <= 15 && matchedDet.confidence >= 0.55f) {
+                    val seedProj = projectEnuToFrame(
+                        targetEnu = targetPosEnu,
+                        camPosEnu = camPosEnu,
+                        rWorldFromScr = displayRotationMatrix,
+                        focalLengthPx = focalPx,
+                        frameWidthPx = latestLumaWidth,
+                        frameHeightPx = latestLumaHeight
+                    )
+                    val seedHalfW = max(12f, angularWidthRad * focalPx * 0.5f)
+                    val seedHalfH = max(12f, angularHeightRad * focalPx * 0.5f)
+                    val sLeft = (seedProj.uPx - seedHalfW).coerceIn(0f, latestLumaWidth.toFloat())
+                    val sTop = (seedProj.vPx - seedHalfH).coerceIn(0f, latestLumaHeight.toFloat())
+                    val sRight = (seedProj.uPx + seedHalfW).coerceIn(sLeft + 8f, latestLumaWidth.toFloat())
+                    val sBottom = (seedProj.vPx + seedHalfH).coerceIn(sTop + 8f, latestLumaHeight.toFloat())
+                    if (seedProj.inFront &&
+                        seedProj.uPx in 64f..(latestLumaWidth - 64f) &&
+                        seedProj.vPx in 64f..(latestLumaHeight - 64f)
+                    ) {
+                        openCvTracker.seedConstellationCollar(
+                            lumaBytes = latestLumaSnapshot,
+                            widthPx = latestLumaWidth,
+                            heightPx = latestLumaHeight,
+                            stoneLeftPx = sLeft,
+                            stoneTopPx = sTop,
+                            stoneRightPx = sRight,
+                            stoneBottomPx = sBottom,
+                            baseScale = 1.0f
+                        )
+                        pinpointAnchorRangeM = anchorRange
+                    }
+                }
             } else {
-                "RF-DETR B=1"
+                // Stage 2 (LOCK_ON_NEURAL) or Stage 3 AKAZE recovery
+                if (isBoxUnclipped) {
+                    angularWidthRad = angularWidthRad * 0.55f + (boxW / focalPx) * 0.45f
+                    angularHeightRad = angularHeightRad * 0.55f + (boxH / focalPx) * 0.45f
+                }
+
+                val obsRCv = scrRotationToCvFromWorld(captureRotScr)
+                appendObservationIfNewBaselineLocked(
+                    TriangulationViewObservation(
+                        camPosEnu = obsCamPos.clone(),
+                        rCvFromWorld = obsRCv,
+                        rayEnu = obsRay,
+                        pixelU = obsU,
+                        pixelV = obsV,
+                        boxSpanPx = boxSpan
+                    )
+                )
+
+                var updatedFromStereo = false
+                if (viewObservations.size >= 2) {
+                    val tri = triangulateMultiViewObservations(
+                        observations = viewObservations,
+                        priorTargetEnu = targetPosEnu,
+                        focalLengthPx = focalPx,
+                        openCvTracker = openCvTracker
+                    )
+                    if (tri != null && tri.maxParallaxDeg >= MIN_PARALLAX_FOR_3D_UPDATE_DEG) {
+                        val triDistM = computeDistanceEnu(camPosEnu, tri.targetEnuM)
+                        val triPlausible = triDistM in 0.18f..3.80f && abs(tri.targetEnuM[2]) <= 0.35f
+                        if (triPlausible) {
+                            val blend = if (tri.sigma3dMm < 35f) 0.85f else 0.55f
+                            targetPosEnu[0] = targetPosEnu[0] * (1f - blend) + tri.targetEnuM[0] * blend
+                            targetPosEnu[1] = targetPosEnu[1] * (1f - blend) + tri.targetEnuM[1] * blend
+                            targetPosEnu[2] = targetPosEnu[2] * (1f - blend) + tri.targetEnuM[2] * blend
+                            sigma3dMm = tri.sigma3dMm
+                            maxParallaxDeg = max(maxParallaxDeg, tri.maxParallaxDeg)
+                            updatedFromStereo = true
+                        }
+                    } else if (tri != null) {
+                        maxParallaxDeg = max(maxParallaxDeg, tri.maxParallaxDeg)
+                    }
+                }
+
+                if (!updatedFromStereo) {
+                    // Single-view / sub-baseline bearing update with deadband smoothing
+                    val currRay = currentTargetRayLocked(fromCamEnu = obsCamPos)
+                    val rayDeltaDeg = currRay.angularDistanceDegTo(obsRay)
+                    val rayAlpha = when {
+                        rayDeltaDeg < 0.30f -> 0.25f
+                        rayDeltaDeg < 1.20f -> 0.55f
+                        else -> 0.85f
+                    }
+                    val smoothedRay = blendWorldRays(currRay, obsRay, rayAlpha)
+                    val curRange = computeDistanceEnu(obsCamPos, targetPosEnu).coerceIn(0.25f, 3.80f)
+                    targetPosEnu[0] = obsCamPos[0] + curRange * smoothedRay.eastX
+                    targetPosEnu[1] = obsCamPos[1] + curRange * smoothedRay.northY
+                    targetPosEnu[2] = obsCamPos[2] + curRange * smoothedRay.upZ
+                }
+
+                val currentRangeM = computeDistanceEnu(obsCamPos, targetPosEnu).coerceIn(0.18f, 3.80f)
+                hasNeuralDetBox = true
+                neuralBoxPosEnu[0] = obsCamPos[0] + currentRangeM * obsRay.eastX
+                neuralBoxPosEnu[1] = obsCamPos[1] + currentRangeM * obsRay.northY
+                neuralBoxPosEnu[2] = obsCamPos[2] + currentRangeM * obsRay.upZ
+                neuralAngularWidthRad = boxW / focalPx
+                neuralAngularHeightRad = boxH / focalPx
+
+                if (isBoxUnclipped) {
+                    val gsd = PushBroomCropper.computeGsdMmPerPx(currentRangeM, zoomRatio)
+                    estimatedDiameterMm = (estimatedDiameterMm * 0.70f + (boxSpan * gsd) * 0.30f)
+                        .coerceIn(18f, 250f)
+                }
+
+                // Reproject current target to latestLumaSnapshot pose for seeding AKAZE collar accurately
+                val seedProj = projectEnuToFrame(
+                    targetEnu = targetPosEnu,
+                    camPosEnu = camPosEnu,
+                    rWorldFromScr = displayRotationMatrix,
+                    focalLengthPx = focalPx,
+                    frameWidthPx = latestLumaWidth,
+                    frameHeightPx = latestLumaHeight
+                )
+                val seedHalfW = max(12f, angularWidthRad * focalPx * 0.5f)
+                val seedHalfH = max(12f, angularHeightRad * focalPx * 0.5f)
+                val sLeft = (seedProj.uPx - seedHalfW).coerceIn(0f, latestLumaWidth.toFloat())
+                val sTop = (seedProj.vPx - seedHalfH).coerceIn(0f, latestLumaHeight.toFloat())
+                val sRight = (seedProj.uPx + seedHalfW).coerceIn(sLeft + 8f, latestLumaWidth.toFloat())
+                val sBottom = (seedProj.vPx + seedHalfH).coerceIn(sTop + 8f, latestLumaHeight.toFloat())
+
+                // Check Stage 2 -> Stage 3 handover criterion: sigma_3D < 0.5 * D, >= 4 views, >= 3.0 deg parallax
+                if (stage == AcquisitionStage.LOCK_ON_NEURAL &&
+                    viewObservations.size >= MIN_VIEWS_FOR_PINPOINT_HANDOVER &&
+                    maxParallaxDeg >= MIN_PARALLAX_DEG_FOR_PINPOINT_HANDOVER &&
+                    sigma3dMm < HANDOVER_SIGMA_TO_DIAMETER_RATIO * estimatedDiameterMm
+                ) {
+                    val seeded = openCvTracker.seedConstellationCollar(
+                        lumaBytes = latestLumaSnapshot,
+                        widthPx = latestLumaWidth,
+                        heightPx = latestLumaHeight,
+                        stoneLeftPx = sLeft,
+                        stoneTopPx = sTop,
+                        stoneRightPx = sRight,
+                        stoneBottomPx = sBottom,
+                        baseScale = 1.0f
+                    )
+                    stage = AcquisitionStage.PINPOINT_CONSTELLATION
+                    pinpointAnchorRangeM = currentRangeM
+                    smoothedPinpointRangeM = currentRangeM
+                    lastPinpointNeuralRefreshNs = timestampNs
+                    if (seeded) {
+                        akazeInliers = OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
+                    }
+                } else if (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+                    akazeInliers < OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
+                ) {
+                    // Neural B=1 re-acquired stone after temporary occlusion / off-screen pan -> re-seed AKAZE!
+                    val reseeded = openCvTracker.seedConstellationCollar(
+                        lumaBytes = latestLumaSnapshot,
+                        widthPx = latestLumaWidth,
+                        heightPx = latestLumaHeight,
+                        stoneLeftPx = sLeft,
+                        stoneTopPx = sTop,
+                        stoneRightPx = sRight,
+                        stoneBottomPx = sBottom,
+                        baseScale = 1.0f
+                    )
+                    pinpointAnchorRangeM = currentRangeM
+                    smoothedPinpointRangeM = currentRangeM
+                    lastPinpointNeuralRefreshNs = timestampNs
+                    if (reseeded) {
+                        akazeInliers = OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
+                    }
+                }
             }
-            return buildDirectBoxHudStateLocked(
-                boxLeftPx = fLeft,
-                boxTopPx = fTop,
-                boxRightPx = fRight,
-                boxBottomPx = fBottom,
-                slantRangeM = currentRangeM,
+
+            return buildProjectedHudStateLocked(
+                rWorldFromScr = displayRotationMatrix,
                 focalLengthPx = focalPx,
-                frameWidthPx = latestLumaWidth,
-                frameHeightPx = latestLumaHeight,
                 nowNs = timestampNs,
-                sourceBadge = badge
+                sourceBadge = resolveSourceBadgeLocked()
             )
         }
 
-        // Missed neural detection on this crop -> start/continue 15.0s grace window if AKAZE is not holding lock
-        if (stage != AcquisitionStage.PINPOINT_CONSTELLATION ||
-            akazeInliers < OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
-        ) {
-            if (lostTrackStartNs == 0L) {
+        // Missed neural detection on this crop
+        missedNeuralCropCount++
+        if (missedNeuralCropCount >= 2 && !akazeActivelyLocked) {
+            hasNeuralDetBox = false
+        }
+        if (!akazeActivelyLocked) {
+            if (missedNeuralCropCount >= MIN_CONSECUTIVE_NEURAL_MISSES_FOR_GRACE && lostTrackStartNs == 0L) {
                 lostTrackStartNs = timestampNs
             }
             if (checkAndExpireGraceWindowLocked(timestampNs)) {
@@ -708,10 +916,10 @@ class LockOnPinpointController(
         }
 
         return buildProjectedHudStateLocked(
-            rWorldFromScr = rotScr,
+            rWorldFromScr = displayRotationMatrix,
             focalLengthPx = focalPx,
             nowNs = timestampNs,
-            sourceBadge = if (lostTrackStartNs != 0L) "STANDBY" else "RF-DETR B=1"
+            sourceBadge = resolveSourceBadgeLocked()
         )
     }
 
@@ -727,11 +935,47 @@ class LockOnPinpointController(
         lockedTrackId = -1L
         viewObservations.clear()
         hasPrevAnalyzerPose = false
+        hasNeuralDetBox = false
+        missedNeuralCropCount = 0
+        wasTargetOffScreen = false
         lostTrackStartNs = 0L
         akazeInliers = 0
+        consecutiveAkazeSpikeFrames = 0
         maxParallaxDeg = 0f
         sigma3dMm = INITIAL_SIGMA_3D_MM
         openCvTracker.resetSession()
+    }
+
+    private fun desiredCropSizePxLocked(focalLengthPx: Float): Int {
+        val f = focalLengthPx.coerceAtLeast(100f)
+        val needsWideSearch = lostTrackStartNs != 0L ||
+            missedNeuralCropCount >= 1 ||
+            (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+                akazeInliers < OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS)
+        if (needsWideSearch) {
+            return PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX
+        }
+        val apparentSpanPx = max(angularWidthRad, angularHeightRad) * f
+        return (apparentSpanPx * 2.4f).roundToInt()
+            .coerceIn(
+                PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
+                PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX
+            )
+    }
+
+    private fun resolveSourceBadgeLocked(): String = when {
+        lostTrackStartNs != 0L -> "STANDBY"
+        stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+            akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS -> "AKAZE"
+        else -> "RF-DETR B=1"
+    }
+
+    private fun currentTargetRayLocked(fromCamEnu: FloatArray = camPosEnu): WorldRay3D {
+        return WorldRay3D(
+            eastX = targetPosEnu[0] - fromCamEnu[0],
+            northY = targetPosEnu[1] - fromCamEnu[1],
+            upZ = targetPosEnu[2] - fromCamEnu[2]
+        ).normalized()
     }
 
     private fun checkAndExpireGraceWindowLocked(nowNs: Long): Boolean {
@@ -750,15 +994,19 @@ class LockOnPinpointController(
         }
         val last = viewObservations.last()
         val baselineDist = computeDistanceEnu(last.camPosEnu, obs.camPosEnu)
-        val rayDeltaDeg = last.rayEnu.angularDistanceDegTo(obs.rayEnu)
-        if (baselineDist >= 0.018f || rayDeltaDeg >= 0.60f) {
+        val anchorDist = computeDistanceEnu(viewObservations.first().camPosEnu, obs.camPosEnu)
+        // Require real >= 3.5 cm camera translation before adding a new triangulation view so pure
+        // wrist rotation never accumulates zero-baseline noisy rays.
+        if (baselineDist >= MIN_STEREO_BASELINE_M && anchorDist >= MIN_STEREO_BASELINE_M) {
             if (viewObservations.size >= MAX_TRIANGULATION_VIEWS) {
                 // Preserve observation 0 (initial widest anchor) and drop oldest intermediate sample
                 viewObservations.removeAt(1)
             }
             viewObservations.add(obs)
-        } else {
-            // Refresh latest observation in-place with newer pixel center
+        } else if (viewObservations.size == 1 && anchorDist < 0.015f) {
+            // Refresh initial stationary anchor ray before camera begins translating
+            viewObservations[0] = obs
+        } else if (viewObservations.size > 1 && baselineDist < 0.015f) {
             viewObservations[viewObservations.lastIndex] = obs
         }
     }
@@ -790,20 +1038,50 @@ class LockOnPinpointController(
             proj.uPx in 0f..frameW.toFloat() &&
             proj.vPx in 0f..frameH.toFloat()
         isTargetInFrame = inFrame
-
-        if (!inFrame && lostTrackStartNs == 0L) {
-            lostTrackStartNs = nowNs
+        if (inFrame) {
+            latestFrameLeftPx = bLeft
+            latestFrameTopPx = bTop
+            latestFrameRightPx = bRight
+            latestFrameBottomPx = bBottom
+            if (wasTargetOffScreen) {
+                // Target re-entered the visible viewport after an off-screen pan -> immediately reset 15s grace timer!
+                wasTargetOffScreen = false
+                lostTrackStartNs = 0L
+                missedNeuralCropCount = 0
+            }
+        } else {
+            wasTargetOffScreen = true
+            if (lostTrackStartNs == 0L) {
+                lostTrackStartNs = nowNs
+            }
         }
 
+        // Reproject 3D-anchored neural detector bounding box so it stays world-locked on screen
+        val neuralProj = projectEnuToFrame(
+            targetEnu = neuralBoxPosEnu,
+            camPosEnu = camPosEnu,
+            rWorldFromScr = rWorldFromScr,
+            focalLengthPx = focalLengthPx,
+            frameWidthPx = frameW,
+            frameHeightPx = frameH
+        )
+        val neuralVisible = hasNeuralDetBox &&
+            neuralProj.inFront &&
+            neuralProj.uPx in 0f..frameW.toFloat() &&
+            neuralProj.vPx in 0f..frameH.toFloat()
+        val nHalfW = max(10f, neuralAngularWidthRad * focalLengthPx * 0.5f)
+        val nHalfH = max(10f, neuralAngularHeightRad * focalLengthPx * 0.5f)
+
+        val activeCropSizePx = desiredCropSizePxLocked(focalLengthPx)
         val (cropL, cropT) = PushBroomCropper.computeClampedSquareCropOrigin(
             centerXPx = proj.uPx,
             centerYPx = proj.vPx,
-            cropSizePx = PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
+            cropSizePx = activeCropSizePx,
             frameWidthPx = frameW,
             frameHeightPx = frameH
         )
         val sigmaPx = ((sigma3dMm * 0.001f) * focalLengthPx / proj.slantRangeM.coerceAtLeast(0.18f))
-            .coerceIn(10f, 220f)
+            .coerceIn(8f, 220f)
         val graceActive = lostTrackStartNs != 0L
         val remSec = if (graceActive && nowNs >= lostTrackStartNs) {
             (MAX_LOST_TRACK_GRACE_SEC - (nowNs - lostTrackStartNs) * 1e-9f).coerceIn(0f, MAX_LOST_TRACK_GRACE_SEC)
@@ -814,6 +1092,12 @@ class LockOnPinpointController(
             computeOffScreenChevron(proj, frameW, frameH)
         } else {
             null
+        }
+        val effectiveBadge = when {
+            !inFrame || graceActive -> "STANDBY"
+            stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+                akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS -> "AKAZE"
+            else -> sourceBadge
         }
 
         return LockOnHudState(
@@ -827,78 +1111,24 @@ class LockOnPinpointController(
             sigmaRadiusPx = sigmaPx,
             parallaxAngleDeg = maxParallaxDeg,
             triangulatedViews = viewObservations.size,
-            akazeInliers = akazeInliers,
+            akazeInliers = if (inFrame) akazeInliers else 0,
             frameLeftPx = bLeft,
             frameTopPx = bTop,
             frameRightPx = bRight,
             frameBottomPx = bBottom,
             cropLeftPx = cropL,
             cropTopPx = cropT,
-            cropSizePx = PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
+            cropSizePx = activeCropSizePx,
+            hasNeuralDetectorBox = neuralVisible,
+            neuralBoxLeftPx = neuralProj.uPx - nHalfW,
+            neuralBoxTopPx = neuralProj.vPx - nHalfH,
+            neuralBoxRightPx = neuralProj.uPx + nHalfW,
+            neuralBoxBottomPx = neuralProj.vPx + nHalfH,
             isTargetInFrame = inFrame,
             isLostTrackGraceActive = graceActive,
             lostTrackRemainingSec = remSec,
             offScreenChevron = chevron,
-            trackingSourceBadge = sourceBadge
-        )
-    }
-
-    private fun buildDirectBoxHudStateLocked(
-        boxLeftPx: Float,
-        boxTopPx: Float,
-        boxRightPx: Float,
-        boxBottomPx: Float,
-        slantRangeM: Float,
-        focalLengthPx: Float,
-        frameWidthPx: Int,
-        frameHeightPx: Int,
-        nowNs: Long,
-        sourceBadge: String
-    ): LockOnHudState {
-        val cx = (boxLeftPx + boxRightPx) * 0.5f
-        val cy = (boxTopPx + boxBottomPx) * 0.5f
-        val inFrame = cx in 0f..frameWidthPx.toFloat() && cy in 0f..frameHeightPx.toFloat()
-        isTargetInFrame = inFrame
-        val (cropL, cropT) = PushBroomCropper.computeClampedSquareCropOrigin(
-            centerXPx = cx,
-            centerYPx = cy,
-            cropSizePx = PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
-            frameWidthPx = frameWidthPx,
-            frameHeightPx = frameHeightPx
-        )
-        val sigmaPx = ((sigma3dMm * 0.001f) * focalLengthPx / slantRangeM.coerceAtLeast(0.18f))
-            .coerceIn(8f, 220f)
-        val graceActive = lostTrackStartNs != 0L
-        val remSec = if (graceActive && nowNs >= lostTrackStartNs) {
-            (MAX_LOST_TRACK_GRACE_SEC - (nowNs - lostTrackStartNs) * 1e-9f).coerceIn(0f, MAX_LOST_TRACK_GRACE_SEC)
-        } else {
-            MAX_LOST_TRACK_GRACE_SEC
-        }
-
-        return LockOnHudState(
-            stage = stage,
-            lockedTrackId = lockedTrackId,
-            stoneClass = stoneClass,
-            smoothedConfidence = smoothedConfidence,
-            estimatedDiameterMm = estimatedDiameterMm,
-            slantRangeMeters = slantRangeM,
-            sigma3dMm = sigma3dMm,
-            sigmaRadiusPx = sigmaPx,
-            parallaxAngleDeg = maxParallaxDeg,
-            triangulatedViews = viewObservations.size,
-            akazeInliers = akazeInliers,
-            frameLeftPx = boxLeftPx,
-            frameTopPx = boxTopPx,
-            frameRightPx = boxRightPx,
-            frameBottomPx = boxBottomPx,
-            cropLeftPx = cropL,
-            cropTopPx = cropT,
-            cropSizePx = PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
-            isTargetInFrame = inFrame,
-            isLostTrackGraceActive = graceActive,
-            lostTrackRemainingSec = remSec,
-            offScreenChevron = null,
-            trackingSourceBadge = sourceBadge
+            trackingSourceBadge = effectiveBadge
         )
     }
 
@@ -918,7 +1148,13 @@ class LockOnPinpointController(
         const val MIN_VIEWS_FOR_PINPOINT_HANDOVER = 4
         const val MIN_PARALLAX_DEG_FOR_PINPOINT_HANDOVER = 3.0f
         const val MIN_PARALLAX_FOR_3D_UPDATE_DEG = 0.8f
+        const val MIN_STEREO_BASELINE_M = 0.035f
         const val MAX_TRIANGULATION_VIEWS = 16
+
+        /** Skip KLT translation updates when inter-frame rotation exceeds `1.25 deg/frame` (`~37.5 deg/s`). */
+        const val MAX_VO_ROTATION_STEP_DEG = 1.25f
+        private const val MAX_VO_HORIZONTAL_STEP_M = 0.032f
+        private const val MAX_VO_VERTICAL_STEP_M = 0.022f
 
         /** `1.0 Hz` neural confidence refresh period during Stage 3 `PINPOINT_CONSTELLATION`. */
         const val PINPOINT_NEURAL_REFRESH_INTERVAL_NS = 1_000_000_000L
@@ -926,6 +1162,7 @@ class LockOnPinpointController(
         /** `15.0 s` continuous lost-track grace standby duration before auto-returning to `PATROL`. */
         const val MAX_LOST_TRACK_GRACE_SEC = 15.0f
         const val MAX_LOST_TRACK_GRACE_NS = 15_000_000_000L
+        private const val MIN_CONSECUTIVE_NEURAL_MISSES_FOR_GRACE = 3
 
         private const val LOCK_ON_SCORE_FLOOR = 0.28f
         private const val MAX_GATE_DISTANCE_PX = 210.0f
@@ -1009,6 +1246,20 @@ class LockOnPinpointController(
         }
 
         /**
+         * Returns the 3D rotation angle in degrees (`[0, 180]`) between two `3x3` orthogonal
+         * rotation matrices `R_a` and `R_b` via `acos((trace(R_a^T R_b) - 1) / 2)`.
+         */
+        fun rotationAngleBetweenMatricesDeg(rA: FloatArray, rB: FloatArray): Float {
+            if (rA.size < 9 || rB.size < 9) return 0f
+            var trace = 0.0
+            for (i in 0 until 9) {
+                trace += rA[i].toDouble() * rB[i].toDouble()
+            }
+            val cosTheta = ((trace - 1.0) * 0.5).coerceIn(-1.0, 1.0)
+            return Math.toDegrees(acos(cosTheta)).toFloat()
+        }
+
+        /**
          * Solves the metric 3D ENU camera optical center `C_curr = (eastM, northM, upM)` (including
          * vertical crouch height!) from RANSAC-inlier static gravel correspondences between two frames
          * via exact `3x3` orthogonal ray-projection linear least squares:
@@ -1085,7 +1336,7 @@ class LockOnPinpointController(
 
             if (validRays < 6) return null
             // Gentle Tikhonov regularization anchored to prevCamPosEnu prevents ill-conditioning on narrow FOV patches
-            val reg = 1e-3
+            val reg = 2e-3
             a00 += reg; a11 += reg; a22 += reg
             b0 += reg * prevCamPosEnu[0]
             b1 += reg * prevCamPosEnu[1]
@@ -1097,6 +1348,9 @@ class LockOnPinpointController(
         /**
          * Intersects `>= 2` calibrated multi-view target observations `(C_k, d_k)` to estimate the
          * 3D stone coordinate `P_enu` and its sphere-of-confusion radius `sigma3dMm`.
+         *
+         * Only viewpoint pairs separated by `>= MIN_STEREO_BASELINE_M` (`3.5 cm`) contribute to
+         * stereo parallax so pure camera rotation never hallucinates depth convergence.
          */
         fun triangulateMultiViewObservations(
             observations: List<TriangulationViewObservation>,
@@ -1106,12 +1360,17 @@ class LockOnPinpointController(
         ): MultiViewTriangulationResult? {
             if (observations.size < 2) return null
 
-            // 1. Find maximum pairwise ray parallax angle and widest-baseline pair (idxA, idxB)
+            // 1. Find maximum pairwise ray parallax angle across genuinely baseline-separated viewpoints
             var maxAngleDeg = 0f
             var wideA = 0
             var wideB = observations.lastIndex
             for (i in observations.indices) {
                 for (j in i + 1 until observations.size) {
+                    val pairBaselineM = computeDistanceEnu(
+                        observations[i].camPosEnu,
+                        observations[j].camPosEnu
+                    )
+                    if (pairBaselineM < MIN_STEREO_BASELINE_M) continue
                     val ang = observations[i].rayEnu.angularDistanceDegTo(observations[j].rayEnu)
                     if (ang > maxAngleDeg) {
                         maxAngleDeg = ang
@@ -1119,6 +1378,14 @@ class LockOnPinpointController(
                         wideB = j
                     }
                 }
+            }
+            if (maxAngleDeg <= 0f) {
+                return MultiViewTriangulationResult(
+                    targetEnuM = priorTargetEnu.clone(),
+                    sigma3dMm = INITIAL_SIGMA_3D_MM,
+                    maxParallaxDeg = 0f,
+                    viewCount = observations.size
+                )
             }
 
             // 2. Solve multi-view ray-bundle midpoint least squares: sum_k (I - d_k d_k^T) P = sum_k (I - d_k d_k^T) C_k
@@ -1221,10 +1488,22 @@ class LockOnPinpointController(
             )
         }
 
+        private fun blendWorldRays(a: WorldRay3D, b: WorldRay3D, alpha: Float): WorldRay3D {
+            val t = alpha.coerceIn(0f, 1f)
+            val inv = 1f - t
+            return WorldRay3D(
+                eastX = a.eastX * inv + b.eastX * t,
+                northY = a.northY * inv + b.northY * t,
+                upZ = a.upZ * inv + b.upZ * t
+            ).normalized()
+        }
+
         private fun selectBestLockOnCropDetection(
             cropDetections: List<TileDetection>,
             cropLeftPx: Int,
             cropTopPx: Int,
+            cropScale: Float,
+            maxGateDistancePx: Float,
             lockedClass: StoneClass,
             expectedFrameX: Float,
             expectedFrameY: Float
@@ -1238,13 +1517,13 @@ class LockOnPinpointController(
                 val cls = StoneClass.fromId(det.classId) ?: continue
                 if (!cls.isUserAlertable) continue
 
-                val fx = cropLeftPx + (det.leftPx + det.rightPx) * 0.5f
-                val fy = cropTopPx + (det.topPx + det.bottomPx) * 0.5f
+                val fx = cropLeftPx + (det.leftPx + det.rightPx) * 0.5f * cropScale
+                val fy = cropTopPx + (det.topPx + det.bottomPx) * 0.5f * cropScale
                 val distPx = hypot(fx - expectedFrameX, fy - expectedFrameY)
-                if (distPx > MAX_GATE_DISTANCE_PX) continue
+                if (distPx > maxGateDistancePx) continue
 
                 val classBonus = if (cls == lockedClass) 0.20f else 0.0f
-                val proximityBonus = (1.0f - (distPx / MAX_GATE_DISTANCE_PX)).coerceIn(0f, 1f) * 0.25f
+                val proximityBonus = (1.0f - (distPx / maxGateDistancePx)).coerceIn(0f, 1f) * 0.25f
                 val utility = det.confidence + classBonus + proximityBonus
                 if (utility > bestUtility) {
                     bestUtility = utility
@@ -1352,6 +1631,9 @@ class LockOnPinpointController(
             return sqrt(dx * dx + dy * dy + dz * dz)
         }
 
+        /**
+         * Solves a symmetric `3x3` linear system `A x = b` via analytical Cramer / cofactor inversion.
+         */
         private fun solveSymmetric3x3(
             a00: Double,
             a01: Double,
@@ -1366,18 +1648,19 @@ class LockOnPinpointController(
             val c00 = a11 * a22 - a12 * a12
             val c01 = -(a01 * a22 - a12 * a02)
             val c02 = a01 * a12 - a11 * a02
-            val det = a00 * c00 + a01 * c01 + a02 * c02
-            if (abs(det) < 1e-9 || !det.isFinite()) return null
-
             val c11 = a00 * a22 - a02 * a02
             val c12 = -(a00 * a12 - a01 * a02)
             val c22 = a00 * a11 - a01 * a01
+
+            val det = a00 * c00 + a01 * c01 + a02 * c02
+            if (!det.isFinite() || abs(det) < 1e-9) return null
 
             val invDet = 1.0 / det
             val x = (c00 * b0 + c01 * b1 + c02 * b2) * invDet
             val y = (c01 * b0 + c11 * b1 + c12 * b2) * invDet
             val z = (c02 * b0 + c12 * b1 + c22 * b2) * invDet
             if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return null
+
             return floatArrayOf(x.toFloat(), y.toFloat(), z.toFloat())
         }
     }

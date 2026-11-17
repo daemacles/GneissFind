@@ -562,14 +562,19 @@ class OpenCvConstellationTracker : AutoCloseable {
             val srcPtsMat = MatOfPoint2f(*goodSrc.toTypedArray())
             val dstPtsMat = MatOfPoint2f(*goodDst.toTypedArray())
             try {
-                homography = Calib3d.findHomography(
+                // Estimate 4-DOF similarity transform (translation + rotation + uniform scale,
+                // refined via Levenberg-Marquardt) rather than 8-DOF perspective homography so
+                // high-ISO keypoint noise never introduces projective keystone corner wobble.
+                homography = Calib3d.estimateAffinePartial2D(
                     srcPtsMat,
                     dstPtsMat,
-                    Calib3d.USAC_MAGSAC,
-                    MAGSAC_REPROJ_THRESHOLD_PX,
-                    inlierMask
+                    inlierMask,
+                    Calib3d.RANSAC,
+                    MAGSAC_REPROJ_THRESHOLD_PX
                 )
-                if (homography == null || homography.empty() || inlierMask.empty()) {
+                if (homography == null || homography.empty() ||
+                    homography.rows() < 2 || homography.cols() < 3 || inlierMask.empty()
+                ) {
                     val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
                     return ConstellationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
                 }
@@ -585,93 +590,85 @@ class OpenCvConstellationTracker : AutoCloseable {
                     return ConstellationMatchResult(matched = false, inliers = inliers, latencyMs = elapsedMs)
                 }
 
-                // Project the 4 corners + center of the stone through H into 1920x1080 coordinates
+                // Extract 2x3 similarity matrix [a, -b, tx; b, a, ty]
+                val m = DoubleArray(6)
+                homography.get(0, 0, m)
+                val m00 = m[0]
+                val m01 = m[1]
+                val tx = m[2]
+                val m10 = m[3]
+                val m11 = m[4]
+                val ty = m[5]
+
+                val scaleX = hypot(m00, m10).toFloat()
+                val scaleY = hypot(m01, m11).toFloat()
+                val relScale = sqrt((scaleX * scaleY).coerceAtLeast(0f))
+                if (!relScale.isFinite() ||
+                    relScale !in MIN_RELATIVE_SCALE..MAX_RELATIVE_SCALE ||
+                    (scaleX / scaleY.coerceAtLeast(1e-3f)) !in 0.75f..1.35f
+                ) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return ConstellationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+
                 val cxLocal = (refStoneLocalLeft + refStoneLocalRight) * 0.5
                 val cyLocal = (refStoneLocalTop + refStoneLocalBottom) * 0.5
-                val localPts = MatOfPoint2f(
-                    Point(refStoneLocalLeft.toDouble(), refStoneLocalTop.toDouble()),
-                    Point(refStoneLocalRight.toDouble(), refStoneLocalTop.toDouble()),
-                    Point(refStoneLocalRight.toDouble(), refStoneLocalBottom.toDouble()),
-                    Point(refStoneLocalLeft.toDouble(), refStoneLocalBottom.toDouble()),
-                    Point(cxLocal, cyLocal)
-                )
-                val projectedPts = MatOfPoint2f()
-                try {
-                    Core.perspectiveTransform(localPts, projectedPts, homography)
-                    val projArr = projectedPts.toArray()
-                    if (projArr.size < 5) {
-                        val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
-                        return ConstellationMatchResult(matched = false, inliers = inliers, latencyMs = elapsedMs)
-                    }
-
-                    // Validate homography scale from projected top/left edge lengths vs reference stone size
-                    val topEdgeLen = hypot(projArr[1].x - projArr[0].x, projArr[1].y - projArr[0].y).toFloat()
-                    val leftEdgeLen = hypot(projArr[3].x - projArr[0].x, projArr[3].y - projArr[0].y).toFloat()
-                    val refW = (refStoneLocalRight - refStoneLocalLeft).coerceAtLeast(8f)
-                    val refH = (refStoneLocalBottom - refStoneLocalTop).coerceAtLeast(8f)
-                    val relScaleX = topEdgeLen / refW
-                    val relScaleY = leftEdgeLen / refH
-                    val relScale = sqrt((relScaleX * relScaleY).coerceAtLeast(0f))
-
-                    if (!relScale.isFinite() ||
-                        relScale !in MIN_RELATIVE_SCALE..MAX_RELATIVE_SCALE ||
-                        (relScaleX / relScaleY.coerceAtLeast(1e-3f)) !in 0.45f..2.25f
-                    ) {
-                        val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
-                        return ConstellationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
-                    }
-
-                    var minX = projArr[0].x.toFloat()
-                    var maxX = projArr[0].x.toFloat()
-                    var minY = projArr[0].y.toFloat()
-                    var maxY = projArr[0].y.toFloat()
-                    for (k in 1..3) {
-                        val px = projArr[k].x.toFloat()
-                        val py = projArr[k].y.toFloat()
-                        minX = min(minX, px)
-                        maxX = max(maxX, px)
-                        minY = min(minY, py)
-                        maxY = max(maxY, py)
-                    }
-
-                    latestRelativeScale = relScale
-                    val cumulativeScale = (keyframeBaseScale * relScale).coerceIn(0.25f, 12.0f)
-
-                    // Rolling scale re-keyframing every 1.8x scale growth (1.5m -> 0.25m approach)
-                    if (inliers >= MIN_REKEYFRAME_INLIERS &&
-                        (relScale >= ROLLING_KEYFRAME_GROWTH_RATIO || relScale <= ROLLING_KEYFRAME_SHRINK_RATIO)
-                    ) {
-                        val centerInFrame = projArr[4].x in 64.0..(widthPx - 64.0) &&
-                            projArr[4].y in 64.0..(heightPx - 64.0)
-                        if (centerInFrame) {
-                            seedConstellationCollar(
-                                lumaBytes = null,
-                                widthPx = widthPx,
-                                heightPx = heightPx,
-                                stoneLeftPx = minX,
-                                stoneTopPx = minY,
-                                stoneRightPx = maxX,
-                                stoneBottomPx = maxY,
-                                baseScale = cumulativeScale
-                            )
-                        }
-                    }
-
+                val projCx = (m00 * cxLocal + m01 * cyLocal + tx).toFloat()
+                val projCy = (m10 * cxLocal + m11 * cyLocal + ty).toFloat()
+                if (!projCx.isFinite() || !projCy.isFinite()) {
                     val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
-                    return ConstellationMatchResult(
-                        matched = true,
-                        inliers = inliers,
-                        frameLeftPx = minX,
-                        frameTopPx = minY,
-                        frameRightPx = maxX,
-                        frameBottomPx = maxY,
-                        cumulativeScale = cumulativeScale,
-                        latencyMs = elapsedMs
-                    )
-                } finally {
-                    localPts.release()
-                    projectedPts.release()
+                    return ConstellationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
                 }
+
+                // Reject spurious repetitive-texture jumps far from predicted target position
+                val jumpDistPx = hypot(projCx - predictedCenterXPx, projCy - predictedCenterYPx)
+                val maxJumpPx = max(96f, searchSide * 0.28f)
+                if (jumpDistPx > maxJumpPx) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return ConstellationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+
+                val refW = (refStoneLocalRight - refStoneLocalLeft).coerceAtLeast(8f)
+                val refH = (refStoneLocalBottom - refStoneLocalTop).coerceAtLeast(8f)
+                val halfW = refW * 0.5f * relScale
+                val halfH = refH * 0.5f * relScale
+                val minX = projCx - halfW
+                val maxX = projCx + halfW
+                val minY = projCy - halfH
+                val maxY = projCy + halfH
+
+                latestRelativeScale = relScale
+                val cumulativeScale = (keyframeBaseScale * relScale).coerceIn(0.25f, 12.0f)
+
+                // Rolling scale re-keyframing on significant approach/retreat scale changes
+                if (relScale >= ROLLING_KEYFRAME_GROWTH_RATIO || relScale <= ROLLING_KEYFRAME_SHRINK_RATIO) {
+                    val centerInFrame = projCx in 64f..(widthPx - 64f) &&
+                        projCy in 64f..(heightPx - 64f)
+                    if (centerInFrame) {
+                        seedConstellationCollar(
+                            lumaBytes = null,
+                            widthPx = widthPx,
+                            heightPx = heightPx,
+                            stoneLeftPx = minX,
+                            stoneTopPx = minY,
+                            stoneRightPx = maxX,
+                            stoneBottomPx = maxY,
+                            baseScale = cumulativeScale
+                        )
+                    }
+                }
+
+                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                return ConstellationMatchResult(
+                    matched = true,
+                    inliers = inliers,
+                    frameLeftPx = minX,
+                    frameTopPx = minY,
+                    frameRightPx = maxX,
+                    frameBottomPx = maxY,
+                    cumulativeScale = cumulativeScale,
+                    latencyMs = elapsedMs
+                )
             } finally {
                 srcPtsMat.release()
                 dstPtsMat.release()
@@ -778,21 +775,20 @@ class OpenCvConstellationTracker : AutoCloseable {
         const val COLLAR_DIAMETER_MULTIPLIER = 3.0f
         const val CANONICAL_PATCH_PX = 192
         const val MIN_COLLAR_SIZE_PX = 256
-        const val MAX_COLLAR_SIZE_PX = 448
-        const val MAX_SEARCH_SIZE_PX = 512
+        const val MAX_COLLAR_SIZE_PX = 576
+        const val MAX_SEARCH_SIZE_PX = 680
 
         /** Minimum `USAC_MAGSAC` homography inliers required to hold Stage 3 `PINPOINT_CONSTELLATION` lock. */
         const val MIN_HOMOGRAPHY_INLIERS = 12
         const val MIN_SEED_KEYPOINTS = 16
-        const val MIN_REKEYFRAME_INLIERS = 14
 
         /** Lowe second-nearest-neighbor descriptor distance ratio (`0.78f`, `.agents/rules/android-camera-ar.md §5`). */
         const val LOWE_RATIO_THRESHOLD = 0.78f
         const val MAGSAC_REPROJ_THRESHOLD_PX = 3.5
 
-        /** Rolling scale keyframe thresholds (`1.45x` scale hops during `1.5m -> 0.25m` crouch approach). */
-        const val ROLLING_KEYFRAME_GROWTH_RATIO = 1.45f
-        const val ROLLING_KEYFRAME_SHRINK_RATIO = 0.68f
+        /** Rolling scale keyframe thresholds (`1.28x` scale hops during `1.5m -> 0.25m` crouch approach). */
+        const val ROLLING_KEYFRAME_GROWTH_RATIO = 1.28f
+        const val ROLLING_KEYFRAME_SHRINK_RATIO = 0.78f
         private const val MIN_RELATIVE_SCALE = 0.35f
         private const val MAX_RELATIVE_SCALE = 3.50f
 

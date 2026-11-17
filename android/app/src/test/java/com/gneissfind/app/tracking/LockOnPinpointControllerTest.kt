@@ -348,6 +348,471 @@ class LockOnPinpointControllerTest {
         controller.close()
     }
 
+    @Test
+    fun `pure camera pitch rotation without translation preserves slant range and does not hallucinate baseline`() {
+        val controller = LockOnPinpointController()
+        val geom = StripRoiGeometry()
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val stationaryCam = floatArrayOf(0f, 0f, 1.06f)
+        val trueStoneEnu = floatArrayOf(0.02f, 1.48f, 0.0f)
+        val trueRange = distance3d(stationaryCam, trueStoneEnu)
+
+        val rot36 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 36f, rollDeg = 0f, yawDeg = 0f)
+        val (u0, v0) = projectGroundPoint(trueStoneEnu, stationaryCam, rot36, focalPx)
+        val initRay = GroundPlaneRaycaster.pixelToWorldRay(u0, v0, focalPx, rot36)
+
+        val target = ConfirmedTarget(
+            trackId = 81L,
+            stoneClass = StoneClass.PETRIFIED_WOOD,
+            worldPosition = WorldPoint3D(trueStoneEnu[0], 0f, trueStoneEnu[1]),
+            stripLeftPx = u0 - geom.stripLeftPx - 36f,
+            stripTopPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX - 36f,
+            stripRightPx = u0 - geom.stripLeftPx + 36f,
+            stripBottomPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX + 36f,
+            smoothedConfidence = 0.78f,
+            estimatedDiameterMm = 68f,
+            slantRangeMeters = trueRange,
+            hitCountInWindow = 3,
+            windowSize = 4,
+            lastUpdatedTimestampNs = 2_000_000_000L,
+            worldRay = initRay,
+            isVisibleInStrip = true
+        )
+
+        var hud = controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rot36,
+            timestampNs = 2_000_000_000L
+        )
+        assertEquals(trueRange, hud.slantRangeMeters, 0.05f)
+
+        // Rotate pitch purely in place across 30 -> 42 -> 34 deg with slight +/-3px bbox noise
+        val pitches = listOf(32f, 38f, 42f, 35f)
+        pitches.forEachIndexed { idx, pitch ->
+            val rot = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = pitch, rollDeg = 0f, yawDeg = 0f)
+            val (uTrue, vTrue) = projectGroundPoint(trueStoneEnu, stationaryCam, rot, focalPx)
+            val jitter = if (idx % 2 == 0) 3.0f else -3.0f
+            val (cropLeft, cropTop) = PushBroomCropper.computeClampedSquareCropOrigin(uTrue, vTrue)
+            val cx = (uTrue + jitter) - cropLeft
+            val cy = (vTrue - jitter) - cropTop
+            val ts = 2_100_000_000L + idx * 80_000_000L
+
+            val pose = MotionPoseSnapshot(
+                cameraWorldPosition = WorldPoint3D(0f, stationaryCam[2], 0f),
+                forwardPitchDeg = pitch,
+                rawPitchDeg = pitch,
+                rollDeg = 0f,
+                referencePitchDeg = 36f,
+                cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = false,
+                centerSlantRangeMeters = trueRange,
+                horizontalSpeedMps = 0f,
+                arPlaneLocked = false,
+                timestampNs = ts,
+                verticalFocalLengthPx = focalPx,
+                rotationMatrix = rot
+            )
+            hud = controller.onNeuralB1Detections(
+                cropDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = StoneClass.PETRIFIED_WOOD.id,
+                        confidence = 0.80f,
+                        leftPx = cx - 34f,
+                        topPx = cy - 34f,
+                        rightPx = cx + 34f,
+                        bottomPx = cy + 34f
+                    )
+                ),
+                cropLeftPx = cropLeft,
+                cropTopPx = cropTop,
+                poseSnapshot = pose,
+                timestampNs = ts
+            )
+        }
+
+        assertEquals("Zero translation must report 0 deg stereo parallax", 0f, hud.parallaxAngleDeg, 0.01f)
+        assertEquals("Pure rotation must not inflate slant range", trueRange, hud.slantRangeMeters, 0.06f)
+        assertEquals(1, hud.triangulatedViews)
+        controller.close()
+    }
+
+    @Test
+    fun `pinpoint off-screen pan holds lock across analyzer frames for 15s and delayed B1 stays world-locked`() {
+        val controller = LockOnPinpointController()
+        val geom = StripRoiGeometry()
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val rot45 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        val trueStoneEnu = floatArrayOf(0.22f, 1.06f, 0.0f)
+        val initCamEnu = floatArrayOf(0f, 0f, 1.06f)
+        val (initU, initV) = projectGroundPoint(trueStoneEnu, initCamEnu, rot45, focalPx)
+        val initRay = GroundPlaneRaycaster.pixelToWorldRay(initU, initV, focalPx, rot45)
+        val initRange = distance3d(initCamEnu, trueStoneEnu)
+
+        val target = ConfirmedTarget(
+            trackId = 88L,
+            stoneClass = StoneClass.PETRIFIED_WOOD,
+            worldPosition = WorldPoint3D(trueStoneEnu[0], 0f, trueStoneEnu[1]),
+            stripLeftPx = initU - geom.stripLeftPx - 38f,
+            stripTopPx = initV - StripRoiGeometry.NOMINAL_CROP_Y_PX - 38f,
+            stripRightPx = initU - geom.stripLeftPx + 38f,
+            stripBottomPx = initV - StripRoiGeometry.NOMINAL_CROP_Y_PX + 38f,
+            smoothedConfidence = 0.86f,
+            estimatedDiameterMm = 48f,
+            slantRangeMeters = initRange,
+            hitCountInWindow = 4,
+            windowSize = 4,
+            lastUpdatedTimestampNs = 3_000_000_000L,
+            worldRay = initRay,
+            isVisibleInStrip = true
+        )
+
+        var tNs = 3_000_000_000L
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rot45,
+            timestampNs = tNs
+        )
+
+        // Converge into PINPOINT_CONSTELLATION via 4 multi-view steps keeping stone well inside 1920x1080
+        val steps = listOf(
+            floatArrayOf(0.06f, 0.08f, 0.96f),
+            floatArrayOf(0.12f, 0.16f, 0.86f),
+            floatArrayOf(0.18f, 0.24f, 0.76f),
+            floatArrayOf(0.24f, 0.30f, 0.68f)
+        )
+        var lastCam = initCamEnu
+        for (cam in steps) {
+            tNs += 100_000_000L
+            lastCam = cam
+            val (u, v) = projectGroundPoint(trueStoneEnu, cam, rot45, focalPx)
+            val (cL, cT) = PushBroomCropper.computeClampedSquareCropOrigin(u, v)
+            val pose = MotionPoseSnapshot(
+                cameraWorldPosition = WorldPoint3D(cam[0], cam[2], cam[1]),
+                forwardPitchDeg = 45f,
+                rawPitchDeg = 45f,
+                rollDeg = 0f,
+                referencePitchDeg = 45f,
+                cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = false,
+                centerSlantRangeMeters = distance3d(cam, trueStoneEnu),
+                horizontalSpeedMps = 0.2f,
+                arPlaneLocked = false,
+                timestampNs = tNs,
+                verticalFocalLengthPx = focalPx,
+                rotationMatrix = rot45
+            )
+            controller.onNeuralB1Detections(
+                cropDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = StoneClass.PETRIFIED_WOOD.id,
+                        confidence = 0.92f,
+                        leftPx = (u - cL) - 36f,
+                        topPx = (v - cT) - 36f,
+                        rightPx = (u - cL) + 36f,
+                        bottomPx = (v - cT) + 36f
+                    )
+                ),
+                cropLeftPx = cL,
+                cropTopPx = cT,
+                poseSnapshot = pose,
+                timestampNs = tNs,
+                syntheticCameraStepEnu = cam
+            )
+        }
+        assertEquals(AcquisitionStage.PINPOINT_CONSTELLATION, controller.currentStage)
+
+        // Verify 145ms-delayed neural B=1 detection captured at rot45 while live display is tilted to rot43
+        // (-2 deg = ~95 px shift at 2.0x zoom) projects both reticle and neuralBox to the live rot43 pose!
+        val rot43 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 43f, rollDeg = 0f, yawDeg = 0f)
+        val (expectedLiveU, expectedLiveV) = projectGroundPoint(trueStoneEnu, lastCam, rot43, focalPx)
+        val (captureU, captureV) = projectGroundPoint(trueStoneEnu, lastCam, rot45, focalPx)
+        val (cL45, cT45) = PushBroomCropper.computeClampedSquareCropOrigin(captureU, captureV)
+        val staleCapturePose = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(lastCam[0], lastCam[2], lastCam[1]),
+            forwardPitchDeg = 45f,
+            rawPitchDeg = 45f,
+            rollDeg = 0f,
+            referencePitchDeg = 45f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = distance3d(lastCam, trueStoneEnu),
+            horizontalSpeedMps = 0f,
+            arPlaneLocked = false,
+            timestampNs = tNs,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rot45
+        )
+        tNs += 145_000_000L
+        val delayedHud = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.PETRIFIED_WOOD.id,
+                    confidence = 0.91f,
+                    leftPx = (captureU - cL45) - 34f,
+                    topPx = (captureV - cT45) - 34f,
+                    rightPx = (captureU - cL45) + 34f,
+                    bottomPx = (captureV - cT45) + 34f
+                )
+            ),
+            cropLeftPx = cL45,
+            cropTopPx = cT45,
+            poseSnapshot = staleCapturePose,
+            timestampNs = tNs,
+            captureCamPosEnu = lastCam,
+            displayRotationMatrix = rot43
+        )
+        assertTrue(delayedHud.hasNeuralDetectorBox)
+        val liveReticleCenterY = (delayedHud.frameTopPx + delayedHud.frameBottomPx) * 0.5f
+        val liveNeuralCenterY = (delayedHud.neuralBoxTopPx + delayedHud.neuralBoxBottomPx) * 0.5f
+        assertEquals(expectedLiveU, (delayedHud.frameLeftPx + delayedHud.frameRightPx) * 0.5f, 8.0f)
+        assertEquals(expectedLiveV, liveReticleCenterY, 8.0f)
+        assertEquals(expectedLiveV, liveNeuralCenterY, 8.0f)
+
+        // Now pan camera 60 degrees away in PINPOINT_CONSTELLATION and verify both 120Hz display and
+        // 30Hz onCameraLumaFrame hold lock for the full 15s grace window with offScreenChevron!
+        val rotPannedAway = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 60f)
+        val dummyLuma = ByteArray(1920 * 1080)
+        val panStartNs = tNs + 50_000_000L
+        val displayOff = controller.reprojectForDisplay120Hz(
+            currentRotationMatrix = rotPannedAway,
+            currentFocalLengthPx = focalPx,
+            nowTimestampNs = panStartNs
+        )
+        assertEquals(AcquisitionStage.PINPOINT_CONSTELLATION, displayOff.stage)
+        assertFalse(displayOff.isTargetInFrame)
+        assertNotNull(displayOff.offScreenChevron)
+
+        val pannedPose = staleCapturePose.copy(rotationMatrix = rotPannedAway, timestampNs = panStartNs + 8_000_000L)
+        val analyzerDirective = controller.onCameraLumaFrame(
+            lumaBytes = dummyLuma,
+            widthPx = 1920,
+            heightPx = 1080,
+            poseSnapshot = pannedPose,
+            timestampNs = panStartNs + 8_000_000L
+        )
+        assertFalse("Must NOT prematurely break lock on off-screen frame", analyzerDirective.autoExitedToPatrol)
+        assertEquals(AcquisitionStage.PINPOINT_CONSTELLATION, analyzerDirective.hudState.stage)
+        assertNotNull(analyzerDirective.hudState.offScreenChevron)
+        assertEquals(15.0f, analyzerDirective.hudState.lostTrackRemainingSec, 0.25f)
+
+        // Pan back to target at +6.0s -> immediately re-enters frame and clears grace timer
+        val backInView = controller.reprojectForDisplay120Hz(
+            currentRotationMatrix = rot45,
+            currentFocalLengthPx = focalPx,
+            nowTimestampNs = panStartNs + 6_000_000_000L
+        )
+        assertTrue(backInView.isTargetInFrame)
+        assertFalse("Grace countdown must clear immediately on viewport re-entry", backInView.isLostTrackGraceActive)
+        assertEquals(15.0f, backInView.lostTrackRemainingSec, 0.01f)
+        assertNull(backInView.offScreenChevron)
+        controller.close()
+    }
+
+    @Test
+    fun `off-screen countdown resets immediately when target reappears and starts fresh on subsequent pan`() {
+        val controller = LockOnPinpointController()
+        val geom = StripRoiGeometry()
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val rotForward = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        val rotPannedAway = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 58f)
+        val dummyLuma = ByteArray(1920 * 1080)
+
+        val target = buildConfirmedTarget(trackId = 104L, stripCenterX = 896f, slantRangeMeters = 1.35f)
+        val t0Ns = 10_000_000_000L
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rotForward,
+            timestampNs = t0Ns
+        )
+
+        // 1. Pan away for 8.5 seconds -> countdown drops to ~6.5 seconds
+        val tPan1StartNs = t0Ns + 100_000_000L
+        controller.reprojectForDisplay120Hz(rotPannedAway, focalPx, tPan1StartNs)
+        val midOffScreen = controller.reprojectForDisplay120Hz(
+            currentRotationMatrix = rotPannedAway,
+            currentFocalLengthPx = focalPx,
+            nowTimestampNs = tPan1StartNs + 8_500_000_000L
+        )
+        assertFalse(midOffScreen.isTargetInFrame)
+        assertTrue(midOffScreen.isLostTrackGraceActive)
+        assertEquals(6.5f, midOffScreen.lostTrackRemainingSec, 0.2f)
+
+        // 2. Pan back so target reappears in-frame (even before neural B=1 finishes!) -> timer MUST reset to 15.0s
+        val tReenterNs = tPan1StartNs + 9_000_000_000L
+        val reenteredDisplay = controller.reprojectForDisplay120Hz(
+            currentRotationMatrix = rotForward,
+            currentFocalLengthPx = focalPx,
+            nowTimestampNs = tReenterNs
+        )
+        assertTrue(reenteredDisplay.isTargetInFrame)
+        assertFalse(reenteredDisplay.isLostTrackGraceActive)
+        assertEquals(15.0f, reenteredDisplay.lostTrackRemainingSec, 0.01f)
+
+        // Analyzer frame arriving right after re-entry must also keep grace reset AND request wide 640px search if needed
+        val forwardPose = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(0f, 1.06f, 0f),
+            forwardPitchDeg = 45f,
+            rawPitchDeg = 45f,
+            rollDeg = 0f,
+            referencePitchDeg = 45f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = 1.35f,
+            horizontalSpeedMps = 0f,
+            arPlaneLocked = false,
+            timestampNs = tReenterNs + 16_000_000L,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rotForward
+        )
+        val reenteredAnalyzer = controller.onCameraLumaFrame(
+            lumaBytes = dummyLuma,
+            widthPx = 1920,
+            heightPx = 1080,
+            poseSnapshot = forwardPose,
+            timestampNs = tReenterNs + 16_000_000L
+        )
+        assertFalse(reenteredAnalyzer.autoExitedToPatrol)
+        assertFalse(reenteredAnalyzer.hudState.isLostTrackGraceActive)
+        assertEquals(15.0f, reenteredAnalyzer.hudState.lostTrackRemainingSec, 0.01f)
+
+        // 3. Pan away a second time for 8.0 seconds (total 17.0s since first pan!) -> MUST start fresh from 15.0s (~7.0s left, NOT expire!)
+        val tPan2StartNs = tReenterNs + 500_000_000L
+        controller.reprojectForDisplay120Hz(rotPannedAway, focalPx, tPan2StartNs)
+        val secondPanAt8s = controller.reprojectForDisplay120Hz(
+            currentRotationMatrix = rotPannedAway,
+            currentFocalLengthPx = focalPx,
+            nowTimestampNs = tPan2StartNs + 8_000_000_000L
+        )
+        assertEquals(AcquisitionStage.LOCK_ON_NEURAL, secondPanAt8s.stage)
+        assertTrue(secondPanAt8s.isLostTrackGraceActive)
+        assertEquals(7.0f, secondPanAt8s.lostTrackRemainingSec, 0.2f)
+        controller.close()
+    }
+
+    @Test
+    fun `wide 640x640 re-acquisition crop recovers 220px offset target and ignores border-clipped diameter shrink`() {
+        val controller = LockOnPinpointController()
+        val geom = StripRoiGeometry()
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val rot45 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+
+        val target = buildConfirmedTarget(
+            trackId = 105L,
+            stripCenterX = 896f,
+            slantRangeMeters = 1.15f,
+            boxSizePx = 180f
+        ).copy(estimatedDiameterMm = 165f)
+        val t0Ns = 20_000_000_000L
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rot45,
+            timestampNs = t0Ns
+        )
+
+        val pose = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(0f, 1.06f, 0f),
+            forwardPitchDeg = 45f,
+            rawPitchDeg = 45f,
+            rollDeg = 0f,
+            referencePitchDeg = 45f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = 1.15f,
+            horizontalSpeedMps = 0f,
+            arPlaneLocked = false,
+            timestampNs = t0Ns + 60_000_000L,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rot45
+        )
+
+        // One missed pass triggers wide 640x640 search window
+        controller.onNeuralB1Detections(
+            cropDetections = emptyList(),
+            cropLeftPx = 800,
+            cropTopPx = 380,
+            poseSnapshot = pose,
+            timestampNs = t0Ns + 60_000_000L
+        )
+        val (predCx, predCy, predSize) = controller.predictCurrentCropWindow(rot45, focalPx)
+        assertEquals(PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX, predSize)
+
+        // Target is 220 px to the right of predicted center (would miss 320x320 crop completely, fits inside 640x640!)
+        val (wideLeft, wideTop) = PushBroomCropper.computeClampedSquareCropOrigin(
+            centerXPx = predCx,
+            centerYPx = predCy,
+            cropSizePx = 640
+        )
+        val trueCenterX = predCx + 220f
+        val trueCenterY = predCy - 40f
+        // Map 1920x1080 box into [0..320] tensor coordinates (cropScale = 2.0)
+        val tensorCx = (trueCenterX - wideLeft) / 2.0f
+        val tensorCy = (trueCenterY - wideTop) / 2.0f
+        val reacquiredHud = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.CHALCEDONY_AGATE.id,
+                    confidence = 0.89f,
+                    leftPx = tensorCx - 45f,
+                    topPx = tensorCy - 45f,
+                    rightPx = tensorCx + 45f,
+                    bottomPx = tensorCy + 45f
+                )
+            ),
+            cropLeftPx = wideLeft,
+            cropTopPx = wideTop,
+            poseSnapshot = pose,
+            timestampNs = t0Ns + 130_000_000L,
+            cropSizePx = 640
+        )
+        assertTrue(reacquiredHud.hasNeuralDetectorBox)
+        val neuralCenterX = (reacquiredHud.neuralBoxLeftPx + reacquiredHud.neuralBoxRightPx) * 0.5f
+        assertEquals("Wide 640px crop must map [0..320] box back to exact 1920x1080 X", trueCenterX, neuralCenterX, 4.0f)
+
+        // Border-clipped detection (rightPx = 319.5 >= 312) must NOT shrink estimatedDiameterMm
+        val sizeBeforeClip = reacquiredHud.estimatedDiameterMm
+        val clippedHud = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.CHALCEDONY_AGATE.id,
+                    confidence = 0.84f,
+                    leftPx = 295f,
+                    topPx = 140f,
+                    rightPx = 319.5f,
+                    bottomPx = 165f
+                )
+            ),
+            cropLeftPx = wideLeft,
+            cropTopPx = wideTop,
+            poseSnapshot = pose,
+            timestampNs = t0Ns + 210_000_000L,
+            cropSizePx = 640
+        )
+        assertEquals(
+            "Clipped edge detection must not shrink estimatedDiameterMm",
+            sizeBeforeClip,
+            clippedHud.estimatedDiameterMm,
+            0.01f
+        )
+        controller.close()
+    }
+
     private fun buildConfirmedTarget(
         trackId: Long,
         stripCenterX: Float,

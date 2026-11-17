@@ -620,10 +620,12 @@ class PushBroomCropper(
      * @param frame Source `YUV_420_888` camera frame.
      * @param outLumaBytes Pre-allocated destination array (`>= uprightW * uprightH` bytes).
      * @param outCrop320RgbFloats Pre-allocated destination array (`>= 320 * 320 * 3` floats).
-     * @param cropCenterXPx Desired horizontal center of the `320x320` crop in upright frame pixels.
-     * @param cropCenterYPx Desired vertical center of the `320x320` crop in upright frame pixels.
+     * @param cropCenterXPx Desired horizontal center of the square crop in upright frame pixels.
+     * @param cropCenterYPx Desired vertical center of the square crop in upright frame pixels.
+     * @param sourceCropSizePx Edge length in upright frame pixels of the square ROI sampled into the
+     *   `320x320` model tensor (`320` for 1:1 tracking; up to `640` for wide-angle re-acquisition or close-up stones).
      * @param extractRgbCrop Whether to decode the `320x320` RGB float patch (`false` on pure `AKAZE` frames).
-     * @return [LockOnFrameExtraction] describing the upright dimensions and clamped crop origin.
+     * @return [LockOnFrameExtraction] describing the upright dimensions and clamped crop origin/size.
      */
     fun extractUprightLumaAndLockOnCrop320(
         frame: Yuv420Frame,
@@ -631,6 +633,7 @@ class PushBroomCropper(
         outCrop320RgbFloats: FloatArray,
         cropCenterXPx: Float,
         cropCenterYPx: Float,
+        sourceCropSizePx: Int = LOCK_ON_CROP_SIZE_PX,
         extractRgbCrop: Boolean = true
     ): LockOnFrameExtraction {
         val rawW = frame.width
@@ -685,16 +688,21 @@ class PushBroomCropper(
             }
         }
 
-        val cropSize = LOCK_ON_CROP_SIZE_PX
+        val tensorSize = LOCK_ON_CROP_SIZE_PX
+        val maxSquare = min(uprightW, uprightH).coerceAtLeast(1)
+        val roiSizePx = sourceCropSizePx.coerceIn(
+            min(tensorSize, maxSquare),
+            min(LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX, maxSquare)
+        )
         val (cropLeft, cropTop) = computeClampedSquareCropOrigin(
             centerXPx = cropCenterXPx,
             centerYPx = cropCenterYPx,
-            cropSizePx = cropSize,
+            cropSizePx = roiSizePx,
             frameWidthPx = uprightW,
             frameHeightPx = uprightH
         )
 
-        if (extractRgbCrop && outCrop320RgbFloats.size >= cropSize * cropSize * 3) {
+        if (extractRgbCrop && outCrop320RgbFloats.size >= tensorSize * tensorSize * 3) {
             val uBuf = frame.uBuffer
             val vBuf = frame.vBuffer
             val uRowStride = frame.uRowStride
@@ -705,10 +713,20 @@ class PushBroomCropper(
             val vLimit = vBuf.limit()
 
             var dstFloatIdx = 0
-            for (cy in 0 until cropSize) {
-                val uy = (cropTop + cy).coerceIn(0, (uprightH - 1).coerceAtLeast(0))
-                for (cx in 0 until cropSize) {
-                    val ux = (cropLeft + cx).coerceIn(0, (uprightW - 1).coerceAtLeast(0))
+            for (cy in 0 until tensorSize) {
+                val srcOffsetY = if (roiSizePx == tensorSize) {
+                    cy
+                } else {
+                    (cy * roiSizePx + (roiSizePx shr 1)) / tensorSize
+                }
+                val uy = (cropTop + srcOffsetY).coerceIn(0, (uprightH - 1).coerceAtLeast(0))
+                for (cx in 0 until tensorSize) {
+                    val srcOffsetX = if (roiSizePx == tensorSize) {
+                        cx
+                    } else {
+                        (cx * roiSizePx + (roiSizePx shr 1)) / tensorSize
+                    }
+                    val ux = (cropLeft + srcOffsetX).coerceIn(0, (uprightW - 1).coerceAtLeast(0))
                     val bx: Int
                     val by: Int
                     when (rot) {
@@ -762,14 +780,17 @@ class PushBroomCropper(
             uprightHeightPx = uprightH,
             cropLeftPx = cropLeft,
             cropTopPx = cropTop,
-            cropSizePx = cropSize,
+            cropSizePx = roiSizePx,
             timestampNs = frame.timestampNs
         )
     }
 
     companion object {
-        /** Native square crop resolution in pixels for `rf_detr_nano_320_b1_w8dyn` Lock-On tracking. */
+        /** Native square tensor resolution in pixels for `rf_detr_nano_320_b1_w8dyn` Lock-On tracking. */
         const val LOCK_ON_CROP_SIZE_PX = 320
+
+        /** Expanded `2.0x` (`640x640` -> `320x320`) wide-angle ROI used for close-up stones & re-acquisition. */
+        const val LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX = 640
 
         /** Default cross-tile Intersection-over-Union threshold (`.agents/rules/android-camera-ar.md §2`). */
         const val DEFAULT_NMS_IOU_THRESHOLD = 0.45f

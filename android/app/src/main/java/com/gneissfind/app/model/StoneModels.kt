@@ -670,6 +670,11 @@ data class OffScreenChevron(
  * @property cropLeftPx Active foveated crop / constellation collar left X in `1920x1080` pixels.
  * @property cropTopPx Active foveated crop / constellation collar top Y in `1920x1080` pixels.
  * @property cropSizePx Active square crop width/height in `1920x1080` pixels (`320` for `B=1`).
+ * @property hasNeuralDetectorBox True when a valid `RF-DETR B=1` neural detection box is anchored in 3D.
+ * @property neuralBoxLeftPx Reprojected neural model detection left X in `1920x1080` pixels.
+ * @property neuralBoxTopPx Reprojected neural model detection top Y in `1920x1080` pixels.
+ * @property neuralBoxRightPx Reprojected neural model detection right X in `1920x1080` pixels.
+ * @property neuralBoxBottomPx Reprojected neural model detection bottom Y in `1920x1080` pixels.
  * @property isTargetInFrame True when the projected 3D anchor / tracked box lies inside `1920x1080`.
  * @property isLostTrackGraceActive True while counting down the `15.0 s` lost-track standby window.
  * @property lostTrackRemainingSec Seconds remaining (`[0.0, 15.0]`) before auto-returning to `PATROL`.
@@ -695,6 +700,11 @@ data class LockOnHudState(
     val cropLeftPx: Int = 800,
     val cropTopPx: Int = 380,
     val cropSizePx: Int = 320,
+    val hasNeuralDetectorBox: Boolean = false,
+    val neuralBoxLeftPx: Float = 900f,
+    val neuralBoxTopPx: Float = 480f,
+    val neuralBoxRightPx: Float = 1020f,
+    val neuralBoxBottomPx: Float = 600f,
     val isTargetInFrame: Boolean = true,
     val isLostTrackGraceActive: Boolean = false,
     val lostTrackRemainingSec: Float = 15.0f,

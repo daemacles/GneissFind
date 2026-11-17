@@ -1,15 +1,16 @@
 /*
- * Split-screen landscape LCARS scanner interface (`.agents/rules/lcars-ui.md`).
+ * Landscape LCARS Geological Tricorder interface (`.agents/rules/lcars-ui.md`).
  *
- * Consumes immutable [ScannerUiState] snapshots from [ScannerViewModel] and renders a non-occluding
- * two-zone tactical layout:
- * - Upper ~50%: [GeologicalViewportZone] hosting the hardware-clipped [PreviewView] inside
- *   [ClippingCameraViewportContainer] (120 Hz GPU RenderNode `translationY` strip stabilization in
- *   `PATROL`, expanding to uncropped full-screen `16:9` with `translationY = 0f` in `LOCK_ON_NEURAL`
- *   and `PINPOINT_CONSTELLATION`), the left-side [PitchTravelGaugeColumn], and [PushBroomTripwireOverlay].
- * - Lower ~50%: [TacticalControlDeckZone] hosting `GNEISSFIND` / build-provenance LCARS shoulders,
- *   single-purpose pill controls (`OPT`, `EXP`, `EYE`, `EIS`, `CAL`, `SW`), the 2x2 mineral matrix,
- *   the central ambidextrous `LOCK NEAREST` / `BREAK LOCK` actuator, and [SourceSelectionDrawer].
+ * Consumes immutable [ScannerUiState] snapshots from [ScannerViewModel] and renders an adaptive
+ * LCARS layout that preserves the single CameraX [PreviewView] instance across mode transitions:
+ * - In `PATROL` (`weight(0.50f)` / `weight(0.50f)` split): [GeologicalViewportZone] on top (120 Hz
+ *   GPU RenderNode `translationY` strip stabilization, [PitchTravelGaugeColumn], and
+ *   [PushBroomTripwireOverlay]) paired with [TacticalControlDeckZone] on the bottom (`OPT`, `EXP`,
+ *   `EYE`, `EIS`, `CAL`, `SW`, 2x2 mineral matrix, central `LOCK NEAREST`, and [SourceSelectionDrawer]).
+ * - In `LOCK_ON_NEURAL` & `PINPOINT_CONSTELLATION` (`weight(1f)` full-screen): hides the lower
+ *   parameter/toggle deck so the uncropped `16:9` camera feed fills the screen between the slim
+ *   `22.dp` top/bottom LCARS telemetry rails, framed by passive LCARS eye-candy readouts and
+ *   [LockOnSideConsole] housing the sole interactive control (`BREAK LOCK`).
  *
  * Main types and entry points:
  * - [PanoramicViewportTransform] / [computePanoramicViewportTransform]: optical coordinate mapping
@@ -49,6 +50,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -87,6 +89,7 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalInspectionMode
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -104,6 +107,7 @@ import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.model.WorldPoint3D
 import com.gneissfind.app.ui.lcars.LcarsBarHeight
+import com.gneissfind.app.ui.lcars.LcarsDetectionReticleSwatch
 import com.gneissfind.app.ui.lcars.LcarsElbow
 import com.gneissfind.app.ui.lcars.LcarsElbowOrientation
 import com.gneissfind.app.ui.lcars.LcarsGutter
@@ -131,6 +135,7 @@ private val TopElbowStemHeight = 50.dp
 private val BottomElbowArmWidth = 192.dp
 private val BottomElbowStemHeight = 48.dp
 private val PitchGaugeWidth = 44.dp
+private val LockOnSideDeckWidth = 168.dp
 private val TngLockGold = Color(0xFFFFCC66)
 private val EyesUpIdleVeilColor = Color(0xE6000000)
 
@@ -456,6 +461,8 @@ fun ScannerScreen(
     onToggleCentralLock: () -> Unit = {},
     initialSourceDrawerOpen: Boolean = false
 ) {
+    val isLockedOn = uiState.acquisitionStage != AcquisitionStage.PATROL
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -464,7 +471,8 @@ fun ScannerScreen(
             .padding(horizontal = 6.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(LcarsGutter)
     ) {
-        // Upper ~50% Height: Geological Viewport (Left Pitch Gauge + Panoramic / Full-16:9 Camera + HUD)
+        // Persistent camera host: ~50% height in PATROL, expanding to 100% full-screen in Lock Mode
+        // without disposing ClippingCameraViewportContainer or rebinding CameraX PreviewView.
         GeologicalViewportZone(
             uiState = uiState,
             hasCameraPermission = hasCameraPermission,
@@ -472,37 +480,41 @@ fun ScannerScreen(
             onBindPreview = onBindPreview,
             onToggleAudioMute = onToggleAudioMute,
             onPatrolViewportTapped = onPatrolViewportTapped,
+            onToggleCentralLock = onToggleCentralLock,
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(0.50f)
+                .weight(if (isLockedOn) 1f else 0.50f)
         )
 
-        // Lower ~50% Height: Tactical Control Deck (Single-Action Buttons + Central Lock + Source Drawer)
-        TacticalControlDeckZone(
-            uiState = uiState,
-            onSelectMode = onSelectMode,
-            onSelectSource = onSelectSource,
-            onToggleSwathTileMode = onToggleSwathTileMode,
-            onToggleEisLock = onToggleEisLock,
-            onSyncPitch = onSyncPitch,
-            onToggleStoneClass = onToggleStoneClass,
-            onToggleShutterClamp = onToggleShutterClamp,
-            onToggleTwoXCrop = onToggleTwoXCrop,
-            onChangeExposureBias = onChangeExposureBias,
-            onToggleEyesUpPatrol = onToggleEyesUpPatrol,
-            onToggleCentralLock = onToggleCentralLock,
-            initialSourceDrawerOpen = initialSourceDrawerOpen,
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(0.50f)
-        )
+        // Lower ~50% Height: Tactical Control Deck (hidden during Lock Mode so video fills the screen)
+        if (!isLockedOn) {
+            TacticalControlDeckZone(
+                uiState = uiState,
+                onSelectMode = onSelectMode,
+                onSelectSource = onSelectSource,
+                onToggleSwathTileMode = onToggleSwathTileMode,
+                onToggleEisLock = onToggleEisLock,
+                onSyncPitch = onSyncPitch,
+                onToggleStoneClass = onToggleStoneClass,
+                onToggleShutterClamp = onToggleShutterClamp,
+                onToggleTwoXCrop = onToggleTwoXCrop,
+                onChangeExposureBias = onChangeExposureBias,
+                onToggleEyesUpPatrol = onToggleEyesUpPatrol,
+                onToggleCentralLock = onToggleCentralLock,
+                initialSourceDrawerOpen = initialSourceDrawerOpen,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(0.50f)
+            )
+        }
     }
 }
 
 /**
- * Upper ~50% LCARS frame hosting the `GNEISSFIND` top-left elbow, high-water-mark passive telemetry
- * header segments (`PITCH`, `RANGE/RESOLUTION`, `VEL`, `OPTICS/SHUTTER/ISO`), the left stem (`FPS`
- * readout and sole `AUDIO` mute pill), the [PitchTravelGaugeColumn], and [PanoramicCameraViewport].
+ * Persistent LCARS camera frame (`weight(0.50f)` in `PATROL`, expanding to `weight(1f)` full-screen
+ * in `LOCK_ON_NEURAL` and `PINPOINT_CONSTELLATION`) hosting the `GNEISSFIND` top-left elbow,
+ * high-water-mark passive telemetry rails, left stem, [PanoramicCameraViewport], and (when locked
+ * on) the build-provenance bottom rail plus [LockOnSideConsole] housing the sole `BREAK LOCK` button.
  */
 @Composable
 private fun GeologicalViewportZone(
@@ -512,6 +524,7 @@ private fun GeologicalViewportZone(
     onBindPreview: (LifecycleOwner, PreviewView) -> Unit,
     onToggleAudioMute: (Boolean) -> Unit,
     onPatrolViewportTapped: (Float, Float, Float) -> Unit,
+    onToggleCentralLock: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isLogging = uiState.operatingMode == OperatingMode.LOG_DATA
@@ -519,6 +532,7 @@ private fun GeologicalViewportZone(
     val rotCode = if (uiState.displaySurfaceRotation == Surface.ROTATION_270) "R-270" else "R-090"
     val crookStart = LcarsStemWidth + LcarsGutter
     val crookTop = LcarsBarHeight + LcarsGutter
+    val crookBottom = if (isLockedOn) LcarsBarHeight + LcarsGutter else 0.dp
 
     val pitchHighWaterWidth = rememberHighWaterSegmentWidth("PITCH -90° [LOCK 16:9]")
     val velHighWaterWidth = rememberHighWaterSegmentWidth("SLOW SWEEP 9.99 M/S")
@@ -587,11 +601,9 @@ private fun GeologicalViewportZone(
                 val hud = uiState.lockOnHudState
                 String.format(
                     Locale.US,
-                    "RANGE %.2f M • ±%.0f MM (%dV %.1f°)",
+                    "RANGE %.2f M • ±%.0f MM",
                     hud.slantRangeMeters,
-                    hud.sigma3dMm,
-                    hud.triangulatedViews,
-                    hud.parallaxAngleDeg
+                    hud.sigma3dMm
                 )
             } else {
                 String.format(
@@ -642,11 +654,14 @@ private fun GeologicalViewportZone(
             )
         }
 
-        // Left 68.dp Stem: Passive FPS Telemetry Block + Sole AUDIO ON/OFF Pill Button
+        // Left 68.dp Stem: FPS + SND button in PATROL; purely passive LCARS C-frame telemetry in Lock Mode
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(top = TopElbowStemHeight + LcarsGutter)
+                .padding(
+                    top = TopElbowStemHeight + LcarsGutter,
+                    bottom = if (isLockedOn) BottomElbowStemHeight + LcarsGutter else 0.dp
+                )
                 .width(LcarsStemWidth)
                 .fillMaxHeight(),
             verticalArrangement = Arrangement.spacedBy(LcarsGutter)
@@ -661,39 +676,79 @@ private fun GeologicalViewportZone(
                     .weight(1f)
             )
 
-            LcarsPillButton(
-                label = if (uiState.isAudioMuted) "MUTE" else "AUDIO",
-                subLabel = if (uiState.isAudioMuted) "OFF" else "ON",
-                prefixCode = "SND",
-                active = !uiState.isAudioMuted,
-                activeColor = LcarsSemanticColors.toggleButton(true, LcarsValueLevel.BASE),
-                inactiveColor = LcarsSemanticColors.toggleButton(false, LcarsValueLevel.BASE),
-                endStyle = LcarsPillEndStyle.CompactRoundedPill,
-                compactStemMode = true,
-                onClick = { onToggleAudioMute(!uiState.isAudioMuted) },
+            if (isLockedOn) {
+                val hud = uiState.lockOnHudState
+                val isHold = hud.isLostTrackGraceActive
+                val isPin = uiState.acquisitionStage == AcquisitionStage.PINPOINT_CONSTELLATION
+                val isAkazeLocked = isPin && hud.isTargetInFrame && hud.akazeInliers >= 12
+                LcarsTelemetryBlock(
+                    prefixCode = "TRK",
+                    valueText = when {
+                        isHold -> "HOLD"
+                        isAkazeLocked -> "PIN"
+                        isPin -> "SRCH"
+                        else -> "LOCK"
+                    },
+                    subText = when {
+                        isHold -> String.format(Locale.US, "%02.0fS", hud.lostTrackRemainingSec)
+                        isAkazeLocked -> "AKAZE"
+                        else -> "B=1"
+                    },
+                    color = when {
+                        isHold -> LcarsColors.GoldenAmber
+                        isPin && !isAkazeLocked -> LcarsColors.IceBlue
+                        else -> LcarsSemanticColors.staticStateLabel(LcarsValueLevel.PLUS)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                )
+            } else {
+                LcarsPillButton(
+                    label = if (uiState.isAudioMuted) "MUTE" else "AUDIO",
+                    subLabel = if (uiState.isAudioMuted) "OFF" else "ON",
+                    prefixCode = "SND",
+                    active = !uiState.isAudioMuted,
+                    activeColor = LcarsSemanticColors.toggleButton(true, LcarsValueLevel.BASE),
+                    inactiveColor = LcarsSemanticColors.toggleButton(false, LcarsValueLevel.BASE),
+                    endStyle = LcarsPillEndStyle.CompactRoundedPill,
+                    compactStemMode = true,
+                    onClick = { onToggleAudioMute(!uiState.isAudioMuted) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                )
+            }
+        }
+
+        // Bottom-Left Build Provenance Elbow + Bottom 22.dp Telemetry Rail when Full-Screen Locked On
+        if (isLockedOn) {
+            LcarsBottomProvenanceFooter(
+                uiState = uiState,
                 modifier = Modifier
+                    .align(Alignment.BottomStart)
                     .fillMaxWidth()
-                    .weight(1f)
             )
         }
 
-        // Inner Crook: Left-Side Pitch/CropY Travel Indicator + Panoramic / Full-16:9 Camera Viewport
+        // Inner Crook: Persistent Panoramic / Full-16:9 Camera Viewport + Mode-Specific Side Chrome
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(start = crookStart, top = crookTop),
+                .padding(start = crookStart, top = crookTop, bottom = crookBottom),
             horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
         ) {
-            PitchTravelGaugeColumn(
-                cropY = uiState.cropY,
-                displayCropYFloat = uiState.displayCropYFloat,
-                eisEnabled = uiState.eisPitchLockEnabled && !isLockedOn,
-                isPitchClamped = uiState.isPitchClamped && !isLockedOn,
-                fullFrameLockOn = isLockedOn,
-                modifier = Modifier
-                    .width(PitchGaugeWidth)
-                    .fillMaxHeight()
-            )
+            if (!isLockedOn) {
+                PitchTravelGaugeColumn(
+                    cropY = uiState.cropY,
+                    displayCropYFloat = uiState.displayCropYFloat,
+                    eisEnabled = uiState.eisPitchLockEnabled,
+                    isPitchClamped = uiState.isPitchClamped,
+                    modifier = Modifier
+                        .width(PitchGaugeWidth)
+                        .fillMaxHeight()
+                )
+            }
 
             PanoramicCameraViewport(
                 uiState = uiState,
@@ -714,6 +769,16 @@ private fun GeologicalViewportZone(
                     )
                     .background(LcarsColors.CanvasBlack)
             )
+
+            if (isLockedOn) {
+                LockOnSideConsole(
+                    uiState = uiState,
+                    onBreakLock = onToggleCentralLock,
+                    modifier = Modifier
+                        .width(LockOnSideDeckWidth)
+                        .fillMaxHeight()
+                )
+            }
         }
     }
 }
@@ -849,10 +914,11 @@ private fun PanoramicCameraViewport(
  *   `#000000`-keylined strip rails, `32 px` inter-tile overlap ticks, high-contrast stone target
  *   reticles, and the `90%` `#E6000000` `"EYES-UP"` OLED-saving veil when `PATROL_IDLE` is active.
  * - In `LOCK_ON_NEURAL` & `PINPOINT_CONSTELLATION`: hides push-broom strip rails/ticks over the
- *   uncropped `16:9` camera view and renders the mineral bracket + shrinking dashed `sigma3dMm`
- *   uncertainty circle (`LOCK_ON_NEURAL`) or solid double-ring crosshair (`PINPOINT_CONSTELLATION`),
- *   telemetry badge `[01 AGATE 96% • 0.64M • ±8MM • AKAZE]`, and pulsing off-screen directional
- *   re-acquisition chevron (`<- 18° AGATE [11S]`).
+ *   uncropped `16:9` camera view and renders the high-visibility `320x320` neural detector crop
+ *   square, world-locked `1 Hz` neural bounding box, mineral bracket + shrinking dashed
+ *   `sigma3dMm` uncertainty circle (`LOCK_ON_NEURAL`) or solid double-ring crosshair
+ *   (`PINPOINT_CONSTELLATION`), and pulsing off-screen directional re-acquisition chevron
+ *   (`<- 18° [14S]`) with zero flickering floating text over the stone.
  * - Renders the non-blocking inline LCARS banner `COMPILING GPU SHADERS...` during async `SRC` loads.
  */
 @Composable
@@ -1208,10 +1274,11 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
     }
 
     val isPinpoint = hud.stage == AcquisitionStage.PINPOINT_CONSTELLATION
+    val isAkazeLocked = isPinpoint && hud.isTargetInFrame && hud.akazeInliers >= 12
     val frameBorderColor = when {
         hud.isLostTrackGraceActive -> LcarsColors.GoldenAmber
-        isPinpoint -> Color(hud.stoneClass.primaryHexColor)
-        else -> LcarsColors.IceBlue.copy(alpha = 0.72f)
+        isAkazeLocked -> Color(hud.stoneClass.primaryHexColor)
+        else -> LcarsColors.IceBlue.copy(alpha = 0.78f)
     }
     drawRect(
         color = frameBorderColor,
@@ -1221,10 +1288,21 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
     )
 
     // Mode tag in top-left of 16:9 frame
-    val modeTag = if (isPinpoint) {
-        String.format(Locale.US, "PINPOINT 16:9 • AKAZE (%d INLIERS)", hud.akazeInliers)
-    } else {
-        String.format(Locale.US, "LOCK-ON 16:9 • B=1 320X320 (%d VIEWS)", hud.triangulatedViews)
+    val modeTag = when {
+        !hud.isTargetInFrame -> "OFF-SCREEN HOLD • PAN TOWARD CHEVRON"
+        hud.isLostTrackGraceActive -> String.format(
+            Locale.US,
+            "HOLDING ANCHOR • %.0fS GRACE",
+            hud.lostTrackRemainingSec
+        )
+        isAkazeLocked -> "PINPOINT 16:9 • 30HZ AKAZE + 1HZ B=1"
+        isPinpoint -> "RE-ACQUIRING 16:9 • B=1 WIDE SEARCH"
+        else -> String.format(
+            Locale.US,
+            "LOCK-ON 16:9 • B=1 %dX%d",
+            hud.cropSizePx,
+            hud.cropSizePx
+        )
     }
     hudPaint.textSize = 10.dp.toPx()
     val modeTagW = hudPaint.measureText(modeTag) + 12.dp.toPx()
@@ -1242,25 +1320,55 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
         hudPaint
     )
 
-    // Subtle dashed 320x320 neural crop window indicator in Stage 2 (LOCK_ON_NEURAL)
-    if (!isPinpoint && hud.isTargetInFrame) {
-        val cL = fLeft + hud.cropLeftPx * transform.scale
-        val cT = fTop + hud.cropTopPx * transform.scale
-        val cSpan = hud.cropSizePx * transform.scale
+    // High-visibility adaptive [320..640] neural detector window rendered cleanly without inner text clutter
+    if (hud.isTargetInFrame) {
+        val cL = (fLeft + hud.cropLeftPx * transform.scale).coerceIn(fLeft, fRight)
+        val cT = (fTop + hud.cropTopPx * transform.scale).coerceIn(fTop, fBottom)
+        val cR = (fLeft + (hud.cropLeftPx + hud.cropSizePx) * transform.scale).coerceIn(cL, fRight)
+        val cB = (fTop + (hud.cropTopPx + hud.cropSizePx) * transform.scale).coerceIn(cT, fBottom)
+        val cSize = Size(max(1f, cR - cL), max(1f, cB - cT))
+        val cropDash = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
+
         drawRect(
-            color = LcarsColors.IceBlue.copy(alpha = 0.28f),
+            color = Color(0xB3000000),
             topLeft = Offset(cL, cT),
-            size = Size(cSpan, cSpan),
-            style = Stroke(
-                width = 1.dp.toPx(),
-                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 8f), 0f)
-            )
+            size = cSize,
+            style = Stroke(width = 3.6.dp.toPx())
+        )
+        drawRect(
+            color = LcarsColors.IceBlue.copy(alpha = 0.86f),
+            topLeft = Offset(cL, cT),
+            size = cSize,
+            style = Stroke(width = 1.8.dp.toPx(), pathEffect = cropDash)
         )
     }
 
     val mineralColor = Color(hud.stoneClass.primaryHexColor)
 
     if (hud.isTargetInFrame) {
+        // World-locked 1 Hz neural detector stone box inside the detector window during PINPOINT
+        if (isPinpoint && hud.hasNeuralDetectorBox) {
+            val nLeft = (fLeft + hud.neuralBoxLeftPx * transform.scale).coerceIn(fLeft, fRight)
+            val nTop = (fTop + hud.neuralBoxTopPx * transform.scale).coerceIn(fTop, fBottom)
+            val nRight = (fLeft + hud.neuralBoxRightPx * transform.scale).coerceIn(nLeft, fRight)
+            val nBottom = (fTop + hud.neuralBoxBottomPx * transform.scale).coerceIn(nTop, fBottom)
+            if (nRight - nLeft >= 8f && nBottom - nTop >= 8f) {
+                val neuralDash = PathEffect.dashPathEffect(floatArrayOf(6f, 4f), 0f)
+                drawRect(
+                    color = Color(0xCC000000),
+                    topLeft = Offset(nLeft, nTop),
+                    size = Size(nRight - nLeft, nBottom - nTop),
+                    style = Stroke(width = 3.2.dp.toPx())
+                )
+                drawRect(
+                    color = LcarsColors.IceBlue,
+                    topLeft = Offset(nLeft, nTop),
+                    size = Size(nRight - nLeft, nBottom - nTop),
+                    style = Stroke(width = 1.6.dp.toPx(), pathEffect = neuralDash)
+                )
+            }
+        }
+
         val left = (fLeft + hud.frameLeftPx * transform.scale).coerceIn(fLeft, fRight)
         val top = (fTop + hud.frameTopPx * transform.scale).coerceIn(fTop, fBottom)
         val right = (fLeft + hud.frameRightPx * transform.scale).coerceIn(fLeft, fRight)
@@ -1281,8 +1389,8 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
             min(transform.renderedFrameWidthPx, transform.renderedFrameHeightPx) * 0.44f
         )
 
-        if (isPinpoint) {
-            // Solid double-ring crosshair for Stage 3 PINPOINT_CONSTELLATION (.agents/rules/lcars-ui.md §4)
+        if (isAkazeLocked) {
+            // Solid double-ring crosshair ONLY when AKAZE texture constellation (>= 12 PTS) is actively locked
             val outerR = max(14.dp.toPx(), sigmaPxScaled)
             val innerR = max(6.dp.toPx(), outerR * 0.48f)
             val strokePx = 2.dp.toPx()
@@ -1325,61 +1433,23 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
                 drawLine(color = mineralColor, start = s, end = e, strokeWidth = strokePx)
             }
         } else {
-            // Shrinking dashed uncertainty circle representing sigma3dMm projected into pixels
+            // Dashed uncertainty / search circle when converging in 3D or re-acquiring with B=1
             val dashEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 7f), 0f)
             val ringStroke = 2.dp.toPx()
+            val ringRadius = if (isPinpoint) max(22.dp.toPx(), sigmaPxScaled) else sigmaPxScaled
             drawCircle(
                 color = LcarsColors.CanvasBlack,
-                radius = sigmaPxScaled,
+                radius = ringRadius,
                 center = Offset(cx, cy),
                 style = Stroke(width = ringStroke + 3.dp.toPx(), pathEffect = dashEffect)
             )
             drawCircle(
                 color = mineralColor,
-                radius = sigmaPxScaled,
+                radius = ringRadius,
                 center = Offset(cx, cy),
                 style = Stroke(width = ringStroke, pathEffect = dashEffect)
             )
         }
-
-        // Reticle telemetry badge: [01 AGATE 96% • 0.64M • ±8MM • AKAZE]
-        val badgeText = String.format(
-            Locale.US,
-            "[%s %s %.0f%% • %.2fM • ±%.0fMM • %s]",
-            hud.stoneClass.codePrefix,
-            hud.stoneClass.lcarsShortName.substringBefore(" /"),
-            hud.smoothedConfidence * 100f,
-            hud.slantRangeMeters,
-            hud.sigma3dMm,
-            hud.trackingSourceBadge
-        )
-        labelPaint.textSize = 11.dp.toPx()
-        val badgeW = labelPaint.measureText(badgeText) + 12.dp.toPx()
-        val badgeH = 17.dp.toPx()
-        val badgeLeft = (cx - badgeW * 0.5f).coerceIn(
-            fLeft + 4f,
-            max(fLeft + 4f, fRight - badgeW - 4f)
-        )
-        val anchorTop = min(top, cy - sigmaPxScaled)
-        val anchorBottom = max(bottom, cy + sigmaPxScaled)
-        val badgeTop = if (anchorTop - badgeH - 4.dp.toPx() >= fTop + 2f) {
-            anchorTop - badgeH - 4.dp.toPx()
-        } else {
-            min(fBottom - badgeH - 2f, anchorBottom + 4.dp.toPx())
-        }
-
-        drawRect(
-            color = LcarsColors.CanvasBlack,
-            topLeft = Offset(badgeLeft, badgeTop),
-            size = Size(badgeW, badgeH)
-        )
-        labelPaint.color = mineralColor.toArgb()
-        drawContext.canvas.nativeCanvas.drawText(
-            badgeText,
-            badgeLeft + 6.dp.toPx(),
-            badgeTop + badgeH - 4.dp.toPx(),
-            labelPaint
-        )
     } else {
         // Off-screen directional re-acquisition chevron during 15s grace window (.agents/rules/lcars-ui.md §4)
         val chevron = hud.offScreenChevron
@@ -1391,8 +1461,8 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
             val perpX = -dirY
             val perpY = dirX
 
-            val tipLen = 11.dp.toPx()
-            val wingSpan = 8.dp.toPx()
+            val tipLen = 12.dp.toPx()
+            val wingSpan = 9.dp.toPx()
             val tip = Offset(edgeX + dirX * tipLen * 0.5f, edgeY + dirY * tipLen * 0.5f)
             val wingA = Offset(
                 edgeX - dirX * tipLen * 0.5f + perpX * wingSpan,
@@ -1419,23 +1489,20 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
                 style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
             )
 
-            val arrowPrefix = if (dirX < -0.25f) "<- " else ""
-            val arrowSuffix = if (dirX > 0.25f) " ->" else ""
+            val degClamped = chevron.angularOffsetDeg.coerceIn(0f, 99f)
             val chevLabel = String.format(
                 Locale.US,
-                "%s%.0f° %s [%02.0fS]%s",
-                arrowPrefix,
-                chevron.angularOffsetDeg,
-                hud.stoneClass.lcarsShortName.substringBefore(" /"),
-                hud.lostTrackRemainingSec,
-                arrowSuffix
+                "%02.0f° • %02.0fS",
+                degClamped,
+                hud.lostTrackRemainingSec
             )
             labelPaint.textSize = 11.dp.toPx()
-            val cw = labelPaint.measureText(chevLabel) + 12.dp.toPx()
+            val fixedBoxW = labelPaint.measureText("99° • 15S") + 14.dp.toPx()
+            val textW = labelPaint.measureText(chevLabel)
             val ch = 18.dp.toPx()
-            val cl = (edgeX - cw * 0.5f - dirX * (cw * 0.35f)).coerceIn(
+            val cl = (edgeX - fixedBoxW * 0.5f - dirX * (fixedBoxW * 0.42f)).coerceIn(
                 fLeft + 14.dp.toPx(),
-                max(fLeft + 14.dp.toPx(), fRight - cw - 14.dp.toPx())
+                max(fLeft + 14.dp.toPx(), fRight - fixedBoxW - 14.dp.toPx())
             )
             val ct = (edgeY - ch * 0.5f - dirY * 14.dp.toPx()).coerceIn(
                 fTop + 6.dp.toPx(),
@@ -1444,12 +1511,12 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
             drawRect(
                 color = LcarsColors.CanvasBlack,
                 topLeft = Offset(cl, ct),
-                size = Size(cw, ch)
+                size = Size(fixedBoxW, ch)
             )
             labelPaint.color = LcarsColors.GoldenAmber.copy(alpha = chevronPulseAlpha).toArgb()
             drawContext.canvas.nativeCanvas.drawText(
                 chevLabel,
-                cl + 6.dp.toPx(),
+                cl + (fixedBoxW - textW) * 0.5f,
                 ct + ch - 4.dp.toPx(),
                 labelPaint
             )
@@ -1552,18 +1619,15 @@ private fun PitchTravelGaugeColumn(
     displayCropYFloat: Float,
     eisEnabled: Boolean,
     isPitchClamped: Boolean,
-    fullFrameLockOn: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val clampedAlert = eisEnabled && isPitchClamped
     val readoutBg = when {
-        fullFrameLockOn -> LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.BASE)
         !eisEnabled -> LcarsColors.MutedSlate
         clampedAlert -> LcarsSemanticColors.criticalAlert
         else -> LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.PLUS)
     }
     val readoutFg = when {
-        fullFrameLockOn -> LcarsColors.CanvasBlack
         !eisEnabled -> LcarsColors.InactiveLabel
         clampedAlert -> LcarsColors.AlertWhite
         else -> LcarsColors.CanvasBlack
@@ -1574,12 +1638,8 @@ private fun PitchTravelGaugeColumn(
         verticalArrangement = Arrangement.spacedBy(LcarsGutter)
     ) {
         LcarsTelemetryBlock(
-            valueText = when {
-                fullFrameLockOn -> "16:9"
-                clampedAlert -> "LIM"
-                else -> String.format(Locale.US, "%03d", cropY)
-            },
-            subText = if (fullFrameLockOn) "FULL" else "Y-PX",
+            valueText = if (clampedAlert) "LIM" else String.format(Locale.US, "%03d", cropY),
+            subText = "Y-PX",
             color = readoutBg,
             textColor = readoutFg,
             modifier = Modifier
@@ -1616,33 +1676,386 @@ private fun PitchTravelGaugeColumn(
                 strokeWidth = 2.dp.toPx()
             )
 
-            if (fullFrameLockOn) {
-                drawRect(
-                    color = LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.BASE),
-                    topLeft = Offset(inset + 2.dp.toPx(), inset + 2.dp.toPx()),
-                    size = Size(
-                        max(2f, w - 2f * (inset + 2.dp.toPx())),
-                        max(2f, h - 2f * (inset + 2.dp.toPx()))
-                    )
+            // Continuous 120 Hz 384/1080 strip window indicator inside [0..696]
+            val windowFrac = StripRoiGeometry.STRIP_HEIGHT_PX.toFloat() /
+                StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat()
+            val thumbH = (h * windowFrac).coerceAtLeast(10.dp.toPx())
+            val maxCropY = StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
+            val travelFrac = displayCropYFloat.coerceIn(0f, maxCropY) / maxCropY
+            val thumbTop = travelFrac * max(0f, h - thumbH)
+
+            val thumbColor = when {
+                !eisEnabled -> LcarsColors.MutedSlate
+                clampedAlert -> LcarsSemanticColors.criticalAlert
+                else -> LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.BASE)
+            }
+            drawRect(
+                color = thumbColor,
+                topLeft = Offset(inset + 2.dp.toPx(), thumbTop),
+                size = Size(max(2f, w - 2f * (inset + 2.dp.toPx())), thumbH)
+            )
+        }
+    }
+}
+
+/**
+ * Shared bottom-left swept LCARS build-provenance elbow (`GIT_COMMIT_HASH_6 • BUILD_DATE_ISO`) and
+ * `22.dp` passive telemetry footer rail rendered at the bottom of the screen in both `PATROL` and
+ * full-screen Lock Mode.
+ */
+@Composable
+private fun LcarsBottomProvenanceFooter(
+    uiState: ScannerUiState,
+    modifier: Modifier = Modifier
+) {
+    val swathCodeHighWaterWidth = rememberHighWaterSegmentWidth("47-1792")
+    val pingHighWaterWidth = rememberHighWaterSegmentWidth("PING 999 HZ @ 99.9/S")
+    val provenanceLabel = remember {
+        "${BuildConfig.GIT_COMMIT_HASH_6} • ${BuildConfig.BUILD_DATE_ISO}"
+    }
+
+    Box(
+        modifier = modifier.height(BottomElbowStemHeight)
+    ) {
+        LcarsElbow(
+            orientation = LcarsElbowOrientation.BottomLeft,
+            color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.BASE),
+            armLabel = provenanceLabel,
+            stemCode = "M2C",
+            armTextStyle = LcarsTypography.TelemetryBar,
+            stemTextStyle = LcarsTypography.PillSubLabel,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .width(BottomElbowArmWidth)
+                .height(BottomElbowStemHeight)
+        )
+
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .fillMaxWidth()
+                .padding(start = BottomElbowArmWidth + LcarsGutter)
+                .height(LcarsBarHeight),
+            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
+        ) {
+            val statusSegmentCode = when (uiState.acquisitionStage) {
+                AcquisitionStage.PATROL -> "47-${uiState.swathTileMode.stripWidthPx}"
+                AcquisitionStage.LOCK_ON_NEURAL -> "LCK-320"
+                AcquisitionStage.PINPOINT_CONSTELLATION -> "PIN-AKZ"
+            }
+            LcarsHeaderSegment(
+                text = statusSegmentCode,
+                color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.PLUS),
+                modifier = Modifier.width(swathCodeHighWaterWidth)
+            )
+
+            val sweepFooterText = when (uiState.acquisitionStage) {
+                AcquisitionStage.PATROL -> String.format(
+                    Locale.US,
+                    "SWEEP %.1f MS • %s (G1 %.1f | TOPK %.1f | G2 %.1f)",
+                    uiState.rollingLatencyMs,
+                    uiState.detectorBackend.label,
+                    uiState.part1LatencyMs,
+                    uiState.bridgeLatencyMs,
+                    uiState.part2LatencyMs
+                )
+                AcquisitionStage.LOCK_ON_NEURAL -> String.format(
+                    Locale.US,
+                    "LOCK B=1 %.1f MS • %dX%d W8-DYN (G1 %.1f | G2 %.1f)",
+                    uiState.rollingLatencyMs,
+                    uiState.lockOnHudState.cropSizePx,
+                    uiState.lockOnHudState.cropSizePx,
+                    uiState.part1LatencyMs,
+                    uiState.part2LatencyMs
+                )
+                AcquisitionStage.PINPOINT_CONSTELLATION -> {
+                    val hud = uiState.lockOnHudState
+                    val neuralB1Ms = uiState.part1LatencyMs + uiState.bridgeLatencyMs + uiState.part2LatencyMs
+                    if (hud.akazeInliers >= 12) {
+                        String.format(
+                            Locale.US,
+                            "PINPOINT 30HZ AKAZE (%d PTS) • 1HZ B=1 %.1f MS",
+                            hud.akazeInliers,
+                            if (neuralB1Ms > 0f) neuralB1Ms else uiState.rollingLatencyMs
+                        )
+                    } else {
+                        String.format(
+                            Locale.US,
+                            "RE-ACQUIRING B=1 %.1f MS • %dX%d WIDE SEARCH",
+                            if (neuralB1Ms > 0f) neuralB1Ms else uiState.rollingLatencyMs,
+                            hud.cropSizePx,
+                            hud.cropSizePx
+                        )
+                    }
+                }
+            }
+            LcarsHeaderSegment(
+                text = sweepFooterText,
+                color = LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.MINUS),
+                modifier = Modifier.weight(1f)
+            )
+
+            val audioTelemetry = when {
+                uiState.isAudioMuted -> "AUDIO MUTED"
+                uiState.audioPitchHz > 0f -> String.format(
+                    Locale.US,
+                    "PING %.0f HZ @ %.1f/S",
+                    uiState.audioPitchHz,
+                    uiState.audioCadenceHz
+                )
+                else -> "SONIFIER ARMED"
+            }
+            LcarsHeaderSegment(
+                text = audioTelemetry,
+                color = if (uiState.isAudioMuted) {
+                    LcarsColors.MutedSlate
+                } else {
+                    LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.PLUS)
+                },
+                textColor = if (uiState.isAudioMuted) {
+                    LcarsColors.InactiveLabel
+                } else {
+                    LcarsColors.CanvasBlack
+                },
+                alignEnd = true,
+                modifier = Modifier.width(pingHighWaterWidth)
+            )
+        }
+    }
+}
+
+/**
+ * Right-hand `168.dp` LCARS tactical pod rendered alongside the full-height `16:9` camera feed in
+ * `LOCK_ON_NEURAL` and `PINPOINT_CONSTELLATION`.
+ *
+ * Occupies the natural `20:9` horizontal pillarbox zone so zero vertical pixels are stolen from the
+ * `16:9` video feed, pairing non-redundant, explicitly labeled 1:1 color-correlated LCARS sensor
+ * gauges (`MODEL CONF`, `3D ANGLES`, and `TEXTURE PTS` / `HOLD TIMER`) with the **sole interactive
+ * actuator on screen**: the prominent Mars Red `BREAK LOCK` button.
+ */
+@Composable
+private fun LockOnSideConsole(
+    uiState: ScannerUiState,
+    onBreakLock: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val hud = uiState.lockOnHudState
+    val isPinpoint = uiState.acquisitionStage == AcquisitionStage.PINPOINT_CONSTELLATION
+    val isAkazeLocked = isPinpoint && hud.isTargetInFrame && hud.akazeInliers >= 12
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(LcarsGutter)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "SENSOR LOCK",
+                style = LcarsTypography.MicroCode,
+                color = LcarsSemanticColors.structuralChrome(LcarsValueLevel.PLUS)
+            )
+            Text(
+                text = when {
+                    hud.isLostTrackGraceActive -> "HOLDING"
+                    isAkazeLocked -> "PINPOINT"
+                    isPinpoint -> "SEARCHING"
+                    else -> "HOMING"
+                },
+                style = LcarsTypography.MicroCode,
+                color = when {
+                    hud.isLostTrackGraceActive -> LcarsColors.GoldenAmber
+                    isPinpoint && !isAkazeLocked -> LcarsColors.IceBlue
+                    else -> LcarsSemanticColors.staticStateLabel(LcarsValueLevel.BASE)
+                }
+            )
+        }
+
+        // Passive Mineral Signature Block (mineral name + physical diameter, zero top-bar duplication)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp)
+                .background(LcarsSemanticColors.staticStateLabel(LcarsValueLevel.MINUS))
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            LcarsDetectionReticleSwatch(
+                reticleColor = Color(hud.stoneClass.primaryHexColor),
+                enabled = true
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = hud.stoneClass.lcarsShortName.uppercase(Locale.US),
+                    style = LcarsTypography.TelemetryBar,
+                    color = LcarsColors.CanvasBlack,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = String.format(
+                        Locale.US,
+                        "EST. SIZE %.0f MM",
+                        hud.estimatedDiameterMm
+                    ),
+                    style = LcarsTypography.MicroCode,
+                    color = LcarsColors.CanvasBlack,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        // 3 Explicitly Labeled, 1:1 Color-Correlated 8-Segment LCARS Sensor Gauges
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .border(
+                    width = 2.dp,
+                    color = LcarsSemanticColors.structuralChrome(LcarsValueLevel.MINUS),
+                    shape = RoundedCornerShape(8.dp)
+                )
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.SpaceEvenly
+        ) {
+            val confPct = (hud.smoothedConfidence * 100f).roundToInt().coerceIn(0, 99)
+            LockOnTelemetryGaugeRow(
+                label = "MODEL CONF",
+                valueText = String.format(Locale.US, "%d%%", confPct),
+                fraction = hud.smoothedConfidence.coerceIn(0f, 1f),
+                color = LcarsColors.GoldenAmber
+            )
+
+            val clampedAngles = hud.parallaxAngleDeg.coerceIn(0f, 45.0f)
+            val angleValueText = if (clampedAngles >= 3.0f) {
+                String.format(Locale.US, "%.1f° LOCK", clampedAngles)
+            } else {
+                String.format(Locale.US, "%.1f° / 3.0°", clampedAngles)
+            }
+            LockOnTelemetryGaugeRow(
+                label = "3D ANGLES",
+                valueText = angleValueText,
+                fraction = (hud.parallaxAngleDeg / 3.0f).coerceIn(0f, 1f),
+                color = LcarsColors.IceBlue
+            )
+
+            if (hud.isLostTrackGraceActive) {
+                LockOnTelemetryGaugeRow(
+                    label = "HOLD TIMER",
+                    valueText = String.format(Locale.US, "%.1fS / 15S", hud.lostTrackRemainingSec),
+                    fraction = (hud.lostTrackRemainingSec / 15.0f).coerceIn(0f, 1f),
+                    color = LcarsColors.GoldenAmber
+                )
+            } else if (isPinpoint) {
+                LockOnTelemetryGaugeRow(
+                    label = "TEXTURE PTS",
+                    valueText = String.format(Locale.US, "%d PTS", hud.akazeInliers),
+                    fraction = (hud.akazeInliers / 32f).coerceIn(0f, 1f),
+                    color = LcarsColors.Periwinkle
                 )
             } else {
-                // Continuous 120 Hz 384/1080 strip window indicator inside [0..696]
-                val windowFrac = StripRoiGeometry.STRIP_HEIGHT_PX.toFloat() /
-                    StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat()
-                val thumbH = (h * windowFrac).coerceAtLeast(10.dp.toPx())
-                val maxCropY = StripRoiGeometry.MAX_CROP_Y_PX.toFloat()
-                val travelFrac = displayCropYFloat.coerceIn(0f, maxCropY) / maxCropY
-                val thumbTop = travelFrac * max(0f, h - thumbH)
+                LockOnTelemetryGaugeRow(
+                    label = "TEXTURE PTS",
+                    valueText = "WAIT 3D",
+                    fraction = 0f,
+                    color = LcarsColors.InactiveLabel
+                )
+            }
+        }
 
-                val thumbColor = when {
-                    !eisEnabled -> LcarsColors.MutedSlate
-                    clampedAlert -> LcarsSemanticColors.criticalAlert
-                    else -> LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.BASE)
-                }
+        // Sole Interactive Control in Lock Mode: Prominent Mars Red BREAK LOCK Actuator
+        val breakLabel = if (hud.isLostTrackGraceActive) {
+            String.format(Locale.US, "BREAK [%02.0fS]", hud.lostTrackRemainingSec)
+        } else {
+            "BREAK LOCK"
+        }
+        val breakSubLabel = if (isPinpoint) {
+            "EXIT PINPOINT"
+        } else {
+            "RETURN TO PATROL"
+        }
+        LcarsPillButton(
+            label = breakLabel,
+            subLabel = breakSubLabel,
+            prefixCode = "BRK",
+            active = true,
+            activeColor = LcarsSemanticColors.criticalAlert,
+            endStyle = LcarsPillEndStyle.Capsule,
+            onClick = onBreakLock,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(88.dp)
+        )
+    }
+}
+
+/**
+ * Single self-explanatory LCARS gauge row inside [LockOnSideConsole] whose left metric title,
+ * right numeric readout, and 8-segment horizontal bar share the exact same semantic [color].
+ */
+@Composable
+private fun LockOnTelemetryGaugeRow(
+    label: String,
+    valueText: String,
+    fraction: Float,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = label,
+                style = LcarsTypography.MicroCode,
+                color = color,
+                maxLines = 1
+            )
+            Text(
+                text = valueText,
+                style = LcarsTypography.MicroCode,
+                color = color,
+                maxLines = 1
+            )
+        }
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(9.dp)
+        ) {
+            val segmentCount = 8
+            val segGap = 2.dp.toPx()
+            val segWidth = max(2f, (size.width - segGap * (segmentCount - 1)) / segmentCount)
+            val clampedFrac = fraction.coerceIn(0f, 1f)
+            val activeSegments = if (clampedFrac <= 0.01f) {
+                0
+            } else {
+                (clampedFrac * segmentCount).roundToInt().coerceIn(1, segmentCount)
+            }
+            for (seg in 0 until segmentCount) {
+                val x = seg * (segWidth + segGap)
                 drawRect(
-                    color = thumbColor,
-                    topLeft = Offset(inset + 2.dp.toPx(), thumbTop),
-                    size = Size(max(2f, w - 2f * (inset + 2.dp.toPx())), thumbH)
+                    color = if (seg < activeSegments) {
+                        color
+                    } else {
+                        LcarsColors.MutedSlate.copy(alpha = 0.35f)
+                    },
+                    topLeft = Offset(x, 0f),
+                    size = Size(segWidth, size.height)
                 )
             }
         }
@@ -1675,12 +2088,6 @@ private fun TacticalControlDeckZone(
     val isLogging = uiState.operatingMode == OperatingMode.LOG_DATA
     val crookStart = LcarsStemWidth + LcarsGutter
     val crookBottom = LcarsBarHeight + LcarsGutter
-
-    val swathCodeHighWaterWidth = rememberHighWaterSegmentWidth("47-1792")
-    val pingHighWaterWidth = rememberHighWaterSegmentWidth("PING 999 HZ @ 99.9/S")
-    val provenanceLabel = remember {
-        "${BuildConfig.GIT_COMMIT_HASH_6} • ${BuildConfig.BUILD_DATE_ISO}"
-    }
 
     Box(modifier = modifier.background(LcarsColors.CanvasBlack)) {
         // Left 68.dp Stem: Single Combined SCAN/LOG Mode Button + Passive Frame Counter Block
@@ -1723,96 +2130,12 @@ private fun TacticalControlDeckZone(
             )
         }
 
-        // Bottom-Left Swept LCARS Build Provenance Elbow (.agents/rules/lcars-ui.md §2.2)
-        LcarsElbow(
-            orientation = LcarsElbowOrientation.BottomLeft,
-            color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.BASE),
-            armLabel = provenanceLabel,
-            stemCode = "M2C",
-            armTextStyle = LcarsTypography.TelemetryBar,
-            stemTextStyle = LcarsTypography.PillSubLabel,
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .width(BottomElbowArmWidth)
-                .height(BottomElbowStemHeight)
-        )
-
-        // Bottom 22.dp Passive Telemetry Footer Rail (High-Water-Mark Ping Width)
-        Row(
+        LcarsBottomProvenanceFooter(
+            uiState = uiState,
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .fillMaxWidth()
-                .padding(start = BottomElbowArmWidth + LcarsGutter)
-                .height(LcarsBarHeight),
-            horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
-        ) {
-            val statusSegmentCode = when (uiState.acquisitionStage) {
-                AcquisitionStage.PATROL -> "47-${uiState.swathTileMode.stripWidthPx}"
-                AcquisitionStage.LOCK_ON_NEURAL -> "LCK-320"
-                AcquisitionStage.PINPOINT_CONSTELLATION -> "PIN-AKZ"
-            }
-            LcarsHeaderSegment(
-                text = statusSegmentCode,
-                color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.PLUS),
-                modifier = Modifier.width(swathCodeHighWaterWidth)
-            )
-
-            val sweepFooterText = when (uiState.acquisitionStage) {
-                AcquisitionStage.PATROL -> String.format(
-                    Locale.US,
-                    "SWEEP %.1f MS • %s (G1 %.1f | TOPK %.1f | G2 %.1f)",
-                    uiState.rollingLatencyMs,
-                    uiState.detectorBackend.label,
-                    uiState.part1LatencyMs,
-                    uiState.bridgeLatencyMs,
-                    uiState.part2LatencyMs
-                )
-                AcquisitionStage.LOCK_ON_NEURAL -> String.format(
-                    Locale.US,
-                    "LOCK B=1 %.1f MS • 320X320 W8-DYN (G1 %.1f | G2 %.1f)",
-                    uiState.rollingLatencyMs,
-                    uiState.part1LatencyMs,
-                    uiState.part2LatencyMs
-                )
-                AcquisitionStage.PINPOINT_CONSTELLATION -> String.format(
-                    Locale.US,
-                    "PINPOINT AKAZE (%d INLIERS) • 1HZ B=1 %.1f MS",
-                    uiState.lockOnHudState.akazeInliers,
-                    uiState.rollingLatencyMs
-                )
-            }
-            LcarsHeaderSegment(
-                text = sweepFooterText,
-                color = LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.MINUS),
-                modifier = Modifier.weight(1f)
-            )
-
-            val audioTelemetry = when {
-                uiState.isAudioMuted -> "AUDIO MUTED"
-                uiState.audioPitchHz > 0f -> String.format(
-                    Locale.US,
-                    "PING %.0f HZ @ %.1f/S",
-                    uiState.audioPitchHz,
-                    uiState.audioCadenceHz
-                )
-                else -> "SONIFIER ARMED"
-            }
-            LcarsHeaderSegment(
-                text = audioTelemetry,
-                color = if (uiState.isAudioMuted) {
-                    LcarsColors.MutedSlate
-                } else {
-                    LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.PLUS)
-                },
-                textColor = if (uiState.isAudioMuted) {
-                    LcarsColors.InactiveLabel
-                } else {
-                    LcarsColors.CanvasBlack
-                },
-                alignEnd = true,
-                modifier = Modifier.width(pingHighWaterWidth)
-            )
-        }
+        )
 
         // 2-Column Tactical Control Matrix Inside Bottom-Left Crook
         Row(
@@ -2470,11 +2793,22 @@ private fun ScannerScreenLockOnPinpointPreview() {
                     frameTopPx = 470f,
                     frameRightPx = 1030f,
                     frameBottomPx = 610f,
+                    cropLeftPx = 800,
+                    cropTopPx = 380,
+                    cropSizePx = 320,
+                    hasNeuralDetectorBox = true,
+                    neuralBoxLeftPx = 898f,
+                    neuralBoxTopPx = 476f,
+                    neuralBoxRightPx = 1022f,
+                    neuralBoxBottomPx = 604f,
                     isTargetInFrame = true,
                     trackingSourceBadge = "AKAZE"
                 ),
                 sweepHz = 29.8f,
                 rollingLatencyMs = 2.8f,
+                part1LatencyMs = 46.2f,
+                bridgeLatencyMs = 0.6f,
+                part2LatencyMs = 15.4f,
                 imuPitchDeg = 52f,
                 referencePitchDeg = 45f,
                 sensorIso = 520,
