@@ -9,7 +9,11 @@
 package com.gneissfind.app.logging
 
 import android.view.Surface
+import com.gneissfind.app.camera.ReplayRunSummary
+import com.gneissfind.app.camera.ReplaySessionItem
+import com.gneissfind.app.inference.SyntheticTargetProfile
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
+import com.gneissfind.app.ui.DetectorSourceOption
 import com.gneissfind.app.vision.PushBroomCropper
 import com.gneissfind.app.vision.Yuv420Frame
 import com.google.common.truth.Truth.assertThat
@@ -161,5 +165,41 @@ class FieldDataLoggerTest {
         assertThat(nv12[uvBase + 1].toInt() and 0xFF).isEqualTo(160)
         assertThat(nv12[nv12.size - 2].toInt() and 0xFF).isEqualTo(80 + (w / 2 - 1))
         assertThat(nv12[nv12.size - 1].toInt() and 0xFF).isEqualTo(160 + (h / 2 - 1))
+    }
+
+    @Test
+    fun sourceDrawerAndReplaySummary_retainsSingleSyntheticDemoAndFormatsLogcatJson() {
+        val syntheticOptions = DetectorSourceOption.entries.filter { it.syntheticProfile != null }
+        assertThat(syntheticOptions).hasSize(1)
+        assertThat(syntheticOptions.single().syntheticProfile)
+            .isEqualTo(SyntheticTargetProfile.MIXED_GRAVEL_WALK)
+
+        val item = ReplaySessionItem(
+            code = "R-01",
+            sessionName = "20261117_030000",
+            sessionDirPath = "/sdcard/Android/media/com.gneissfind.app/replays/20261117_030000",
+            durationSec = 12
+        )
+        assertThat(item.drawerTitle).isEqualTo("REPLAY: 20261117_030000")
+        assertThat(item.drawerSubtitle).contains("[12S]")
+
+        val summary = ReplayRunSummary(
+            sessionName = "m2d_validation_v1",
+            frames = 180,
+            locks = 1,
+            handovers = 1,
+            lostLocks = 0,
+            distractorJumps = 0,
+            exceptions = 0
+        )
+        val line = summary.toLogLine()
+        assertThat(line).startsWith("GNEISSFIND_REPLAY_SUMMARY ")
+        assertThat(line).contains("\"session\":\"m2d_validation_v1\"")
+        assertThat(line).contains("\"frames\":180")
+        assertThat(line).contains("\"locks\":1")
+        assertThat(line).contains("\"handovers\":1")
+        assertThat(line).contains("\"lost_locks\":0")
+        assertThat(line).contains("\"distractor_jumps\":0")
+        assertThat(line).contains("\"exceptions\":0")
     }
 }

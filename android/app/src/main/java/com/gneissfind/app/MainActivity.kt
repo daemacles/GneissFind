@@ -11,6 +11,7 @@
 package com.gneissfind.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
@@ -73,6 +74,9 @@ class MainActivity : ComponentActivity() {
         window.decorView.isSoundEffectsEnabled = false
 
         syncCurrentDisplayGeometry()
+        if (savedInstanceState == null) {
+            handleDebugReplayIntent(intent)
+        }
 
         setContent {
             val hostView = LocalView.current
@@ -89,6 +93,9 @@ class MainActivity : ComponentActivity() {
                     override fun onDisplayRemoved(displayId: Int) = Unit
                     override fun onDisplayChanged(displayId: Int) {
                         syncCurrentDisplayGeometry()
+        if (savedInstanceState == null) {
+            handleDebugReplayIntent(intent)
+        }
                     }
                 }
                 displayManager?.registerDisplayListener(listener, null)
@@ -125,6 +132,9 @@ class MainActivity : ComponentActivity() {
                         when (event) {
                             Lifecycle.Event.ON_RESUME -> {
                                 syncCurrentDisplayGeometry()
+        if (savedInstanceState == null) {
+            handleDebugReplayIntent(intent)
+        }
                                 viewModel.onResumeSensorsAndAudio()
                             }
                             Lifecycle.Event.ON_PAUSE -> viewModel.onPauseSensorsAndAudio()
@@ -169,10 +179,32 @@ class MainActivity : ComponentActivity() {
                     onToggleAudioMute = viewModel::setAudioMuted,
                     onToggleEyesUpPatrol = viewModel::toggleEyesUpPatrol,
                     onPatrolViewportTapped = viewModel::onPatrolViewportTapped,
-                    onToggleCentralLock = viewModel::toggleCentralLockButton
+                    onToggleCentralLock = viewModel::toggleCentralLockButton,
+                    onSelectReplaySession = { item -> viewModel.selectReplaySession(item) },
+                    onOpenSourceDrawer = viewModel::refreshAvailableReplaySessions
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDebugReplayIntent(intent)
+    }
+
+    private fun handleDebugReplayIntent(intent: Intent?) {
+        val replaySession = intent?.getStringExtra(EXTRA_DEBUG_REPLAY_SESSION)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return
+        val autoLockFrame = intent.getIntExtra(EXTRA_DEBUG_AUTO_LOCK_FRAME, -1)
+        val loopReplay = intent.getBooleanExtra(EXTRA_DEBUG_LOOP_REPLAY, true)
+        viewModel.startDebugReplaySessionFromIntent(
+            sessionNameOrPath = replaySession,
+            autoLockFrameIdx = autoLockFrame,
+            loopReplay = loopReplay
+        )
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
@@ -195,5 +227,11 @@ class MainActivity : ComponentActivity() {
             viewportWidthPx = bounds.width(),
             viewportHeightPx = bounds.height()
         )
+    }
+
+    companion object {
+        const val EXTRA_DEBUG_REPLAY_SESSION = "debug_replay_session"
+        const val EXTRA_DEBUG_AUTO_LOCK_FRAME = "debug_auto_lock_frame"
+        const val EXTRA_DEBUG_LOOP_REPLAY = "debug_loop_replay"
     }
 }

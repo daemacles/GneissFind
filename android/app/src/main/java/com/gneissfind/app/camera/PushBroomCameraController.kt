@@ -101,6 +101,13 @@ class PushBroomCameraController(
     private var boundCamera: Camera? = null
     private var previewUseCase: Preview? = null
     private var imageAnalysisUseCase: ImageAnalysis? = null
+    private var lastLifecycleOwner: LifecycleOwner? = null
+    private var lastPreviewView: PreviewView? = null
+
+    /** When `true`, CameraX hardware capture is unbound while [ReplayCameraSource] owns the pipeline. */
+    @Volatile
+    var isSuspendedForReplay: Boolean = false
+        private set
 
     /** Hardware-supported ISO sensitivity range queried from `SENSOR_INFO_SENSITIVITY_RANGE`. */
     private var sensorIsoRange: Range<Int> = Range(100, 6400)
@@ -176,6 +183,8 @@ class PushBroomCameraController(
         previewView: PreviewView,
         initialRotation: Int = targetSurfaceRotation
     ) {
+        lastLifecycleOwner = lifecycleOwner
+        lastPreviewView = previewView
         targetSurfaceRotation = normalizeLandscapeRotation(initialRotation)
         val providerFuture = ProcessCameraProvider.getInstance(appContext)
         providerFuture.addListener(
@@ -183,13 +192,51 @@ class PushBroomCameraController(
                 try {
                     val provider = providerFuture.get()
                     cameraProvider = provider
-                    bindUseCases(provider, lifecycleOwner, previewView)
+                    if (!isSuspendedForReplay) {
+                        bindUseCases(provider, lifecycleOwner, previewView)
+                    }
                 } catch (t: Throwable) {
                     Log.e(TAG, "Failed binding CameraX pipeline", t)
                 }
             },
             ContextCompat.getMainExecutor(appContext)
         )
+    }
+
+    /**
+     * Unbinds CameraX hardware capture on the main thread while [ReplayCameraSource] owns the
+     * viewport and inference pipeline, without destroying the laid-out [PreviewView].
+     */
+    fun suspendCaptureForReplay() {
+        isSuspendedForReplay = true
+        ContextCompat.getMainExecutor(appContext).execute {
+            if (isSuspendedForReplay) {
+                boundCamera = null
+                runCatching { cameraProvider?.unbindAll() }
+            }
+        }
+    }
+
+    /**
+     * Rebinds live CameraX capture on the main thread when exiting [ReplayCameraSource] back to a
+     * live hardware `S-01..S-05` or `SIM` source.
+     */
+    fun resumeCaptureFromReplay() {
+        val wasSuspended = isSuspendedForReplay
+        isSuspendedForReplay = false
+        if (!wasSuspended && boundCamera != null) return
+        ContextCompat.getMainExecutor(appContext).execute {
+            if (isSuspendedForReplay || boundCamera != null) return@execute
+            val owner = lastLifecycleOwner ?: return@execute
+            val view = lastPreviewView ?: return@execute
+            val provider = cameraProvider
+            if (provider != null) {
+                runCatching { bindUseCases(provider, owner, view) }
+                    .onFailure { Log.e(TAG, "Failed resuming CameraX after replay", it) }
+            } else {
+                bindToLifecycle(owner, view, targetSurfaceRotation)
+            }
+        }
     }
 
     /**

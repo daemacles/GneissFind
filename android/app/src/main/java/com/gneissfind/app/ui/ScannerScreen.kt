@@ -21,6 +21,7 @@
 package com.gneissfind.app.ui
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Outline as AndroidOutline
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -29,6 +30,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.widget.FrameLayout
+import android.widget.ImageView
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.RepeatMode
@@ -96,6 +98,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.gneissfind.app.BuildConfig
+import com.gneissfind.app.camera.ReplaySessionItem
 import com.gneissfind.app.model.AcquisitionStage
 import com.gneissfind.app.model.ConfirmedTarget
 import com.gneissfind.app.model.LockOnHudState
@@ -314,9 +317,16 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         isSoundEffectsEnabled = false
     }
 
+    private val replayImageView: ImageView = ImageView(context).apply {
+        scaleType = ImageView.ScaleType.FIT_XY
+        visibility = View.GONE
+        isSoundEffectsEnabled = false
+    }
+
     private var currentCropYFloat: Float = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat()
     private var currentSwathMode: SwathTileMode = SwathTileMode.FIVE_TILE
     private var currentFullFrameLockOn: Boolean = false
+    private var lastRenderedReplaySeq: Long = -1L
 
     init {
         clipChildren = true
@@ -333,16 +343,16 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
             previewView,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         )
+        addView(
+            replayImageView,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+        )
     }
 
     /**
      * Updates the sub-pixel vertical crop offset, swath tile mode, and full-frame Lock-On state,
-     * applying vertical frame shifts directly to `previewView.translationY` on the UI thread in
-     * `PATROL` (`0f` when [fullFrameLockOn] is active) without per-frame layout stalls.
-     *
-     * @param cropYFloat Continuous 120 Hz stabilized `cropY` in `[0f, MAX_CROP_Y_PX]`.
-     * @param swathTileMode Active swath tile mode.
-     * @param fullFrameLockOn Whether uncropped `16:9` Lock-On / Pinpoint mode is active.
+     * applying vertical frame shifts directly to `previewView.translationY` (and `replayImageView.translationY`)
+     * on the UI thread in `PATROL` (`0f` when [fullFrameLockOn] is active) without per-frame layout stalls.
      */
     fun updateStabilizationState(
         cropYFloat: Float,
@@ -358,8 +368,8 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
             requestLayout()
         }
         if (width > 0 && height > 0) {
-            if (currentFullFrameLockOn) {
-                previewView.translationY = 0f
+            val transY = if (currentFullFrameLockOn) {
+                0f
             } else {
                 val t = computePanoramicViewportTransform(
                     viewportWidthPx = width.toFloat(),
@@ -368,9 +378,30 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
                     swathTileMode = currentSwathMode,
                     fullFrameLockOn = false
                 )
-                // Pure GPU RenderNode sub-pixel translation — zero measure/layout stalls.
-                previewView.translationY = t.frameTopPx
+                t.frameTopPx
             }
+            previewView.translationY = transY
+            replayImageView.translationY = transY
+        }
+    }
+
+    /** Updates the replay frame overlay without ever unmeasuring or hiding [previewView] (`fc80785`). */
+    fun updateReplayFrame(isReplayActive: Boolean, bitmap: Bitmap?, frameSeq: Long) {
+        if (isReplayActive && bitmap != null) {
+            if (replayImageView.visibility != View.VISIBLE) {
+                replayImageView.visibility = View.VISIBLE
+            }
+            if (lastRenderedReplaySeq != frameSeq || replayImageView.drawable == null) {
+                lastRenderedReplaySeq = frameSeq
+                replayImageView.setImageBitmap(bitmap)
+                replayImageView.invalidate()
+            }
+        } else {
+            if (replayImageView.visibility != View.GONE) {
+                replayImageView.visibility = View.GONE
+                replayImageView.setImageBitmap(null)
+            }
+            lastRenderedReplaySeq = -1L
         }
     }
 
@@ -386,11 +417,11 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         )
         val childW = t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
         val childH = t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
-        // Always measure PreviewView so dynamically attached TextureView children size to non-zero bounds.
-        previewView.measure(
-            MeasureSpec.makeMeasureSpec(childW, MeasureSpec.EXACTLY),
-            MeasureSpec.makeMeasureSpec(childH, MeasureSpec.EXACTLY)
-        )
+        val exactW = MeasureSpec.makeMeasureSpec(childW, MeasureSpec.EXACTLY)
+        val exactH = MeasureSpec.makeMeasureSpec(childH, MeasureSpec.EXACTLY)
+        // Always measure PreviewView unconditionally so CameraX SurfaceTexture never tears down (fc80785).
+        previewView.measure(exactW, exactH)
+        replayImageView.measure(exactW, exactH)
         setMeasuredDimension(vwInt, vhInt)
     }
 
@@ -408,8 +439,11 @@ private class ClippingCameraViewportContainer(context: Context) : FrameLayout(co
         val childTop = if (currentFullFrameLockOn) t.frameTopPx.roundToInt() else 0
         val childW = t.renderedFrameWidthPx.roundToInt().coerceAtLeast(1)
         val childH = t.renderedFrameHeightPx.roundToInt().coerceAtLeast(1)
+        val transY = if (currentFullFrameLockOn) 0f else t.frameTopPx
         previewView.layout(childLeft, childTop, childLeft + childW, childTop + childH)
-        previewView.translationY = if (currentFullFrameLockOn) 0f else t.frameTopPx
+        previewView.translationY = transY
+        replayImageView.layout(childLeft, childTop, childLeft + childW, childTop + childH)
+        replayImageView.translationY = transY
     }
 }
 
@@ -459,6 +493,8 @@ fun ScannerScreen(
     onToggleEyesUpPatrol: () -> Unit = {},
     onPatrolViewportTapped: (Float, Float, Float) -> Unit = { _, _, _ -> },
     onToggleCentralLock: () -> Unit = {},
+    onSelectReplaySession: (ReplaySessionItem) -> Unit = {},
+    onOpenSourceDrawer: () -> Unit = {},
     initialSourceDrawerOpen: Boolean = false
 ) {
     val isLockedOn = uiState.acquisitionStage != AcquisitionStage.PATROL
@@ -492,6 +528,8 @@ fun ScannerScreen(
                 uiState = uiState,
                 onSelectMode = onSelectMode,
                 onSelectSource = onSelectSource,
+                onSelectReplaySession = onSelectReplaySession,
+                onOpenSourceDrawer = onOpenSourceDrawer,
                 onToggleSwathTileMode = onToggleSwathTileMode,
                 onToggleEisLock = onToggleEisLock,
                 onSyncPitch = onSyncPitch,
@@ -535,6 +573,7 @@ private fun GeologicalViewportZone(
     val crookBottom = if (isLockedOn) LcarsBarHeight + LcarsGutter else 0.dp
 
     val pitchHighWaterWidth = rememberHighWaterSegmentWidth("PITCH -90° [LOCK 16:9]")
+    val replayHighWaterWidth = rememberHighWaterSegmentWidth("REPLAY")
     val velHighWaterWidth = rememberHighWaterSegmentWidth("SLOW SWEEP 9.99 M/S")
     val expHighWaterWidth = rememberHighWaterSegmentWidth("2.0X • 1/2000S • ISO 9999")
 
@@ -564,6 +603,14 @@ private fun GeologicalViewportZone(
                 .height(LcarsBarHeight),
             horizontalArrangement = Arrangement.spacedBy(LcarsGutter)
         ) {
+            if (uiState.isReplayActive) {
+                LcarsHeaderSegment(
+                    text = "REPLAY",
+                    color = LcarsColors.Periwinkle,
+                    modifier = Modifier.width(replayHighWaterWidth)
+                )
+            }
+
             val pitchClampedActive = !isLockedOn && uiState.eisPitchLockEnabled && uiState.isPitchClamped
             val pitchColor = when {
                 isLockedOn -> LcarsSemanticColors.realtimeDataLabel(LcarsValueLevel.MINUS)
@@ -827,7 +874,7 @@ private fun PanoramicCameraViewport(
             }
         }
     ) {
-        if (hasCameraPermission && !isInspection) {
+        if ((hasCameraPermission || uiState.isReplayActive) && !isInspection) {
             AndroidView(
                 factory = { ctx ->
                     ClippingCameraViewportContainer(ctx).apply {
@@ -840,7 +887,14 @@ private fun PanoramicCameraViewport(
                             swathTileMode = uiState.swathTileMode,
                             fullFrameLockOn = fullFrameLockOn
                         )
-                        onBindPreview(lifecycleOwner, previewView)
+                        updateReplayFrame(
+                            isReplayActive = uiState.isReplayActive,
+                            bitmap = uiState.replayPreviewBitmap,
+                            frameSeq = uiState.replayFrameSeq
+                        )
+                        if (hasCameraPermission) {
+                            onBindPreview(lifecycleOwner, previewView)
+                        }
                     }
                 },
                 update = { container ->
@@ -848,6 +902,11 @@ private fun PanoramicCameraViewport(
                         cropYFloat = uiState.displayCropYFloat,
                         swathTileMode = uiState.swathTileMode,
                         fullFrameLockOn = fullFrameLockOn
+                    )
+                    container.updateReplayFrame(
+                        isReplayActive = uiState.isReplayActive,
+                        bitmap = uiState.replayPreviewBitmap,
+                        frameSeq = uiState.replayFrameSeq
                     )
                 },
                 modifier = Modifier.fillMaxSize()
@@ -884,7 +943,7 @@ private fun PanoramicCameraViewport(
             modifier = Modifier.fillMaxSize()
         )
 
-        if (!hasCameraPermission && !isInspection) {
+        if (!hasCameraPermission && !uiState.isReplayActive && !isInspection) {
             Box(
                 modifier = Modifier
                     .align(Alignment.Center)
@@ -2113,6 +2172,8 @@ private fun TacticalControlDeckZone(
     uiState: ScannerUiState,
     onSelectMode: (OperatingMode) -> Unit,
     onSelectSource: (DetectorSourceOption) -> Unit,
+    onSelectReplaySession: (ReplaySessionItem) -> Unit,
+    onOpenSourceDrawer: () -> Unit,
     onToggleSwathTileMode: () -> Unit,
     onToggleEisLock: (Boolean) -> Unit,
     onSyncPitch: () -> Unit,
@@ -2224,6 +2285,8 @@ private fun TacticalControlDeckZone(
                 onToggleStoneClass = onToggleStoneClass,
                 onToggleCentralLock = onToggleCentralLock,
                 onSelectSource = onSelectSource,
+                onSelectReplaySession = onSelectReplaySession,
+                onOpenSourceDrawer = onOpenSourceDrawer,
                 initialSourceDrawerOpen = initialSourceDrawerOpen,
                 modifier = Modifier
                     .weight(0.53f)
@@ -2422,6 +2485,8 @@ private fun ProspectMatrixColumn(
     onToggleStoneClass: (StoneClass) -> Unit,
     onToggleCentralLock: () -> Unit,
     onSelectSource: (DetectorSourceOption) -> Unit,
+    onSelectReplaySession: (ReplaySessionItem) -> Unit,
+    onOpenSourceDrawer: () -> Unit,
     modifier: Modifier = Modifier,
     initialSourceDrawerOpen: Boolean = false
 ) {
@@ -2489,8 +2554,15 @@ private fun ProspectMatrixColumn(
             if (drawerOpen) {
                 SourceSelectionDrawer(
                     activeOption = activeSource,
+                    isReplayActive = uiState.isReplayActive,
+                    activeReplaySessionName = uiState.activeReplaySessionName,
+                    replaySessions = uiState.availableReplaySessions,
                     onSelectOption = { chosen ->
                         onSelectSource(chosen)
+                        isSourceDrawerOpen = false
+                    },
+                    onSelectReplaySession = { replayItem ->
+                        onSelectReplaySession(replayItem)
                         isSourceDrawerOpen = false
                     },
                     modifier = Modifier.fillMaxSize()
@@ -2599,20 +2671,36 @@ private fun ProspectMatrixColumn(
             )
 
             val drawerArrow = if (isSourceDrawerOpen) "▴" else "▾"
+            val activeSrcLabel = if (uiState.isReplayActive && !uiState.activeReplaySessionName.isNullOrEmpty()) {
+                "REPLAY: ${uiState.activeReplaySessionName.uppercase(Locale.US)} $drawerArrow"
+            } else {
+                "${activeSource.title} $drawerArrow"
+            }
             LcarsPillButton(
-                label = "${activeSource.title} $drawerArrow",
+                label = activeSrcLabel,
                 subLabel = when {
                     uiState.isCompilingModel -> "COMPILING SHADERS..."
                     isSourceDrawerOpen -> "TAP SOURCE IN DRAWER"
+                    uiState.isReplayActive -> "MP4 + 120HZ IMU REPLAY"
                     else -> "MODEL SELECTOR"
                 },
                 prefixCode = "SRC",
                 active = true,
-                activeColor = LcarsSemanticColors.actionOrDrawerButton(
-                    if (isSourceDrawerOpen) LcarsValueLevel.PLUS else LcarsValueLevel.BASE
-                ),
+                activeColor = if (uiState.isReplayActive && !isSourceDrawerOpen) {
+                    LcarsColors.Periwinkle
+                } else {
+                    LcarsSemanticColors.actionOrDrawerButton(
+                        if (isSourceDrawerOpen) LcarsValueLevel.PLUS else LcarsValueLevel.BASE
+                    )
+                },
                 endStyle = LcarsPillEndStyle.Capsule,
-                onClick = { isSourceDrawerOpen = !isSourceDrawerOpen },
+                onClick = {
+                    val nextOpen = !isSourceDrawerOpen
+                    if (nextOpen) {
+                        onOpenSourceDrawer()
+                    }
+                    isSourceDrawerOpen = nextOpen
+                },
                 modifier = Modifier
                     .weight(1.27f)
                     .fillMaxHeight()
@@ -2621,18 +2709,81 @@ private fun ProspectMatrixColumn(
     }
 }
 
+private sealed interface SourceDrawerRowModel {
+    val key: String
+    val code: String
+    val title: String
+    val subtitle: String
+    val isSelected: Boolean
+
+    data class LiveOrSimRow(
+        val option: DetectorSourceOption,
+        override val isSelected: Boolean
+    ) : SourceDrawerRowModel {
+        override val key: String get() = "opt_${option.name}"
+        override val code: String get() = option.code
+        override val title: String get() = option.title
+        override val subtitle: String get() = option.subtitle
+    }
+
+    data class ReplayRow(
+        val item: ReplaySessionItem,
+        override val isSelected: Boolean
+    ) : SourceDrawerRowModel {
+        override val key: String get() = "rep_${item.sessionDirPath}"
+        override val code: String get() = item.code
+        override val title: String get() = item.drawerTitle
+        override val subtitle: String get() = item.drawerSubtitle
+    }
+}
+
 /**
- * Scrollable LCARS selection drawer presenting all [DetectorSourceOption] items with a live
- * right-edge scroll position thumb. First tap on `SRC` opens this drawer; second tap on any row
- * activates that source and collapses the drawer.
+ * Scrollable LCARS selection drawer presenting live GPU profiles (`S-01..S-05`), dynamically
+ * discovered `REPLAY: <session>` folders (`R-01..`), and the single retained synthetic demo
+ * (`S-06: MIXED GRAVEL SIM`) with a live right-edge scroll position thumb.
  */
 @Composable
 private fun SourceSelectionDrawer(
     activeOption: DetectorSourceOption,
+    isReplayActive: Boolean,
+    activeReplaySessionName: String?,
+    replaySessions: List<ReplaySessionItem>,
     onSelectOption: (DetectorSourceOption) -> Unit,
+    onSelectReplaySession: (ReplaySessionItem) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val options = DetectorSourceOption.entries
+    val rows = remember(activeOption, isReplayActive, activeReplaySessionName, replaySessions) {
+        buildList {
+            DetectorSourceOption.entries
+                .filter { it.syntheticProfile == null }
+                .forEach { opt ->
+                    add(
+                        SourceDrawerRowModel.LiveOrSimRow(
+                            option = opt,
+                            isSelected = !isReplayActive && opt == activeOption
+                        )
+                    )
+                }
+            replaySessions.forEach { rep ->
+                add(
+                    SourceDrawerRowModel.ReplayRow(
+                        item = rep,
+                        isSelected = isReplayActive && rep.sessionName == activeReplaySessionName
+                    )
+                )
+            }
+            DetectorSourceOption.entries
+                .filter { it.syntheticProfile != null }
+                .forEach { opt ->
+                    add(
+                        SourceDrawerRowModel.LiveOrSimRow(
+                            option = opt,
+                            isSelected = !isReplayActive && opt == activeOption
+                        )
+                    )
+                }
+        }
+    }
     val listState = rememberLazyListState()
     val rowCycle = remember {
         listOf(
@@ -2642,8 +2793,8 @@ private fun SourceSelectionDrawer(
         )
     }
 
-    LaunchedEffect(activeOption) {
-        val idx = options.indexOf(activeOption).coerceAtLeast(0)
+    LaunchedEffect(rows) {
+        val idx = rows.indexOfFirst { it.isSelected }.coerceAtLeast(0)
         listState.scrollToItem((idx - 1).coerceAtLeast(0))
     }
 
@@ -2667,18 +2818,27 @@ private fun SourceSelectionDrawer(
                 .weight(1f)
                 .fillMaxHeight()
         ) {
-            itemsIndexed(options, key = { _, item -> item.name }) { idx, option ->
-                val isSelected = option == activeOption
+            itemsIndexed(rows, key = { _, row -> row.key }) { idx, row ->
                 val level = rowCycle[idx % rowCycle.size]
+                val activeRowColor = if (row is SourceDrawerRowModel.ReplayRow) {
+                    LcarsColors.Periwinkle
+                } else {
+                    LcarsSemanticColors.actionOrDrawerButton(LcarsValueLevel.PLUS)
+                }
                 LcarsPillButton(
-                    label = if (isSelected) "● ${option.title}" else option.title,
-                    subLabel = option.subtitle,
-                    prefixCode = option.code,
-                    active = isSelected,
-                    activeColor = LcarsSemanticColors.actionOrDrawerButton(LcarsValueLevel.PLUS),
+                    label = if (row.isSelected) "● ${row.title}" else row.title,
+                    subLabel = row.subtitle,
+                    prefixCode = row.code,
+                    active = row.isSelected,
+                    activeColor = activeRowColor,
                     inactiveColor = LcarsSemanticColors.toggleButton(false, level),
                     endStyle = LcarsPillEndStyle.FlatLeftRoundRight,
-                    onClick = { onSelectOption(option) },
+                    onClick = {
+                        when (row) {
+                            is SourceDrawerRowModel.LiveOrSimRow -> onSelectOption(row.option)
+                            is SourceDrawerRowModel.ReplayRow -> onSelectReplaySession(row.item)
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(40.dp)
@@ -2694,7 +2854,7 @@ private fun SourceSelectionDrawer(
                 .clip(RoundedCornerShape(3.dp))
                 .background(LcarsColors.MutedSlate)
         ) {
-            val total = options.size.coerceAtLeast(1)
+            val total = rows.size.coerceAtLeast(1)
             val visibleCount = listState.layoutInfo.visibleItemsInfo.size.coerceIn(1, total)
             val firstIdx = listState.firstVisibleItemIndex.coerceIn(0, (total - visibleCount).coerceAtLeast(0))
             val thumbFrac = (visibleCount.toFloat() / total.toFloat()).coerceIn(0.25f, 1f)

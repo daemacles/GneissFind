@@ -310,8 +310,10 @@ class GroundPlaneRaycaster(
      */
     fun stopImuListening() {
         sensorManager?.unregisterListener(this)
-        hasLiveImuStream = false
-        lastGameRotationTimestampNs = 0L
+        if (!isReplayModeActive) {
+            hasLiveImuStream = false
+            lastGameRotationTimestampNs = 0L
+        }
     }
 
     override fun close() {
