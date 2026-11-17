@@ -95,6 +95,8 @@ class OpenCvConstellationTracker : AutoCloseable {
 
     private var akaze: AKAZE? = null
     private var bfMatcher: BFMatcher? = null
+    private var canonicalPatchMat: Mat? = null
+    private var emptyMaskMat: Mat? = null
 
     // Active reference constellation keyframe (updated on rolling 1.8x scale transitions)
     private var refDescriptors: Mat? = null
@@ -403,21 +405,40 @@ class OpenCvConstellationTracker : AutoCloseable {
             .coerceIn(0, (heightPx - collarSide).coerceAtLeast(0))
 
         val detector = ensureAkaze()
+        val patchMat = prevOrAllocMat(
+            canonicalPatchMat,
+            CANONICAL_PATCH_PX,
+            CANONICAL_PATCH_PX,
+            CvType.CV_8UC1
+        ).also { canonicalPatchMat = it }
+        val maskMat = ensureEmptyMaskMat()
         val collarSub = fullMat.submat(Rect(collarLeft, collarTop, collarSide, collarSide))
         val keypoints = MatOfKeyPoint()
         val descriptors = Mat()
 
         try {
-            detector.detectAndCompute(collarSub, Mat(), keypoints, descriptors)
+            Imgproc.resize(
+                collarSub,
+                patchMat,
+                Size(CANONICAL_PATCH_PX.toDouble(), CANONICAL_PATCH_PX.toDouble()),
+                0.0,
+                0.0,
+                Imgproc.INTER_LINEAR
+            )
+            detector.detectAndCompute(patchMat, maskMat, keypoints, descriptors)
             val kpArray = keypoints.toArray()
             if (kpArray.size < MIN_SEED_KEYPOINTS || descriptors.empty()) {
                 descriptors.release()
                 return false
             }
 
+            val scaleFromCanonical = collarSide.toDouble() / CANONICAL_PATCH_PX.toDouble()
             refDescriptors?.release()
             refDescriptors = descriptors
-            refKeypointCoords = Array(kpArray.size) { idx -> kpArray[idx].pt }
+            refKeypointCoords = Array(kpArray.size) { idx ->
+                val p = kpArray[idx].pt
+                Point(p.x * scaleFromCanonical, p.y * scaleFromCanonical)
+            }
             refCollarWidthPx = collarSide
             refCollarHeightPx = collarSide
             refStoneLocalLeft = stoneLeftPx - collarLeft
@@ -480,6 +501,13 @@ class OpenCvConstellationTracker : AutoCloseable {
 
         val detector = ensureAkaze()
         val matcher = ensureBfMatcher()
+        val patchMat = prevOrAllocMat(
+            canonicalPatchMat,
+            CANONICAL_PATCH_PX,
+            CANONICAL_PATCH_PX,
+            CvType.CV_8UC1
+        ).also { canonicalPatchMat = it }
+        val maskMat = ensureEmptyMaskMat()
         val searchSub = fullMat.submat(Rect(searchLeft, searchTop, searchSide, searchSide))
         val liveKeypoints = MatOfKeyPoint()
         val liveDescriptors = Mat()
@@ -488,7 +516,15 @@ class OpenCvConstellationTracker : AutoCloseable {
         val inlierMask = Mat()
 
         try {
-            detector.detectAndCompute(searchSub, Mat(), liveKeypoints, liveDescriptors)
+            Imgproc.resize(
+                searchSub,
+                patchMat,
+                Size(CANONICAL_PATCH_PX.toDouble(), CANONICAL_PATCH_PX.toDouble()),
+                0.0,
+                0.0,
+                Imgproc.INTER_LINEAR
+            )
+            detector.detectAndCompute(patchMat, maskMat, liveKeypoints, liveDescriptors)
             val liveKpArr = liveKeypoints.toArray()
             if (liveKpArr.size < MIN_HOMOGRAPHY_INLIERS || liveDescriptors.empty()) {
                 val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
@@ -497,6 +533,7 @@ class OpenCvConstellationTracker : AutoCloseable {
 
             matcher.knnMatch(activeRefDesc, liveDescriptors, knnMatches, 2)
 
+            val searchScaleFromCanonical = searchSide.toDouble() / CANONICAL_PATCH_PX.toDouble()
             val goodSrc = ArrayList<Point>(knnMatches.size)
             val goodDst = ArrayList<Point>(knnMatches.size)
             for (pairMat in knnMatches) {
@@ -507,7 +544,12 @@ class OpenCvConstellationTracker : AutoCloseable {
                     if (qIdx in refKeypointCoords.indices && tIdx in liveKpArr.indices) {
                         goodSrc.add(refKeypointCoords[qIdx])
                         val dstPt = liveKpArr[tIdx].pt
-                        goodDst.add(Point(dstPt.x + searchLeft, dstPt.y + searchTop))
+                        goodDst.add(
+                            Point(
+                                searchLeft + dstPt.x * searchScaleFromCanonical,
+                                searchTop + dstPt.y * searchScaleFromCanonical
+                            )
+                        )
                     }
                 }
             }
@@ -654,6 +696,10 @@ class OpenCvConstellationTracker : AutoCloseable {
         currHalfGrayMat = null
         halfMaskMat?.release()
         halfMaskMat = null
+        canonicalPatchMat?.release()
+        canonicalPatchMat = null
+        emptyMaskMat?.release()
+        emptyMaskMat = null
     }
 
     private fun ensureFullGrayMat(widthPx: Int, heightPx: Int): Mat {
@@ -663,6 +709,10 @@ class OpenCvConstellationTracker : AutoCloseable {
         }
         existing?.release()
         return Mat(heightPx, widthPx, CvType.CV_8UC1).also { fullGrayMat = it }
+    }
+
+    private fun ensureEmptyMaskMat(): Mat {
+        return emptyMaskMat ?: Mat().also { emptyMaskMat = it }
     }
 
     private fun prevOrAllocMat(existing: Mat?, rows: Int, cols: Int, type: Int): Mat {
@@ -678,9 +728,9 @@ class OpenCvConstellationTracker : AutoCloseable {
             AKAZE.DESCRIPTOR_MLDB,
             0,
             3,
-            0.0007f,
-            3,
-            3
+            0.00035f,
+            2,
+            2
         ).also { akaze = it }
     }
 
@@ -726,6 +776,7 @@ class OpenCvConstellationTracker : AutoCloseable {
 
         /** Gravel-constellation context collar multiplier (`3.0x` stone diameter, `.agents/rules/android-camera-ar.md §5`). */
         const val COLLAR_DIAMETER_MULTIPLIER = 3.0f
+        const val CANONICAL_PATCH_PX = 192
         const val MIN_COLLAR_SIZE_PX = 256
         const val MAX_COLLAR_SIZE_PX = 448
         const val MAX_SEARCH_SIZE_PX = 512
@@ -733,15 +784,15 @@ class OpenCvConstellationTracker : AutoCloseable {
         /** Minimum `USAC_MAGSAC` homography inliers required to hold Stage 3 `PINPOINT_CONSTELLATION` lock. */
         const val MIN_HOMOGRAPHY_INLIERS = 12
         const val MIN_SEED_KEYPOINTS = 16
-        const val MIN_REKEYFRAME_INLIERS = 20
+        const val MIN_REKEYFRAME_INLIERS = 14
 
         /** Lowe second-nearest-neighbor descriptor distance ratio (`0.78f`, `.agents/rules/android-camera-ar.md §5`). */
         const val LOWE_RATIO_THRESHOLD = 0.78f
         const val MAGSAC_REPROJ_THRESHOLD_PX = 3.5
 
-        /** Rolling scale keyframe thresholds (`1.8x` scale growth during `1.5m -> 0.25m` approach). */
-        const val ROLLING_KEYFRAME_GROWTH_RATIO = 1.80f
-        const val ROLLING_KEYFRAME_SHRINK_RATIO = 0.56f
+        /** Rolling scale keyframe thresholds (`1.45x` scale hops during `1.5m -> 0.25m` crouch approach). */
+        const val ROLLING_KEYFRAME_GROWTH_RATIO = 1.45f
+        const val ROLLING_KEYFRAME_SHRINK_RATIO = 0.68f
         private const val MIN_RELATIVE_SCALE = 0.35f
         private const val MAX_RELATIVE_SCALE = 3.50f
 

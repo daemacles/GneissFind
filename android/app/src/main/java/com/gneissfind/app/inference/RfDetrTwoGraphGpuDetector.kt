@@ -410,6 +410,8 @@ class RfDetrTwoGraphGpuDetector(
 
     private var initializedOnThread = false
     private var hardwareGraphsLoaded = false
+    private var activeSlotFromLru = false
+    private val warmPatrolLru = LinkedHashMap<LiveModelProfile, WarmPatrolSlot>(4, 0.75f, true)
     private var initMessage: String = initialProfile.statusBadge
 
     // Dynamic staging arrays sized once at model load time to match exact TensorBuffer byte capacities
@@ -533,13 +535,17 @@ class RfDetrTwoGraphGpuDetector(
     private fun checkBenchmarkOverrideHotSwap() {
         val overrideFile = resolveBenchmarkOverrideFile()
         val mtime = if (overrideFile != null && overrideFile.exists()) overrideFile.lastModified() else 0L
+        val overrideChanged = mtime != lastOverrideMtimeMs
         val profileChanged = desiredLiveProfile != activeLiveProfile
-        if (initializedOnThread && (mtime != lastOverrideMtimeMs || profileChanged)) {
+        if (initializedOnThread && (overrideChanged || profileChanged)) {
             Log.i(
                 TAG,
                 "Hot-swapping LiteRT models (overrideMtime=$mtime, profile=${desiredLiveProfile.name})"
             )
-            releaseModelsOnly()
+            detachOrReleaseActiveModels()
+            if (overrideChanged || overrideFile != null) {
+                evictAllWarmPatrolSlots()
+            }
             initializedOnThread = false
             sweepCount = 0L
             rollingLatencyMs = 0f
@@ -634,6 +640,28 @@ class RfDetrTwoGraphGpuDetector(
         val overrideFile = resolveBenchmarkOverrideFile()
         lastOverrideMtimeMs = if (overrideFile != null && overrideFile.exists()) overrideFile.lastModified() else 0L
         activeLiveProfile = desiredLiveProfile
+
+        if (overrideFile == null) {
+            val cachedSlot = warmPatrolLru[activeLiveProfile]
+            if (cachedSlot != null) {
+                val swapStartNs = System.nanoTime()
+                restoreWarmPatrolSlot(cachedSlot)
+                val swapMs = (System.nanoTime() - swapStartNs) / 1_000_000.0
+                onCompilationStateChanged?.invoke(false, initMessage)
+                Log.i(
+                    TAG,
+                    String.format(
+                        Locale.US,
+                        "Warm LRU SRC switch to %s completed in %.2f ms (slots=%d/%d)",
+                        initMessage,
+                        swapMs,
+                        warmPatrolLru.size,
+                        MAX_WARM_PATROL_SLOTS
+                    )
+                )
+                return
+            }
+        }
 
         try {
             val assetList = appContext.assets.list("")?.toSet().orEmpty()
@@ -941,10 +969,17 @@ class RfDetrTwoGraphGpuDetector(
                             metadata.numClasses
                         )
                     )
+                    if (overrideFile == null && hardwareGraphsLoaded) {
+                        cacheCurrentAsWarmPatrolSlot(profile)
+                    }
                 } else {
                     hardwareGraphsLoaded = false
+                    activeSlotFromLru = false
                     initMessage = "LiteRT GPU Stub (missing .tflite in assets/)"
                     Log.w(TAG, "$initMessage — falling back to host bridge profiler")
+                }
+                if (overrideFile == null && hardwareGraphsLoaded && !activeSlotFromLru) {
+                    cacheCurrentAsWarmPatrolSlot(profile)
                 }
             } finally {
                 onCompilationStateChanged?.invoke(false, initMessage)
@@ -2040,8 +2075,152 @@ class RfDetrTwoGraphGpuDetector(
     }
 
     /**
-     * Closes the active Patrol [TensorBuffer] and [CompiledModel] handles during hot-swaps while
-     * keeping [environment] and the pre-warmed `B=1` `320` Lock-On models resident.
+     * Retains a compiled Patrol [LiveModelProfile] and its GPU [TensorBuffer] bindings in the
+     * bounded 3-slot LRU cache so warm `SRC` drawer switches complete in `< 5 ms` (`<= 500 ms`)
+     * without re-unpacking `W8-Dyn` constant tensors onto GPU memory.
+     */
+    private class WarmPatrolSlot(
+        val metadata: CocoStandInMetadata,
+        val activeTopology: String,
+        val activeAcceleratorLabel: String,
+        val compiledBatchSize: Int,
+        val activeInputResolution: Int,
+        val activeTileFloatCount: Int,
+        val singleModel: CompiledModel?,
+        val part1Model: CompiledModel?,
+        val part2Model: CompiledModel?,
+        val singleInputs: List<TensorBuffer>,
+        val singleOutputs: List<TensorBuffer>,
+        val part1Inputs: List<TensorBuffer>,
+        val part1Outputs: List<TensorBuffer>,
+        val part2Inputs: List<TensorBuffer>,
+        val part2Outputs: List<TensorBuffer>,
+        val part2ZeroCopyInputs: List<TensorBuffer>,
+        val singleBoxesOutputIdx: Int,
+        val singleScoresOutputIdx: Int,
+        val part2BoxesOutputIdx: Int,
+        val part2ScoresOutputIdx: Int,
+        var useZeroCopyEncMemory: Boolean,
+        val interleaveEvenOdd: Boolean,
+        val initMessage: String
+    ) {
+        fun close() {
+            singleInputs.forEach { runCatching { it.close() } }
+            singleOutputs.forEach { runCatching { it.close() } }
+            part1Inputs.forEach { runCatching { it.close() } }
+            part1Outputs.forEach { runCatching { it.close() } }
+            part2Inputs.forEach { runCatching { it.close() } }
+            part2Outputs.forEach { runCatching { it.close() } }
+            runCatching { singleModel?.close() }
+            runCatching { part1Model?.close() }
+            runCatching { part2Model?.close() }
+        }
+    }
+
+    private fun cacheCurrentAsWarmPatrolSlot(profile: LiveModelProfile) {
+        warmPatrolLru[profile]?.takeIf {
+            it.part1Model !== part1Model && it.singleModel !== singleModel
+        }?.close()
+        warmPatrolLru[profile] = WarmPatrolSlot(
+            metadata = metadata,
+            activeTopology = activeTopology,
+            activeAcceleratorLabel = activeAcceleratorLabel,
+            compiledBatchSize = compiledBatchSize,
+            activeInputResolution = activeInputResolution,
+            activeTileFloatCount = activeTileFloatCount,
+            singleModel = singleModel,
+            part1Model = part1Model,
+            part2Model = part2Model,
+            singleInputs = singleInputs,
+            singleOutputs = singleOutputs,
+            part1Inputs = part1Inputs,
+            part1Outputs = part1Outputs,
+            part2Inputs = part2Inputs,
+            part2Outputs = part2Outputs,
+            part2ZeroCopyInputs = part2ZeroCopyInputs,
+            singleBoxesOutputIdx = singleBoxesOutputIdx,
+            singleScoresOutputIdx = singleScoresOutputIdx,
+            part2BoxesOutputIdx = part2BoxesOutputIdx,
+            part2ScoresOutputIdx = part2ScoresOutputIdx,
+            useZeroCopyEncMemory = useZeroCopyEncMemory,
+            interleaveEvenOdd = interleaveEvenOdd,
+            initMessage = initMessage
+        )
+        activeSlotFromLru = true
+        while (warmPatrolLru.size > MAX_WARM_PATROL_SLOTS) {
+            val iter = warmPatrolLru.entries.iterator()
+            var evicted = false
+            while (iter.hasNext()) {
+                val entry = iter.next()
+                if (entry.key != profile) {
+                    entry.value.close()
+                    iter.remove()
+                    evicted = true
+                    break
+                }
+            }
+            if (!evicted) break
+        }
+    }
+
+    private fun restoreWarmPatrolSlot(slot: WarmPatrolSlot) {
+        metadata = slot.metadata
+        activeTopology = slot.activeTopology
+        activeAcceleratorLabel = slot.activeAcceleratorLabel
+        compiledBatchSize = slot.compiledBatchSize
+        activeInputResolution = slot.activeInputResolution
+        activeTileFloatCount = slot.activeTileFloatCount
+        singleModel = slot.singleModel
+        part1Model = slot.part1Model
+        part2Model = slot.part2Model
+        singleInputs = slot.singleInputs
+        singleOutputs = slot.singleOutputs
+        part1Inputs = slot.part1Inputs
+        part1Outputs = slot.part1Outputs
+        part2Inputs = slot.part2Inputs
+        part2Outputs = slot.part2Outputs
+        part2ZeroCopyInputs = slot.part2ZeroCopyInputs
+        singleBoxesOutputIdx = slot.singleBoxesOutputIdx
+        singleScoresOutputIdx = slot.singleScoresOutputIdx
+        part2BoxesOutputIdx = slot.part2BoxesOutputIdx
+        part2ScoresOutputIdx = slot.part2ScoresOutputIdx
+        useZeroCopyEncMemory = slot.useZeroCopyEncMemory
+        interleaveEvenOdd = slot.interleaveEvenOdd
+        initMessage = slot.initMessage
+        allocateStagingBuffersForMetadata()
+        hardwareGraphsLoaded = true
+        activeSlotFromLru = true
+    }
+
+    private fun detachOrReleaseActiveModels() {
+        if (activeSlotFromLru) {
+            warmPatrolLru[activeLiveProfile]?.useZeroCopyEncMemory = useZeroCopyEncMemory
+            activeSlotFromLru = false
+            singleInputs = emptyList()
+            singleOutputs = emptyList()
+            part1Inputs = emptyList()
+            part1Outputs = emptyList()
+            part2Inputs = emptyList()
+            part2Outputs = emptyList()
+            part2ZeroCopyInputs = emptyList()
+            singleModel = null
+            part1Model = null
+            part2Model = null
+            hardwareGraphsLoaded = false
+        } else {
+            releaseModelsOnly()
+        }
+    }
+
+    private fun evictAllWarmPatrolSlots() {
+        warmPatrolLru.values.forEach { it.close() }
+        warmPatrolLru.clear()
+        activeSlotFromLru = false
+    }
+
+    /**
+     * Closes an uncached active Patrol [TensorBuffer] and [CompiledModel] set while keeping
+     * [environment] and the pre-warmed `B=1` `320` Lock-On models resident.
      */
     private fun releaseModelsOnly() {
         singleInputs.forEach { runCatching { it.close() } }
@@ -2064,6 +2243,7 @@ class RfDetrTwoGraphGpuDetector(
         part1Model = null
         part2Model = null
         hardwareGraphsLoaded = false
+        activeSlotFromLru = false
     }
 
     /** Closes the pre-warmed `B=1` `320x320` Lock-On [TensorBuffer] and [CompiledModel] handles. */
@@ -2086,7 +2266,8 @@ class RfDetrTwoGraphGpuDetector(
     }
 
     override fun close() {
-        releaseModelsOnly()
+        detachOrReleaseActiveModels()
+        evictAllWarmPatrolSlots()
         releaseLockOnModels()
         runCatching { environment?.close() }
         environment = null
@@ -2095,6 +2276,7 @@ class RfDetrTwoGraphGpuDetector(
     companion object {
         private const val TAG = "RfDetrTwoGraphGpu"
         private const val GPU_SHADER_CACHE_SUBDIR = "litert_gpu_cache"
+        private const val MAX_WARM_PATROL_SLOTS = 3
         private const val LOCK_ON_P1_CACHE_TOKEN = "lockon_320_b1_p1_v1"
         private const val LOCK_ON_P2_CACHE_TOKEN = "lockon_320_b1_p2_v1"
         const val LOCK_ON_DEFAULT_SCORE_THRESHOLD = 0.28f
