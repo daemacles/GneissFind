@@ -1,67 +1,62 @@
 # GneissFind — Execution Roadmap & Acceptance Criteria (`docs/ROADMAP.md`)
 
-## Milestone 1 — Baseline Push-Broom Skeleton *(Completed — `3f1dee0`)*
-- [x] Initial Android project (`com.gneissfind.app`), `<= 1/500 s` shutter clamp + floating ISO, synthetic gravel simulator, 3-of-6 voter, speed gate, and `AudioTrack` sonifier.
+## Milestone 1 & 1B — Push-Broom Optical Skeleton, 120 Hz EIS & TNG LCARS *(Completed — `fc80785`)*
+- [x] Reversible `sensorLandscape`, default `2.0x` sensor crop + `<= 1/500 s` dynamic shutter clamp, `5 x 384x384` (`1792x384`) strip cropper, 120 Hz RenderNode EIS, and 6-role TNG LCARS UI.
 
-## Milestone 1B — Reversible Landscape, TNG LCARS, 5-Tile Swath & 120 Hz IMU EIS *(Completed — `fc80785`)*
-- [x] Validated on Pixel 10 Pro XL: reversible `sensorLandscape`, default `2.0x` sensor crop + dynamic `Camera2CameraControl` exposure/EV servo, `5 x 384x384` (`1792x384`) push-broom cropper, 120 Hz GPU RenderNode IMU pitch stabilization, and 6-role TNG LCARS UI.
+## Milestone 2 — RF-DETR-Nano COCO Stand-In Integration & 3D World-Ray Tracking *(Completed — `0cad9b2`)*
+- [x] 100% single-partition `LITERT_CL` 2-Graph `RF-DETR-Nano` export, verified 91-logit COCO stand-in oracle (`cup`, `apple`, `toothbrush`, `remote`), `IoU+IoM` cross-tile seam merge, and 120 Hz 3D `WorldRay3D` ego-motion reprojection.
+
+## Milestone 2B — >= 5.0 Hz Sustained Full-Swath GPU Optimization *(Completed on `exp/m2b-fps-exploration` — `a0fe747`)*
+- [x] LiteRT `2.3.2` + `W8-Dyn` (`dynamic_wi8_afp32`, `3.7x` weight compression, `0%` recall loss), zero-copy `encMemory`, 3-slot lock-free async pipeline, `K=100` decoder surgery, and `B=3` priority interleaving (`9.24 FPS` cold / `6.57 FPS` 180s thermal-soaked on `256 B=3 W8-Dyn`; `7.07 FPS` cold / `100%` small recall on `320 B=3 W8-Dyn`).
 
 ---
 
-## Milestone 2 — RF-DETR-Nano COCO Stand-In Benchmark & Integration *(Completed & Hardware-Benchmarked — see [`docs/ENGINEERING_LEDGER.md §3.5`](ENGINEERING_LEDGER.md#35-milestone-2--rf-detr-nano-litert-gpu-export-litert_cl-operator-engineering--pixel-10-pro-xl-benchmark-4825ef5-965d027-head))*
+## Milestone 2C — Merge 2B, Idle Patrol Duty-Cycling, Tap-to-Lock `B=1` + OpenCV `AKAZE` Pinpoint Funnel & LCARS Build Provenance *(Current Active Task)*
 
 ### Goal
-Validate the real end-to-end `RF-DETR-Nano` (`384x384`, Apache-2.0) LiteRT GPU FP16 inference pipeline inside GneissFind on the Pixel 10 Pro XL using baseline MS-COCO weights and 4 household stand-in classes (`cup`, `apple`, `toothbrush`, `remote`) mapped transparently onto the existing 4 mineral buttons—retiring mobile ViT latency, seam-splitting, GC, and thermal risks before field data collection.
+Merge `exp/m2b-fps-exploration` into `main`, eliminate 15s model-switch freezes and duplicate reticles, keep the phone cool during eyes-up walking via `15 FPS` / OLED-dimmed `PATROL` duty-cycling, and implement the **3-Stage Target Acquisition Funnel** (`PATROL` -> Full-Screen `B=1` `320x320` `LOCK-ON` -> OpenCV `AKAZE` gravel-constellation `PINPOINT` guidance once 3D triangulation sphere of confusion `< 0.5 * stone diameter`) with ambidextrous LCARS controls and Git build provenance.
 
 ### Copy-Paste Prompt for Antigravity
 Paste this prompt into Antigravity:
 
 ```text
-Read @AGENTS.md, @docs/ENGINEERING_LEDGER.md, @.agents/rules/android-camera-ar.md, @.agents/rules/lcars-ui.md, @.agents/rules/litert-inference.md, and @docs/ROADMAP.md in full—Milestone 2 (RF-DETR-Nano COCO Stand-In Vertical Slice) is now active.
+Read @AGENTS.md, @docs/ENGINEERING_LEDGER.md, @.agents/rules/android-camera-ar.md, @.agents/rules/lcars-ui.md, @.agents/rules/litert-inference.md, and @docs/ROADMAP.md in full—Milestone 2C is now active.
 
-Execute Milestone 2 end-to-end without regressing any `fc80785` or `8707282` hardware/UI invariants:
-1. Set up `ml-pipeline/` with `uv` (pinned to `CUDA_VISIBLE_DEVICES=0` on the RTX 4090 where GPU is used) and create a reproducible export + verification script for pretrained `RF-DETR-Nano` (`384x384` MS-COCO object detection). Fuse `NHWC -> NCHW` permute and ImageNet `(x - mean)/std` normalization onto `[B, 384, 384, 3]` float32 `[0..1]` inputs matching `PushBroomSweepBuffers`.
-2. Empirically verify the exported `.tflite` against PyTorch on real/sample test images containing `cup`, `apple`, `toothbrush`, and `remote` (`pytest` parity check) so 80- vs 91-logit COCO IDs cannot mismatch, and write `android/app/src/main/assets/rf_detr_coco_metadata.json` mapping `cup -> CHALCEDONY_AGATE`, `apple -> JASPER_RED_YELLOW`, `toothbrush -> GREEN_GEM_ROCK`, `remote -> PETRIFIED_WOOD`, and other confident COCO classes -> muted `HARD_CONFUSER`.
-3. Benchmark 1-graph vs 2-graph LiteRT GPU FP16 execution AND static `B=5` batched vs `5 x B=1` sequential tile dispatch on the connected Pixel 10 Pro XL (`adb`), keeping whichever achieves the fastest steady-state 5-tile latency under the `<= 125 ms/sweep` (`>= 8.0 Hz`) pass floor (with shader disk caching and zero per-frame heap allocations on a dedicated inference thread).
-4. Upgrade cross-tile seam deduplication in `PushBroomCropper` to fuse same-class boxes across the `32 px` seam using `IoU >= 0.45f OR IoM >= 0.65f` (union box) so elongated `toothbrush` and `remote` stand-ins spanning two tiles merge into one target, covered by unit tests.
-5. Register the live LiteRT GPU detector as the default source in `LcarsSourceDrawerOverlay` (keeping all LCARS mineral UI labels untouched and displaying live GPU inference `MS` in the `SWEEP` telemetry readout), verify `./gradlew -p android assembleDebug testDebugUnitTest` and `uv run pytest` pass, make atomic one-sentence git commits, append full benchmark results (`1-graph vs 2-graph`, `B=5 vs 5xB=1`, p50/p95 ms, sustained Hz) to `docs/ENGINEERING_LEDGER.md`, and run `./scripts/pack_context.sh`.
+Execute Milestone 2C step-by-step without regressing `fc80785`, `8707282`, `0cad9b2`, or `1bfdda0` invariants:
+1. Merge `exp/m2b-fps-exploration` cleanly into `main` (and work on `main` or a clean feature branch merged back to `main` once all tests pass).
+2. Fix GPU shader caching & track deduplication:
+   - Configure per-profile LiteRT GPU disk shader serialization (`part1` and `part2` distinct tokens in `context.codeCacheDir`) and non-blocking async loading (`INITIALIZING GPU KERNELS...` inline banner) so warm `SRC` profile switches complete in `<= 500 ms` without UI freezes.
+   - Add Track-Level Spatial NMS in `TemporalTargetTracker` (`<= 3.2 deg` ray separation or `<= 75 mm` 3D distance or strip `IoU >= 0.35 / IoM >= 0.60`) so one object never spawns duplicate brackets.
+3. Implement `PATROL` Duty-Cycling + `"EYES-UP"` OLED Dimming:
+   - After `5.0 s` with zero alertable candidates (`score >= 0.30`) in `PATROL` mode, drop Camera2 `CONTROL_AE_TARGET_FPS_RANGE` to `Range(15, 15)` via `Camera2CameraControl` (preserving `<= 1/500 s` shutter clamp!) and set `preferredRefreshRate = 30f`. Add an `"EYES-UP"` (`EYE`) toggle pill that applies a `90%` `#000000` OLED-saving veil when `PATROL_IDLE` is active, waking to `30 FPS` / `120 Hz` in `< 50 ms` on first candidate detection or tap.
+4. Export `rf_detr_nano_320_b1_w8dyn` (`B=1`, `320x320`, `K=100`, `W8-Dyn`) in `ml-pipeline/` (`uv run pytest` verified) and keep it pre-warmed so Lock-On transitions in `< 50 ms` at `~15-22 FPS`.
+5. Integrate official Maven Central OpenCV (`org.opencv:opencv:4.12.0` or `4.13.0`, Apache-2.0, verifying `16 KB` page alignment on Pixel 10 Pro XL) and implement the **Lock-On -> Pinpoint Funnel**:
+   - Triggered by tapping any target reticle in the strip OR tapping the central `LOCK NEAREST` LCARS button: switch top viewport to **uncropped full-screen `16:9` camera view**, disable EIS (`translationY = 0f`), and track the target with dynamic `B=1` `320x320` crops while running OpenCV ground-patch parallax + `Calib3d.triangulatePoints` / 3D ray covariance to compute `sigma3dMm` (sphere of confusion).
+   - Once `sigma3dMm < 0.5 * estimatedDiameterMm` (with valid multi-view parallax), hand off 30 FPS guidance to OpenCV `AKAZE` + `BFMatcher(NORM_HAMMING)` + `Calib3d.findHomography(..., USAC_MAGSAC)` over a **`3x` gravel-constellation collar** on the `Y` luma plane (with rolling scale re-keyframing on approach from `1.5m -> 0.25m`), throttling `B=1` RF-DETR down to **`1.0 Hz`** for confidence refinement.
+   - Maintain a **`15.0 s` lost-track grace window** (with off-screen directional edge chevrons) before auto-returning to `PATROL`, or exit immediately when `BREAK LOCK` is tapped.
+6. Apply LCARS UI & Build Provenance updates:
+   - Top-left shoulder (`TopLeft` elbow): change `"GEO-47"` to **`GNEISSFIND`**.
+   - Bottom-left shoulder (`BottomLeft` elbow): inject `BuildConfig.GIT_COMMIT_HASH_6` (`git rev-parse --short=6 HEAD`) and `BuildConfig.BUILD_DATE_ISO` (`YYYY-MM-DD`) via Gradle and render both cleanly (`e.g., A0FE74 • 2026-11-16`).
+   - Replace `SPEED SIM` with the single stateful **`LOCK NEAREST` / `BREAK LOCK`** button and **swap positions with `SRC` (`MODEL SELECTOR`)** so `LOCK NEAREST / BREAK LOCK` sits right next to the center deck divider for ambidextrous left/right-handed use.
+7. Add unit + instrumentation/device tests covering Track NMS, Patrol idle state transitions, Lock-On ROI clamping, and OpenCV `AKAZE` homography + triangulation convergence. Verify `uv run pytest` and `./gradlew -p android assembleDebug testDebugUnitTest`, install on Pixel 10 Pro XL, make atomic git commits on `main`, update `docs/ENGINEERING_LEDGER.md`, and run `./scripts/pack_context.sh`.
 ```
 
-### Milestone 2 Acceptance Criteria (Oracle)
-- [x] **Python Parity Tests (`ml-pipeline/`):** `uv run pytest` passes PyTorch-vs-LiteRT numerical/box parity (`IoU = 1.0000`, `max_diff <= 8.2e-3`) and empirically verifies `cup=47`, `apple=53`, `toothbrush=90`, and `remote=75` class indices in `rf_detr_coco_metadata.json`.
-- [x] **Pixel 10 Pro XL 4-Way LiteRT GPU FP16 Benchmark (`58110DLCQ00003`):** Eliminated all `TOPK_V2`, `GATHER_ND`, `BROADCAST_TO`, `FLOOR_DIV`, `RELU_0_TO_1`, and rank $\ge 5$ ops so `2-Graph B=5` compiles 100% into single `LITERT_CL` GPU partitions (`909/909` nodes in `Part 1`, `350/350` nodes in `Part 2`), achieving **`75.37 ms/tile` (`13.27 tiles/sec`)** and **`376.86 ms/sweep` (`p50`) / `363.01 ms/sweep` (`min`)** across `5` tiles (`148.51 GFLOPs` at `394 GFLOP/s` sustained) while maintaining locked 120 Hz RenderNode EIS and zero GC pause spikes.
-- [x] **Cross-Tile Seam Union Merging & Confuser Muting:** `PushBroomCropper.mergeCrossTileDetections` fuses elongated `toothbrush`/`remote` fragments across the `32 px` overlap band (`IoU >= 0.45f OR IoM >= 0.65f OR seam-straddling with vertical overlap >= 0.60f`) into union boxes, while routing unmapped COCO classes to muted `HARD_CONFUSER`.
-- [x] **3D IMU World-Ray AR Tracking & 120 Hz Ego-Motion Reprojection:** `GroundPlaneRaycaster` + `TemporalTargetTracker` anchor detections as rotation-invariant 3D world rays ($\Delta\theta \le 3.8^\circ$), lock in 2 consecutive high-confidence ($\ge 0.72$) sweeps with 2-of-6 maintenance hysteresis, and forward-reproject confirmed reticles at 120 Hz while suppressing off-strip ghost brackets and audio pings.
-- [x] **Build, Annotations, Commits & Ledger:** `./gradlew -p android assembleDebug testDebugUnitTest` (`18/18` unit tests), `uv run pytest` (`6/6` tests), and `comment_diff_check.py --strict` (`19/19` Kotlin files) pass, `docs/ENGINEERING_LEDGER.md` and `docs/INTERNALS.md` are updated, and `/tmp/gneissfind-sync.md` is generated.
+### Milestone 2C Acceptance Criteria (Oracle)
+1. **Warm Switch Speed & Zero Duplicate Tracks:** Switching cached models in `SRC` takes `<= 0.5 s` with zero UI freeze, and indoor stand-ins (`cup`, `apple`, `toothbrush`, `remote`) produce strictly 1 reticle per physical object.
+2. **Patrol Power/Thermal Throttle:** Leaving the camera aimed at empty floor for `> 5 s` drops Camera2 rate to `15 FPS` and dims the viewport (when `EYES-UP` is ON), waking `< 50 ms` when a `cup` or `remote` enters the strip.
+3. **Full-Screen `B=1` Lock-On -> OpenCV `AKAZE` Handover:** Tapping a reticle or the central `LOCK NEAREST` button opens full-screen `16:9` uncropped view at `>= 15 FPS` (`B=1` `320px`), shrinks the uncertainty ring as the phone translates `~15-25 cm` laterally/forward, switches cleanly to `30 FPS` `[AKAZE]` constellation guidance (`1 Hz` neural refresh) down to `0.25 m` close-up, survives brief occlusion with edge chevrons up to `15 s`, and releases immediately on `BREAK LOCK` (which turns from `LOCK NEAREST` TNG Gold to `BREAK LOCK` Mars Red).
+4. **LCARS Shoulders & Build:** Top-left elbow reads `GNEISSFIND`; bottom-left elbow displays the live 6-char Git hash + `YYYY-MM-DD` build date; `apk` installs and runs cleanly on `16 KB` page-size Pixel 10 Pro XL.
 
 ---
 
-## Milestone 2B — Achieving >= 5.0 Hz Sustained Full-Swath Detection on Pixel 10 Pro XL *(Completed & 180s Thermal-Soak Verified — see [`docs/M2B_OVERNIGHT_REPORT.md`](M2B_OVERNIGHT_REPORT.md))*
+## Milestone 3 — Scene/Gravel Video Capture, Patrol FPS Replay Simulator & T7920 `SAM 2` Auto-Labeling (`ml-pipeline/`)
+- **Full-Frame `30 FPS` Video + IMU Sidecar Capture (`LOG DATA` Upgrade):** Record synchronized `1920x1080` `30 FPS` walkthrough videos + `metadata.jsonl` IMU/optics telemetry—starting with indoor mocked-up stone/stand-in scenes and moving to salted + unsalted PNW gravel bars.
+- **Trace-Driven Patrol FPS Simulator (`ml-pipeline/scripts/simulate_patrol_fps.py`):** Replay recorded `<= 1.1 m/s` walks through `RF-DETR` + `TemporalTargetTracker` at decimated frame rates (`15, 10, 7.5, 6, 5, 4, 3, 2 FPS`) to empirically determine the minimum `PATROL` FPS ($X	ext{ FPS}$) that preserves `>= 98%` stone lock probability—unlocking further thermal and battery savings in the field.
+- **`SAM 2` + Hard-Negative Copy-Paste (`GPU 1 & 2`, `2x RTX 4000 Ada`):** Propagate `SAM 2` masks across recorded gravel videos into 5-class training boxes (`4 PNW stone classes + hard_confuser`) and composite segmented raw PNW stones onto empty hard-negative gravel frames.
 
-### Goal
-Overcome the live-app GPU bandwidth and thermal bottleneck (`420–577 ms/sweep`, `1.5–2.4 Hz` in `RF-DETR-Nano 384 B=5`) to achieve **`>= 5.0 FPS` (`<= 200 ms` sweep period; stretch `>= 8.0 FPS`) sustained** across a **180-second live CameraX + 120 Hz LCARS thermal soak** on the Pixel 10 Pro XL (`Tensor G5`) while preserving the full `1792 px` (`93.3%` landscape width) horizontal FOV and small-pebble recall (`28–45 px` targets representing `20–26 mm` stones at `0.59 mm/px` GSD).
-
-### Milestone 2B Acceptance Criteria & Empirical Results
-- [x] **Anti-Cheating Dual-Scale Strip Recall Oracle (`ml-pipeline/tests/eval_small_proxy_strip.py`):** Synthesizes deterministic `1792x384` gravel-textured evaluation strips with `4` medium targets (`120–200 px`, including a cross-tile seam target) and `12` small pebble targets (`28–45 px` minor-axis width) and evaluates candidate detectors end-to-end with `IoU >= 0.45 OR IoM >= 0.65` cross-tile union merging.
-- [x] **LiteRT `2.3.2` Upgrade, Zero-Copy `encMemory`, & Lock-Free 3-Slot Async Pipeline:** Upgraded to `com.google.ai.edge.litert:litert:2.3.2` (`litert-gpu:2.3.2`, `litert-npu-runtime-google-tensor:2.3.2`), eliminated the `5.9 MB` `part1Outputs[0] -> part2Inputs[0]` host round-trip copy via `part2ZeroCopyInputs`, and decoupled CameraX `ImageAnalysis` (`~3 ms` YUV extraction + immediate `imageProxy.close()`) from a dedicated `GneissFind-Inference` thread via a 3-slot lock-free `PreparedSweepSlot` ring buffer.
-- [x] **`W8-Dyn` (`dynamic_wi8_afp32`) GPU Weight Quantization + Top-K=`100` Surgery:** Compressed `RF-DETR-Nano Part 1 + Part 2` by **`3.7x` (`104.5 MB -> 28.1 MB`)** with zero recall loss using `dynamic_wi8_afp32` and `allowSrcQuantizedFcConvOps = true` on the Tensor G5 GPU, while trimming Stage-2 decoder queries from `K=300` to `K=100` (`-46%` Part 2 latency, `0.0%` recall loss).
-- [x] **Tensor G5 NPU Postmortem & 27-Configuration Pareto Bake-Off:** Documented why `Accelerator.NPU` on standalone APKs hits `kLiteRtStatusErrorNotFound` (AICore dynamic NPU provider requirement), contends with Camera HAL `G3ACoordinator` on `/dev/edgetpu`, and suffers `W8A8` ViT activation collapse (`100% -> 12.5%` small recall), whereas `W8-Dyn` on GPU FP16 delivers a `28–33%` speedup with `100%` FP32 recall parity. Also benchmarked 1-Graph `YOLO26s` / `YOLO26n` (`384/320/256 B=5`, `76.1–55.7 ms` / `13.1–18.0 FPS`).
-- [x] **180-Second Continuous Live-App Thermal Soaks (`t = 150..180s`):**
-  - **`S-01` (`RF-DETR 256 B=3 W8-DYN`, Default Apache-2.0):** **`108.2 ms` (`9.24 FPS`) cold** (beating the `>= 8.0 FPS` stretch goal) and **`152.2 ms` (`6.57 FPS` batch / priority target tile, `3.29 Hz` full 5-tile swath) sustained at `t = 150..180s`**.
-  - **`S-02` (`RF-DETR 320 B=3 W8-DYN`, `100%` Small `38-45px` Recall Apache-2.0):** **`141.5 ms` (`7.07 FPS`) cold** and **`187.9–204.2 ms` (`4.90–5.32 FPS`) under `Thermal Status: 1`**.
-  - **`S-03` (`RF-DETR 256 B=5 W8-DYN`, All 5 Tiles Every Sweep Apache-2.0):** **`158.0 ms` (`6.33 FPS`) cold** and **`206.0 ms` (`4.85 FPS` across all 5 tiles simultaneously) at `t = 150..180s`** (`3.2x` faster than the `577 ms` baseline).
-  - **`S-04` (`YOLO26-S 384 B=5 GPU`, AGPL-3.0 Reference):** **`76.1 ms` (`13.15 FPS`) cold** and **`128.3 ms` (`7.80 FPS` across all 5 tiles) at `t = 150..180s`**.
-- [x] **Multi-Model LCARS `SOURCE` Drawer & Report:** Bundled the finalist `.tflite` models into `android/app/src/main/assets/`, wired runtime hot-swapping in `LcarsSourceDrawerOverlay` (`DetectorSourceOption`), and published [`docs/M2B_OVERNIGHT_REPORT.md`](M2B_OVERNIGHT_REPORT.md).
-
----
-
-## Milestone 3 — T7920 Auto-Labeling & Hard-Negative Copy-Paste Pipeline (`ml-pipeline/`)
-- Build `SAM 2` video propagation scripts pinned to `GPU 1 & 2` (`2x RTX 4000 Ada`) to auto-segment `FieldDataLogger` salted gravel-bar PNG strips into 5-class bounding boxes (`4 PNW stone targets + hard_confuser`).
-- Build Copy-Paste instance compositor pasting segmented raw PNW stones onto unsalted local hard-negative gravel frames.
-
-## Milestone 4 — `RF-DETR-Nano` PNW Stone Fine-Tuning & Production Weight Swap
-- Fine-tune `RF-DETR-Nano` (`384x384`, Apache-2.0) and optional `RF-DETR-Large` teacher on `GPU 0` (`RTX 4090 24GB`) using real + synthetic PNW gravel strips.
-- Re-run the Milestone 2 `litert-torch` exporter to swap COCO stand-in weights + `metadata.json` for production 5-class PNW mineral weights with zero Android architecture rework.
+## Milestone 4 — `RF-DETR-Nano` PNW Stone Fine-Tuning, FPS-Simulated Validation & Production Weight Swap
+- Fine-tune `RF-DETR-Nano` (`256` & `320`, `B=3`/`B=5`/`B=1`, `W8-Dyn`) and optional `RF-DETR-Large` teacher on `GPU 0` (`RTX 4090 24GB`).
+- Validate fine-tuned weights against held-out real gravel-bar walk videos across simulated `PATROL` FPS rates in the Milestone 3 replay harness before locking production field duty-cycle defaults and swapping weights into `android/app/src/main/assets/`.
 
 ## Milestone 5 — Field Calibration, Watershed Presets & Hard-Negative Mining
 - Per-class confidence sliders, regional presets (Puget Sound beaches, Western Cascade rivers, Bellingham / Skagit bars), and one-tap field confuser flagging.

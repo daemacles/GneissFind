@@ -12,16 +12,20 @@ OUT_FILE="${1:-/tmp/gneissfind-sync.md}"
   echo '```text'
   git -C "$REPO_ROOT" status -sb
   echo "---"
-  git -C "$REPO_ROOT" log -n 12 --oneline
+  git -C "$REPO_ROOT" log -n 15 --oneline
   echo '```'
   echo ""
-  if [[ -f "$REPO_ROOT/android/app/src/main/assets/rf_detr_coco_metadata.json" ]]; then
-    echo "## Exported LiteRT Model Metadata (rf_detr_coco_metadata.json)"
-    echo '```json'
-    cat "$REPO_ROOT/android/app/src/main/assets/rf_detr_coco_metadata.json"
-    echo '```'
-    echo ""
-  fi
+  for meta in \
+    "android/app/src/main/assets/rf_detr_coco_metadata.json" \
+    "android/app/src/main/assets/rf_detr_320_b1_metadata.json"; do
+    if [[ -f "$REPO_ROOT/$meta" ]]; then
+      echo "## Exported LiteRT Metadata ($meta)"
+      echo '```json'
+      cat "$REPO_ROOT/$meta"
+      echo '```'
+      echo ""
+    fi
+  done
   echo "## Key Kotlin Domain & Detector Contracts"
   for rel in \
     "android/app/src/main/java/com/gneissfind/app/model/StoneModels.kt" \
@@ -36,11 +40,6 @@ OUT_FILE="${1:-/tmp/gneissfind-sync.md}"
   done
   echo "## Engineering Ledger (docs/ENGINEERING_LEDGER.md)"
   cat "$REPO_ROOT/docs/ENGINEERING_LEDGER.md"
-  if [[ -f "$REPO_ROOT/docs/M2B_OVERNIGHT_REPORT.md" ]]; then
-    echo ""
-    echo "## Milestone 2B Overnight Report (docs/M2B_OVERNIGHT_REPORT.md)"
-    cat "$REPO_ROOT/docs/M2B_OVERNIGHT_REPORT.md"
-  fi
 } > "$OUT_FILE"
 
 echo "Wrote sync bundle to $OUT_FILE ($(wc -c < "$OUT_FILE") bytes)"
