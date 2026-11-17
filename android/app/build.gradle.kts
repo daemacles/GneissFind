@@ -1,9 +1,16 @@
+import java.time.LocalDate
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+val gitCommitHash6Provider = providers.exec {
+    commandLine("git", "rev-parse", "--short=6", "HEAD")
+}.standardOutput.asText.map { it.trim().uppercase().ifEmpty { "000000" } }.orElse("000000")
+
+val buildDateIso = LocalDate.now().toString()
 
 android {
     namespace = "com.gneissfind.app"
@@ -14,9 +21,12 @@ android {
         minSdk = 34
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.0-milestone1"
+        versionName = "0.2.0-milestone2c"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "GIT_COMMIT_HASH_6", "\"${gitCommitHash6Provider.get()}\"")
+        buildConfigField("String", "BUILD_DATE_ISO", "\"$buildDateIso\"")
     }
 
     buildTypes {
@@ -48,6 +58,9 @@ android {
     }
 
     packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -88,6 +101,7 @@ dependencies {
     implementation(libs.litert.api)
     implementation(libs.litert.gpu)
     implementation(libs.litert.npu.google.tensor)
+    implementation(libs.opencv)
 
     implementation(libs.kotlinx.coroutines.android)
 

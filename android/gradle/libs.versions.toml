@@ -8,6 +8,7 @@ composeBom = "2025.12.01"
 camerax = "1.5.3"
 arcore = "1.57.0"
 litert = "2.3.2"
+opencv = "4.13.0"
 coroutines = "1.10.2"
 junit = "4.13.2"
 truth = "1.4.4"
@@ -38,6 +39,7 @@ litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "
 litert-api = { group = "com.google.ai.edge.litert", name = "litert-api", version.ref = "litert" }
 litert-gpu = { group = "com.google.ai.edge.litert", name = "litert-gpu", version.ref = "litert" }
 litert-npu-google-tensor = { group = "com.google.ai.edge.litert", name = "litert-npu-runtime-google-tensor", version.ref = "litert" }
+opencv = { group = "org.opencv", name = "opencv", version.ref = "opencv" }
 
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }

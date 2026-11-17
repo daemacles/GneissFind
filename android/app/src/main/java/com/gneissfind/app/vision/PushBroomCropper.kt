@@ -126,6 +126,27 @@ class PushBroomSweepBuffers(
 }
 
 /**
+ * Metadata describing an upright full-frame `1920x1080` luminance (`Y`) copy and clamped
+ * `320x320` foveated RGB `[0.0, 1.0]` crop extracted for Stage 2 (`LOCK_ON_NEURAL`) and
+ * Stage 3 (`PINPOINT_CONSTELLATION`).
+ *
+ * @property uprightWidthPx Upright landscape frame width in pixels (`1920`).
+ * @property uprightHeightPx Upright landscape frame height in pixels (`1080`).
+ * @property cropLeftPx Clamped left X coordinate of the square neural crop in `[0..uprightWidthPx - cropSizePx]`.
+ * @property cropTopPx Clamped top Y coordinate of the square neural crop in `[0..uprightHeightPx - cropSizePx]`.
+ * @property cropSizePx Edge length in pixels of the square neural crop ([PushBroomCropper.LOCK_ON_CROP_SIZE_PX]).
+ * @property timestampNs Frame capture timestamp in nanoseconds.
+ */
+data class LockOnFrameExtraction(
+    val uprightWidthPx: Int,
+    val uprightHeightPx: Int,
+    val cropLeftPx: Int,
+    val cropTopPx: Int,
+    val cropSizePx: Int = PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
+    val timestampNs: Long
+)
+
+/**
  * Extracts only the pitch-stabilized push-broom strip ROI from an upright landscape `YUV_420_888`
  * frame into horizontally overlapping square float tiles without allocating full-frame bitmaps,
  * and stitches per-tile predictions back into unified strip coordinates
@@ -590,7 +611,166 @@ class PushBroomCropper(
         )
     }
 
+    /**
+     * Copies the full upright landscape luminance (`Y`) plane into [outLumaBytes] for OpenCV
+     * KLT / `AKAZE` tracking and optionally decodes a clamped `320x320` NHWC RGB `[0.0, 1.0]`
+     * crop centered on `(cropCenterXPx, cropCenterYPx)` into [outCrop320RgbFloats] in `< 2 ms`
+     * so `ImageProxy` can be closed immediately without Gralloc starvation.
+     *
+     * @param frame Source `YUV_420_888` camera frame.
+     * @param outLumaBytes Pre-allocated destination array (`>= uprightW * uprightH` bytes).
+     * @param outCrop320RgbFloats Pre-allocated destination array (`>= 320 * 320 * 3` floats).
+     * @param cropCenterXPx Desired horizontal center of the `320x320` crop in upright frame pixels.
+     * @param cropCenterYPx Desired vertical center of the `320x320` crop in upright frame pixels.
+     * @param extractRgbCrop Whether to decode the `320x320` RGB float patch (`false` on pure `AKAZE` frames).
+     * @return [LockOnFrameExtraction] describing the upright dimensions and clamped crop origin.
+     */
+    fun extractUprightLumaAndLockOnCrop320(
+        frame: Yuv420Frame,
+        outLumaBytes: ByteArray,
+        outCrop320RgbFloats: FloatArray,
+        cropCenterXPx: Float,
+        cropCenterYPx: Float,
+        extractRgbCrop: Boolean = true
+    ): LockOnFrameExtraction {
+        val rawW = frame.width
+        val rawH = frame.height
+        val rot = ((frame.rotationDegrees % 360) + 360) % 360
+        val uprightW = if (rot == 90 || rot == 270) rawH else rawW
+        val uprightH = if (rot == 90 || rot == 270) rawW else rawH
+
+        val yDup = frame.yBuffer.duplicate()
+        val yRowStride = frame.yRowStride
+        val yPixStride = frame.yPixelStride
+        val yLimit = yDup.limit()
+        val neededLuma = uprightW * uprightH
+
+        if (outLumaBytes.size >= neededLuma) {
+            if (rot == 0 && yPixStride == 1 && rawW == uprightW && rawH == uprightH) {
+                for (uy in 0 until uprightH) {
+                    val srcPos = uy * yRowStride
+                    if (srcPos + uprightW <= yLimit) {
+                        yDup.position(srcPos)
+                        yDup.get(outLumaBytes, uy * uprightW, uprightW)
+                    }
+                }
+            } else {
+                var dstIdx = 0
+                for (uy in 0 until uprightH) {
+                    for (ux in 0 until uprightW) {
+                        val bx: Int
+                        val by: Int
+                        when (rot) {
+                            90 -> {
+                                bx = uy
+                                by = (rawH - 1 - ux).coerceIn(0, rawH - 1)
+                            }
+                            180 -> {
+                                bx = (rawW - 1 - ux).coerceIn(0, rawW - 1)
+                                by = (rawH - 1 - uy).coerceIn(0, rawH - 1)
+                            }
+                            270 -> {
+                                bx = (rawW - 1 - uy).coerceIn(0, rawW - 1)
+                                by = ux
+                            }
+                            else -> {
+                                bx = ux
+                                by = uy
+                            }
+                        }
+                        val yIndex = (by * yRowStride + bx * yPixStride).coerceIn(0, yLimit - 1)
+                        outLumaBytes[dstIdx++] = yDup.get(yIndex)
+                    }
+                }
+            }
+        }
+
+        val cropSize = LOCK_ON_CROP_SIZE_PX
+        val (cropLeft, cropTop) = computeClampedSquareCropOrigin(
+            centerXPx = cropCenterXPx,
+            centerYPx = cropCenterYPx,
+            cropSizePx = cropSize,
+            frameWidthPx = uprightW,
+            frameHeightPx = uprightH
+        )
+
+        if (extractRgbCrop && outCrop320RgbFloats.size >= cropSize * cropSize * 3) {
+            val uBuf = frame.uBuffer
+            val vBuf = frame.vBuffer
+            val uRowStride = frame.uRowStride
+            val uPixStride = frame.uPixelStride
+            val vRowStride = frame.vRowStride
+            val vPixStride = frame.vPixelStride
+            val uLimit = uBuf.limit()
+            val vLimit = vBuf.limit()
+
+            var dstFloatIdx = 0
+            for (cy in 0 until cropSize) {
+                val uy = (cropTop + cy).coerceIn(0, (uprightH - 1).coerceAtLeast(0))
+                for (cx in 0 until cropSize) {
+                    val ux = (cropLeft + cx).coerceIn(0, (uprightW - 1).coerceAtLeast(0))
+                    val bx: Int
+                    val by: Int
+                    when (rot) {
+                        90 -> {
+                            bx = uy
+                            by = (rawH - 1 - ux).coerceIn(0, rawH - 1)
+                        }
+                        180 -> {
+                            bx = (rawW - 1 - ux).coerceIn(0, rawW - 1)
+                            by = (rawH - 1 - uy).coerceIn(0, rawH - 1)
+                        }
+                        270 -> {
+                            bx = (rawW - 1 - uy).coerceIn(0, rawW - 1)
+                            by = ux
+                        }
+                        else -> {
+                            bx = ux
+                            by = uy
+                        }
+                    }
+
+                    val yIndex = (by * yRowStride + bx * yPixStride).coerceIn(0, yLimit - 1)
+                    val uvX = bx shr 1
+                    val uvY = by shr 1
+                    val uIndex = (uvY * uRowStride + uvX * uPixStride).coerceIn(0, uLimit - 1)
+                    val vIndex = (uvY * vRowStride + uvX * vPixStride).coerceIn(0, vLimit - 1)
+
+                    val yVal = yDup.get(yIndex).toInt() and 0xFF
+                    val uVal = (uBuf.get(uIndex).toInt() and 0xFF) - 128
+                    val vVal = (vBuf.get(vIndex).toInt() and 0xFF) - 128
+
+                    val r8 = (yVal + ((1436 * vVal) shr 10)).coerceIn(0, 255)
+                    val g8 = (yVal - ((352 * uVal + 731 * vVal) shr 10)).coerceIn(0, 255)
+                    val b8 = (yVal + ((1815 * uVal) shr 10)).coerceIn(0, 255)
+
+                    if (applyImageNetNormalization) {
+                        outCrop320RgbFloats[dstFloatIdx++] = (r8 * INV_255 - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R
+                        outCrop320RgbFloats[dstFloatIdx++] = (g8 * INV_255 - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G
+                        outCrop320RgbFloats[dstFloatIdx++] = (b8 * INV_255 - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B
+                    } else {
+                        outCrop320RgbFloats[dstFloatIdx++] = r8 * INV_255
+                        outCrop320RgbFloats[dstFloatIdx++] = g8 * INV_255
+                        outCrop320RgbFloats[dstFloatIdx++] = b8 * INV_255
+                    }
+                }
+            }
+        }
+
+        return LockOnFrameExtraction(
+            uprightWidthPx = uprightW,
+            uprightHeightPx = uprightH,
+            cropLeftPx = cropLeft,
+            cropTopPx = cropTop,
+            cropSizePx = cropSize,
+            timestampNs = frame.timestampNs
+        )
+    }
+
     companion object {
+        /** Native square crop resolution in pixels for `rf_detr_nano_320_b1_w8dyn` Lock-On tracking. */
+        const val LOCK_ON_CROP_SIZE_PX = 320
+
         /** Default cross-tile Intersection-over-Union threshold (`.agents/rules/android-camera-ar.md §2`). */
         const val DEFAULT_NMS_IOU_THRESHOLD = 0.45f
 
@@ -642,11 +822,36 @@ class PushBroomCropper(
         private const val IMAGENET_INV_STD_B = 1.0f / 0.225f
 
         /**
+         * Computes the clamped `(leftPx, topPx)` origin of a square [cropSizePx] ROI centered on
+         * `(centerXPx, centerYPx)` within `[0..frameWidthPx] x [0..frameHeightPx]`.
+         *
+         * @param centerXPx Desired crop center X in upright frame pixels.
+         * @param centerYPx Desired crop center Y in upright frame pixels.
+         * @param cropSizePx Square crop edge length in pixels ([LOCK_ON_CROP_SIZE_PX]).
+         * @param frameWidthPx Upright landscape frame width in pixels.
+         * @param frameHeightPx Upright landscape frame height in pixels.
+         * @return Pair `(cropLeftPx, cropTopPx)` guaranteed within frame bounds.
+         */
+        fun computeClampedSquareCropOrigin(
+            centerXPx: Float,
+            centerYPx: Float,
+            cropSizePx: Int = LOCK_ON_CROP_SIZE_PX,
+            frameWidthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
+            frameHeightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
+        ): Pair<Int, Int> {
+            val maxLeft = (frameWidthPx - cropSizePx).coerceAtLeast(0)
+            val maxTop = (frameHeightPx - cropSizePx).coerceAtLeast(0)
+            val rawLeft = (centerXPx - cropSizePx * 0.5f).roundToInt()
+            val rawTop = (centerYPx - cropSizePx * 0.5f).roundToInt()
+            return Pair(rawLeft.coerceIn(0, maxLeft), rawTop.coerceIn(0, maxTop))
+        }
+
+        /**
          * Computes cross-track Ground Sample Distance (`mm/px`) from slant range [slantRangeMeters]
          * and active zoom ([DEFAULT_ZOOM_RATIO] -> [DEFAULT_GSD_MM_PER_PX] at [DEFAULT_SLANT_RANGE_METERS]).
          *
          * @param slantRangeMeters Slant distance from camera optical center to ground patch in meters
-         *   (clamped internally to `[0.40, 4.00]` m).
+         *   (clamped internally to `[0.18, 4.00]` m to support close-up terminal homing).
          * @param zoomRatio Active digital/sensor crop zoom ratio (clamped internally to `>= 1.0f`).
          * @return Ground sample distance in millimeters per pixel.
          */
@@ -654,7 +859,7 @@ class PushBroomCropper(
             slantRangeMeters: Float,
             zoomRatio: Float = DEFAULT_ZOOM_RATIO
         ): Float {
-            val clampedRange = slantRangeMeters.coerceIn(0.40f, 4.00f)
+            val clampedRange = slantRangeMeters.coerceIn(0.18f, 4.00f)
             val safeZoom = zoomRatio.coerceAtLeast(1.0f)
             return DEFAULT_GSD_MM_PER_PX *
                 (clampedRange / DEFAULT_SLANT_RANGE_METERS) *

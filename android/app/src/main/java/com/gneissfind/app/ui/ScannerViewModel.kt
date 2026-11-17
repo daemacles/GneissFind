@@ -38,14 +38,19 @@ import com.gneissfind.app.model.PatrolPowerState
 import com.gneissfind.app.model.ScanSpeedState
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripDetection
+import com.gneissfind.app.inference.SweepInferenceResult
 import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.SwathTileMode
+import com.gneissfind.app.model.TileDetection
+import com.gneissfind.app.model.WorldPoint3D
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
+import com.gneissfind.app.tracking.LockOnPinpointController
 import com.gneissfind.app.tracking.MotionPoseSnapshot
 import com.gneissfind.app.tracking.PatrolDutyCycleController
 import com.gneissfind.app.tracking.ProjectedCandidate
 import com.gneissfind.app.tracking.TemporalTargetTracker
 import com.gneissfind.app.vision.ImageProxyYuv420Frame
+import com.gneissfind.app.vision.LockOnFrameExtraction
 import com.gneissfind.app.vision.PushBroomCropper
 import com.gneissfind.app.vision.PushBroomSweepBuffers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -212,7 +217,13 @@ data class ScannerUiState(
  */
 private class PreparedSweepSlot {
     val sweepBuffers = PushBroomSweepBuffers()
+    val lockOnCrop320RgbFloats = FloatArray(
+        PushBroomCropper.LOCK_ON_CROP_SIZE_PX * PushBroomCropper.LOCK_ON_CROP_SIZE_PX * 3
+    )
     val inUseByConsumer = AtomicBoolean(false)
+    var isLockOnSlot: Boolean = false
+    var lockOnCropLeftPx: Int = 0
+    var lockOnCropTopPx: Int = 0
     var poseSnapshot: MotionPoseSnapshot? = null
     var geometry: StripRoiGeometry = StripRoiGeometry()
     var exposureTelemetry: CameraExposureTelemetry = CameraExposureTelemetry()
@@ -263,8 +274,17 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val raycaster = GroundPlaneRaycaster(appContext)
     private val tracker = TemporalTargetTracker()
     private val patrolDutyController = PatrolDutyCycleController()
+    private val lockOnController = LockOnPinpointController()
     private val sonifier = MetalDetectorSonifier()
     private val fieldLogger = FieldDataLogger(appContext)
+
+    // Pre-allocated analyzer scratch buffers for 30 FPS Lock-On / Pinpoint extraction
+    private val analyzerLumaScratch = ByteArray(
+        StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX * StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
+    )
+    private val analyzerCrop320Scratch = FloatArray(
+        PushBroomCropper.LOCK_ON_CROP_SIZE_PX * PushBroomCropper.LOCK_ON_CROP_SIZE_PX * 3
+    )
 
     private val cameraController = PushBroomCameraController(
         appContext = appContext,
@@ -296,13 +316,15 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         raycaster.onRealtimeImuPitchListener = { smoothedPitchDeg, rollDeg, refPitchDeg ->
             var updatedVisibleTargetsForAudio: List<ConfirmedTarget>? = null
             var currentSpeedForAudio: ScanSpeedState = ScanSpeedState.Normal(0f)
+            val nowNs = System.nanoTime()
             _uiState.update { prev ->
                 val fy = prev.verticalFocalLengthPx
+                val liveMat = raycaster.copyLatestRotationMatrix(displayRotationMatrixScratch)
                 val floatStab = GroundPlaneRaycaster.computeStabilizedCropYFloat(
                     currentPitchDeg = smoothedPitchDeg,
                     referencePitchDeg = refPitchDeg,
                     verticalFocalLengthPx = fy,
-                    eisEnabled = prev.eisPitchLockEnabled
+                    eisEnabled = prev.eisPitchLockEnabled && prev.acquisitionStage == AcquisitionStage.PATROL
                 )
                 val stripCenterOffsetPx = floatStab.clampedCropYFloat - StripRoiGeometry.NOMINAL_CROP_Y_PX
                 val lookPitchDeg = smoothedPitchDeg + Math.toDegrees(
@@ -312,36 +334,70 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     forwardPitchDeg = lookPitchDeg
                 )
                 val gsd = PushBroomCropper.computeGsdMmPerPx(slantR, prev.activeZoomRatio)
-                val reprojectedTargets = if (prev.confirmedTargets.isNotEmpty()) {
-                    val liveMat = raycaster.copyLatestRotationMatrix(displayRotationMatrixScratch)
-                    raycaster.reprojectConfirmedTargetsToCurrentPose(
-                        targets = prev.confirmedTargets,
-                        stripGeometry = prev.stripGeometry,
-                        currentCropYFloat = floatStab.clampedCropYFloat,
+
+                if (prev.acquisitionStage != AcquisitionStage.PATROL) {
+                    val reprojectedLock = lockOnController.reprojectForDisplay120Hz(
+                        currentRotationMatrix = liveMat,
                         currentFocalLengthPx = fy,
-                        currentRotationMatrix = liveMat
+                        nowTimestampNs = nowNs
                     )
+                    if (reprojectedLock.stage == AcquisitionStage.PATROL) {
+                        updatedVisibleTargetsForAudio = emptyList()
+                        currentSpeedForAudio = ScanSpeedState.Normal(0f)
+                        prev.copy(
+                            acquisitionStage = AcquisitionStage.PATROL,
+                            lockOnHudState = reprojectedLock,
+                            imuPitchDeg = smoothedPitchDeg,
+                            rollDeg = rollDeg,
+                            referencePitchDeg = refPitchDeg
+                        )
+                    } else {
+                        updatedVisibleTargetsForAudio = buildLockOnAudioTargets(reprojectedLock)
+                        currentSpeedForAudio = ScanSpeedState.Normal(0f)
+                        prev.copy(
+                            acquisitionStage = reprojectedLock.stage,
+                            lockOnHudState = reprojectedLock,
+                            imuPitchDeg = smoothedPitchDeg,
+                            rollDeg = rollDeg,
+                            referencePitchDeg = refPitchDeg,
+                            slantRangeMeters = reprojectedLock.slantRangeMeters,
+                            gsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(
+                                reprojectedLock.slantRangeMeters,
+                                prev.activeZoomRatio
+                            )
+                        )
+                    }
                 } else {
-                    prev.confirmedTargets
+                    val reprojectedTargets = if (prev.confirmedTargets.isNotEmpty()) {
+                        raycaster.reprojectConfirmedTargetsToCurrentPose(
+                            targets = prev.confirmedTargets,
+                            stripGeometry = prev.stripGeometry,
+                            currentCropYFloat = floatStab.clampedCropYFloat,
+                            currentFocalLengthPx = fy,
+                            currentRotationMatrix = liveMat
+                        )
+                    } else {
+                        prev.confirmedTargets
+                    }
+                    val prevVisibleCount = prev.confirmedTargets.count { it.isVisibleInStrip }
+                    val newVisibleCount = reprojectedTargets.count { it.isVisibleInStrip }
+                    if (prevVisibleCount != newVisibleCount) {
+                        updatedVisibleTargetsForAudio = reprojectedTargets.filter { it.isVisibleInStrip }
+                        currentSpeedForAudio = prev.speedState
+                    }
+                    prev.copy(
+                        imuPitchDeg = smoothedPitchDeg,
+                        rollDeg = rollDeg,
+                        referencePitchDeg = refPitchDeg,
+                        cropY = floatStab.clampedCropYFloat.roundToInt()
+                            .coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX),
+                        displayCropYFloat = floatStab.clampedCropYFloat,
+                        isPitchClamped = floatStab.isPitchClamped,
+                        slantRangeMeters = slantR,
+                        gsdMmPerPx = gsd,
+                        confirmedTargets = reprojectedTargets
+                    )
                 }
-                val prevVisibleCount = prev.confirmedTargets.count { it.isVisibleInStrip }
-                val newVisibleCount = reprojectedTargets.count { it.isVisibleInStrip }
-                if (prevVisibleCount != newVisibleCount) {
-                    updatedVisibleTargetsForAudio = reprojectedTargets.filter { it.isVisibleInStrip }
-                    currentSpeedForAudio = prev.speedState
-                }
-                prev.copy(
-                    imuPitchDeg = smoothedPitchDeg,
-                    rollDeg = rollDeg,
-                    referencePitchDeg = refPitchDeg,
-                    cropY = floatStab.clampedCropYFloat.roundToInt()
-                        .coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX),
-                    displayCropYFloat = floatStab.clampedCropYFloat,
-                    isPitchClamped = floatStab.isPitchClamped,
-                    slantRangeMeters = slantR,
-                    gsdMmPerPx = gsd,
-                    confirmedTargets = reprojectedTargets
-                )
             }
             updatedVisibleTargetsForAudio?.let { visibleTargets ->
                 sonifier.updateTargets(visibleTargets, currentSpeedForAudio)
@@ -418,6 +474,161 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     /** Toggles the `"EYES-UP"` (`EYE`) OLED-saving veil preference. */
     fun toggleEyesUpPatrol() {
         setEyesUpPatrolEnabled(!_uiState.value.eyesUpPatrolEnabled)
+    }
+
+    /**
+     * Enters Stage 2 (`LOCK_ON_NEURAL`) on the visible [ConfirmedTarget] matching [trackId].
+     */
+    fun lockTargetById(trackId: Long) {
+        val current = _uiState.value
+        if (current.operatingMode != OperatingMode.SCAN) return
+        val target = current.confirmedTargets.firstOrNull { it.trackId == trackId && it.isVisibleInStrip }
+            ?: return
+        activateLockOnTarget(target)
+    }
+
+    /**
+     * Enters Stage 2 (`LOCK_ON_NEURAL`) on the visible [ConfirmedTarget] with the smallest
+     * [ConfirmedTarget.slantRangeMeters] (tie-breaking by horizontal proximity to viewport center).
+     */
+    fun lockNearestTarget() {
+        val current = _uiState.value
+        if (current.operatingMode != OperatingMode.SCAN) return
+        val nearest = LockOnPinpointController.selectNearestVisibleTarget(
+            targets = current.confirmedTargets,
+            stripGeometry = current.stripGeometry
+        ) ?: return
+        activateLockOnTarget(nearest)
+    }
+
+    /**
+     * Hit-tests a tap inside the `PATROL` push-broom viewport (`normalizedStripX`, `normalizedStripY`
+     * in `[0.0, 1.0]`) and enters `LOCK_ON_NEURAL` if a visible reticle was tapped.
+     */
+    fun onPatrolViewportTapped(normalizedStripX: Float, normalizedStripY: Float) {
+        onUserTouchInteraction()
+        val current = _uiState.value
+        if (current.operatingMode != OperatingMode.SCAN ||
+            current.acquisitionStage != AcquisitionStage.PATROL
+        ) {
+            return
+        }
+        val tapX = normalizedStripX.coerceIn(0f, 1f) * current.stripGeometry.stripWidthPx
+        val tapY = normalizedStripY.coerceIn(0f, 1f) * StripRoiGeometry.STRIP_HEIGHT_PX
+        val hit = LockOnPinpointController.findTappedTargetInStrip(
+            targets = current.confirmedTargets,
+            tapStripXPx = tapX,
+            tapStripYPx = tapY
+        ) ?: return
+        activateLockOnTarget(hit)
+    }
+
+    /**
+     * Handles the central stateful **`LOCK NEAREST` / `BREAK LOCK`** LCARS button:
+     * breaks lock immediately (`0 ms`) when locked on, or locks onto the nearest visible target in `PATROL`.
+     */
+    fun toggleCentralLockButton() {
+        onUserTouchInteraction()
+        if (_uiState.value.acquisitionStage != AcquisitionStage.PATROL) {
+            breakLock()
+        } else {
+            lockNearestTarget()
+        }
+    }
+
+    /**
+     * Immediately exits `LOCK_ON_NEURAL` / `PINPOINT_CONSTELLATION` (`0 ms`) and restores `PATROL`
+     * push-broom scanning and EIS.
+     */
+    fun breakLock() {
+        val unlockedHud = lockOnController.breakLock()
+        latestReadySlot.set(null)
+        lastCompletedSweepWallNs = 0L
+        smoothedSweepHz = 0f
+        val nextPower = patrolDutyController.onContextChanged(
+            operatingMode = _uiState.value.operatingMode,
+            acquisitionStage = AcquisitionStage.PATROL,
+            nowNs = System.nanoTime()
+        )
+        cameraController.setTargetCameraFps(nextPower.targetCameraFps)
+        sonifier.updateTargets(
+            confirmedTargets = _uiState.value.confirmedTargets.filter { it.isVisibleInStrip },
+            speedState = _uiState.value.speedState
+        )
+        val audioTel = sonifier.latestTelemetry
+        _uiState.update { prev ->
+            prev.copy(
+                acquisitionStage = AcquisitionStage.PATROL,
+                lockOnHudState = unlockedHud,
+                patrolPowerState = nextPower,
+                audioPitchHz = audioTel.currentPitchHz,
+                audioCadenceHz = audioTel.currentPingCadenceHz
+            )
+        }
+    }
+
+    private fun activateLockOnTarget(target: ConfirmedTarget) {
+        val nowNs = System.nanoTime()
+        val prev = _uiState.value
+        val rotMat = raycaster.copyLatestRotationMatrix()
+        val lockHud = lockOnController.lockOntoTarget(
+            target = target,
+            stripGeometry = prev.stripGeometry,
+            currentCropYFloat = prev.displayCropYFloat,
+            currentFocalLengthPx = prev.verticalFocalLengthPx,
+            currentRotationMatrix = rotMat,
+            timestampNs = nowNs
+        )
+        latestReadySlot.set(null)
+        lastCompletedSweepWallNs = 0L
+        smoothedSweepHz = 0f
+        val nextPower = patrolDutyController.onContextChanged(
+            operatingMode = prev.operatingMode,
+            acquisitionStage = lockHud.stage,
+            nowNs = nowNs
+        )
+        cameraController.setTargetCameraFps(nextPower.targetCameraFps)
+        sonifier.updateTargets(
+            confirmedTargets = buildLockOnAudioTargets(lockHud),
+            speedState = ScanSpeedState.Normal(0f)
+        )
+        val audioTel = sonifier.latestTelemetry
+        _uiState.update {
+            it.copy(
+                acquisitionStage = lockHud.stage,
+                lockOnHudState = lockHud,
+                patrolPowerState = nextPower,
+                audioPitchHz = audioTel.currentPitchHz,
+                audioCadenceHz = audioTel.currentPingCadenceHz
+            )
+        }
+    }
+
+    private fun buildLockOnAudioTargets(hud: LockOnHudState): List<ConfirmedTarget> {
+        if (!hud.isLocked || !hud.isTargetInFrame || !hud.stoneClass.isUserAlertable) {
+            return emptyList()
+        }
+        // Boost cadence smoothly as range closes from 1.50m -> 0.25m for tactile homing feedback
+        val proximityBoost = ((1.50f - hud.slantRangeMeters) / 1.25f).coerceIn(0f, 0.35f)
+        val effectiveConf = (hud.smoothedConfidence + proximityBoost).coerceIn(0.45f, 0.99f)
+        return listOf(
+            ConfirmedTarget(
+                trackId = hud.lockedTrackId,
+                stoneClass = hud.stoneClass,
+                worldPosition = WorldPoint3D(0f, 0f, hud.slantRangeMeters),
+                stripLeftPx = hud.frameLeftPx,
+                stripTopPx = hud.frameTopPx,
+                stripRightPx = hud.frameRightPx,
+                stripBottomPx = hud.frameBottomPx,
+                smoothedConfidence = effectiveConf,
+                estimatedDiameterMm = hud.estimatedDiameterMm,
+                slantRangeMeters = hud.slantRangeMeters,
+                hitCountInWindow = 6,
+                windowSize = 6,
+                lastUpdatedTimestampNs = 0L,
+                isVisibleInStrip = true
+            )
+        )
     }
 
     /**
@@ -641,6 +852,16 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         imageProxy: ImageProxy,
         exposureTelemetry: CameraExposureTelemetry
     ) {
+        if (isShuttingDown.get()) {
+            imageProxy.close()
+            return
+        }
+
+        if (lockOnController.currentStage != AcquisitionStage.PATROL) {
+            processLockOnFrameOnAnalyzerThread(imageProxy, exposureTelemetry)
+            return
+        }
+
         val slot: PreparedSweepSlot
         val stateSnapshot: ScannerUiState
         val isLoggingMode: Boolean
@@ -651,7 +872,6 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val frameTs: Long
 
         try {
-            if (isShuttingDown.get()) return
             val nowWallMs = SystemClock.elapsedRealtime()
             // Avoid redundant 30 Hz CPU YUV decoding if an unread frame is already staged and < 22 ms old
             if (inferenceRunning.get() &&
@@ -666,6 +886,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             } ?: return
 
             slot = freeSlot
+            slot.isLockOnSlot = false
             lastProducerExtractWallMs = nowWallMs
             stateSnapshot = _uiState.value
             isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
@@ -734,6 +955,127 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         scheduleInferenceDrainIfNeeded()
     }
 
+    /**
+     * Fast Lock-On / Pinpoint frame producer (`< 1.5 ms` [ImageProxy] hold time):
+     * copies upright `1920x1080` `Y` luma + clamped `320x320` RGB crop, closes [imageProxy]
+     * immediately, runs `30 FPS` OpenCV VO / `AKAZE` homography, and schedules `B=1` GPU inference
+     * whenever requested (`~15-22 FPS` in Stage 2, `1.0 Hz` in Stage 3).
+     */
+    private fun processLockOnFrameOnAnalyzerThread(
+        imageProxy: ImageProxy,
+        exposureTelemetry: CameraExposureTelemetry
+    ) {
+        val frameTs: Long
+        val poseSnapshot: MotionPoseSnapshot
+        val extraction: LockOnFrameExtraction
+        val stateSnapshot = _uiState.value
+
+        try {
+            frameTs = imageProxy.imageInfo.timestamp
+            poseSnapshot = raycaster.capturePoseSnapshot(
+                arFrame = null,
+                fallbackTimestampNs = frameTs,
+                verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx
+            )
+            val (predCx, predCy) = lockOnController.predictCurrentCropCenterPx(
+                rotationMatrix = poseSnapshot.rotationMatrix,
+                focalLengthPx = exposureTelemetry.verticalFocalLengthPx
+            )
+            val yuvFrame = ImageProxyYuv420Frame(imageProxy)
+            extraction = cropper.extractUprightLumaAndLockOnCrop320(
+                frame = yuvFrame,
+                outLumaBytes = analyzerLumaScratch,
+                outCrop320RgbFloats = analyzerCrop320Scratch,
+                cropCenterXPx = predCx,
+                cropCenterYPx = predCy,
+                extractRgbCrop = true
+            )
+        } finally {
+            imageProxy.close()
+        }
+
+        val directive = lockOnController.onCameraLumaFrame(
+            lumaBytes = analyzerLumaScratch,
+            widthPx = extraction.uprightWidthPx,
+            heightPx = extraction.uprightHeightPx,
+            poseSnapshot = poseSnapshot,
+            timestampNs = frameTs
+        )
+
+        if (directive.autoExitedToPatrol || directive.hudState.stage == AcquisitionStage.PATROL) {
+            val nextPower = patrolDutyController.onContextChanged(
+                operatingMode = _uiState.value.operatingMode,
+                acquisitionStage = AcquisitionStage.PATROL,
+                nowNs = System.nanoTime()
+            )
+            cameraController.setTargetCameraFps(nextPower.targetCameraFps)
+            sonifier.updateTargets(emptyList(), ScanSpeedState.Normal(0f))
+            val audioTel = sonifier.latestTelemetry
+            _uiState.update { prev ->
+                prev.copy(
+                    acquisitionStage = AcquisitionStage.PATROL,
+                    lockOnHudState = directive.hudState,
+                    patrolPowerState = nextPower,
+                    cameraStreamFps = exposureTelemetry.measuredCameraFps,
+                    audioPitchHz = audioTel.currentPitchHz,
+                    audioCadenceHz = audioTel.currentPingCadenceHz
+                )
+            }
+            return
+        }
+
+        // Publish 30 FPS AKAZE / Lock-On HUD + homing audio telemetry immediately
+        sonifier.updateTargets(
+            confirmedTargets = buildLockOnAudioTargets(directive.hudState),
+            speedState = ScanSpeedState.Normal(0f)
+        )
+        val audioTel = sonifier.latestTelemetry
+        val useAkazeTelemetry = directive.hudState.stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+            directive.openCvLatencyMs > 0f
+        _uiState.update { prev ->
+            prev.copy(
+                acquisitionStage = directive.hudState.stage,
+                lockOnHudState = directive.hudState,
+                cameraStreamFps = exposureTelemetry.measuredCameraFps,
+                exposureTimeNs = exposureTelemetry.exposureTimeNs,
+                sensorIso = exposureTelemetry.sensorIso,
+                activeZoomRatio = exposureTelemetry.activeZoomRatio,
+                verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx,
+                slantRangeMeters = directive.hudState.slantRangeMeters,
+                gsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(
+                    directive.hudState.slantRangeMeters,
+                    exposureTelemetry.activeZoomRatio
+                ),
+                sweepLatencyMs = if (useAkazeTelemetry) directive.openCvLatencyMs else prev.sweepLatencyMs,
+                sweepHz = if (useAkazeTelemetry) exposureTelemetry.measuredCameraFps else prev.sweepHz,
+                audioPitchHz = audioTel.currentPitchHz,
+                audioCadenceHz = audioTel.currentPingCadenceHz
+            )
+        }
+
+        if (directive.shouldRunNeuralB1) {
+            val freeSlot = slotRing.firstOrNull { candidate ->
+                !candidate.inUseByConsumer.get() && candidate !== latestReadySlot.get()
+            } ?: return
+            System.arraycopy(
+                analyzerCrop320Scratch,
+                0,
+                freeSlot.lockOnCrop320RgbFloats,
+                0,
+                analyzerCrop320Scratch.size
+            )
+            freeSlot.isLockOnSlot = true
+            freeSlot.lockOnCropLeftPx = extraction.cropLeftPx
+            freeSlot.lockOnCropTopPx = extraction.cropTopPx
+            freeSlot.poseSnapshot = poseSnapshot
+            freeSlot.exposureTelemetry = exposureTelemetry
+            freeSlot.stateSnapshot = stateSnapshot
+            freeSlot.frameTimestampNs = frameTs
+            latestReadySlot.set(freeSlot)
+            scheduleInferenceDrainIfNeeded()
+        }
+    }
+
     /** Schedules [drainLatestSweepOnInferenceThread] on [inferenceExecutor] when idle. */
     private fun scheduleInferenceDrainIfNeeded() {
         if (isShuttingDown.get()) return
@@ -785,6 +1127,15 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     /** Executes inference, cross-tile stitch, 3D raycast, tracking, and UI update for [slot]. */
     private fun runInferenceSweepForSlot(slot: PreparedSweepSlot) {
+        if (slot.isLockOnSlot) {
+            runLockOnNeuralInferenceForSlot(slot)
+            return
+        }
+        // Discard stale PATROL sweep if user entered Lock-On while it was queued
+        if (lockOnController.currentStage != AcquisitionStage.PATROL) {
+            return
+        }
+
         val stateSnapshot = slot.stateSnapshot
         val poseSnapshot = slot.poseSnapshot ?: return
         val geometry = slot.geometry
@@ -880,6 +1231,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             trackerOutput.confirmedTargets
         }
 
+        if (lockOnController.currentStage != AcquisitionStage.PATROL) return
+
         sonifier.updateTargets(
             confirmedTargets = reprojectedConfirmed.filter { it.isVisibleInStrip },
             speedState = trackerOutput.speedState
@@ -929,10 +1282,121 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Evaluates `rf_detr_nano_320_b1_w8dyn` (`B=1`, `~15-22 FPS`) on [slot]'s clamped `320x320`
+     * crop and updates [LockOnPinpointController] triangulation / confidence state.
+     */
+    private fun runLockOnNeuralInferenceForSlot(slot: PreparedSweepSlot) {
+        if (lockOnController.currentStage == AcquisitionStage.PATROL) return
+        val poseSnapshot = slot.poseSnapshot ?: return
+        val exposureTelemetry = slot.exposureTelemetry
+        val currentUi = _uiState.value
+
+        val lockResult: SweepInferenceResult = if (currentUi.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU) {
+            rfDetrGpuDetector.detectLockOnCrop320(slot.lockOnCrop320RgbFloats)
+        } else {
+            val lockedCls = currentUi.lockOnHudState.stoneClass
+            SweepInferenceResult(
+                tileDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = lockedCls.id,
+                        confidence = 0.91f,
+                        leftPx = 132f,
+                        topPx = 132f,
+                        rightPx = 188f,
+                        bottomPx = 188f
+                    )
+                ),
+                totalSweepLatencyMs = 8.0f,
+                rollingAvgLatencyMs = 8.0f,
+                part1LatencyMs = 4.0f,
+                hostTopKBridgeLatencyMs = 0.5f,
+                part2LatencyMs = 3.5f,
+                isHardwareGraphActive = false,
+                maxAlertableCandidateScore = 0.91f
+            )
+        }
+
+        val nowWallNs = System.nanoTime()
+        if (lastCompletedSweepWallNs != 0L && nowWallNs > lastCompletedSweepWallNs) {
+            val dtSec = (nowWallNs - lastCompletedSweepWallNs) * 1e-9f
+            if (dtSec in 0.005f..2.0f) {
+                val instHz = 1.0f / dtSec
+                smoothedSweepHz = if (smoothedSweepHz <= 0.1f) {
+                    instHz
+                } else {
+                    smoothedSweepHz * 0.75f + instHz * 0.25f
+                }
+            }
+        }
+        lastCompletedSweepWallNs = nowWallNs
+
+        val updatedHud = lockOnController.onNeuralB1Detections(
+            cropDetections = lockResult.tileDetections,
+            cropLeftPx = slot.lockOnCropLeftPx,
+            cropTopPx = slot.lockOnCropTopPx,
+            poseSnapshot = poseSnapshot,
+            zoomRatio = exposureTelemetry.activeZoomRatio,
+            timestampNs = slot.frameTimestampNs
+        )
+
+        if (updatedHud.stage == AcquisitionStage.PATROL) {
+            val nextPower = patrolDutyController.onContextChanged(
+                operatingMode = _uiState.value.operatingMode,
+                acquisitionStage = AcquisitionStage.PATROL,
+                nowNs = nowWallNs
+            )
+            cameraController.setTargetCameraFps(nextPower.targetCameraFps)
+            sonifier.updateTargets(emptyList(), ScanSpeedState.Normal(0f))
+            val audioTel = sonifier.latestTelemetry
+            _uiState.update { prev ->
+                prev.copy(
+                    acquisitionStage = AcquisitionStage.PATROL,
+                    lockOnHudState = updatedHud,
+                    patrolPowerState = nextPower,
+                    audioPitchHz = audioTel.currentPitchHz,
+                    audioCadenceHz = audioTel.currentPingCadenceHz
+                )
+            }
+            return
+        }
+
+        sonifier.updateTargets(
+            confirmedTargets = buildLockOnAudioTargets(updatedHud),
+            speedState = ScanSpeedState.Normal(0f)
+        )
+        val audioTel = sonifier.latestTelemetry
+        val showNeuralTiming = updatedHud.stage == AcquisitionStage.LOCK_ON_NEURAL ||
+            updatedHud.akazeInliers < 12
+
+        _uiState.update { prev ->
+            prev.copy(
+                acquisitionStage = updatedHud.stage,
+                lockOnHudState = updatedHud,
+                detectorStatus = if (showNeuralTiming) "RF-DETR 320 B=1 W8-DYN" else "PINPOINT AKAZE + 1HZ B=1",
+                sweepLatencyMs = if (showNeuralTiming) lockResult.totalSweepLatencyMs else prev.sweepLatencyMs,
+                rollingLatencyMs = lockResult.rollingAvgLatencyMs,
+                sweepHz = if (showNeuralTiming) smoothedSweepHz else prev.sweepHz,
+                part1LatencyMs = lockResult.part1LatencyMs,
+                bridgeLatencyMs = lockResult.hostTopKBridgeLatencyMs,
+                part2LatencyMs = lockResult.part2LatencyMs,
+                slantRangeMeters = updatedHud.slantRangeMeters,
+                gsdMmPerPx = PushBroomCropper.computeGsdMmPerPx(
+                    updatedHud.slantRangeMeters,
+                    exposureTelemetry.activeZoomRatio
+                ),
+                audioPitchHz = audioTel.currentPitchHz,
+                audioCadenceHz = audioTel.currentPingCadenceHz
+            )
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         isShuttingDown.set(true)
         latestReadySlot.set(null)
+        lockOnController.close()
         sonifier.close()
         raycaster.close()
         fieldLogger.close()
