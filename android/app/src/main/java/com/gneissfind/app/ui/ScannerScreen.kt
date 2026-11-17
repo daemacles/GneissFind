@@ -1761,7 +1761,7 @@ private fun LcarsBottomProvenanceFooter(
             orientation = LcarsElbowOrientation.BottomLeft,
             color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.BASE),
             armLabel = provenanceLabel,
-            stemCode = "M2C",
+            stemCode = "M2D",
             armTextStyle = LcarsTypography.TelemetryBar,
             stemTextStyle = LcarsTypography.PillSubLabel,
             modifier = Modifier
@@ -2159,11 +2159,32 @@ private fun TacticalControlDeckZone(
                     .weight(1.15f)
             )
 
+            val recMins = (uiState.loggedDurationSec / 60).coerceIn(0, 99)
+            val recSecs = (uiState.loggedDurationSec % 60).coerceIn(0, 59)
+            val recValueText = if (isLogging) {
+                String.format(Locale.US, "%02d:%02d", recMins, recSecs)
+            } else {
+                String.format(Locale.US, "%04d", uiState.loggedFrameCount)
+            }
+            val recSubText = when {
+                isLogging -> String.format(Locale.US, "%dF", uiState.loggedFrameCount)
+                uiState.loggedDurationSec > 0 -> String.format(Locale.US, "%dS SAVED", uiState.loggedDurationSec)
+                else -> "SAVED"
+            }
             LcarsTelemetryBlock(
                 prefixCode = "REC",
-                valueText = String.format(Locale.US, "%04d", uiState.loggedFrameCount),
-                subText = if (isLogging) "4.0 HZ" else "SAVED",
-                color = LcarsSemanticColors.staticStateLabel(LcarsValueLevel.MINUS),
+                valueText = recValueText,
+                subText = recSubText,
+                color = if (isLogging) {
+                    LcarsSemanticColors.criticalAlert
+                } else {
+                    LcarsSemanticColors.staticStateLabel(LcarsValueLevel.MINUS)
+                },
+                textColor = if (isLogging) {
+                    LcarsColors.AlertWhite
+                } else {
+                    LcarsColors.CanvasBlack
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(0.85f)

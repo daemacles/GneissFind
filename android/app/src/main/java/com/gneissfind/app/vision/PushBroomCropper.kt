@@ -794,6 +794,156 @@ class PushBroomCropper(
         )
     }
 
+    /**
+     * Copies an upright landscape `YUV_420_888` [frame] into a contiguous semi-planar `NV12`
+     * (`Y` plane `[dstWidthPx * dstHeightPx]` followed by interleaved `U, V` `[dstWidthPx * dstHeightPx / 2]`)
+     * byte buffer in `< 1.5 ms` so [ImageProxy] can be closed immediately while `FieldDataLogger`
+     * feeds hardware `MediaCodec` H.264 on a background thread (`.agents/rules/android-camera-ar.md §2`).
+     */
+    fun extractUprightNv12Frame(
+        frame: Yuv420Frame,
+        outNv12Bytes: ByteArray,
+        dstWidthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
+        dstHeightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
+    ): Boolean {
+        val rawW = frame.width
+        val rawH = frame.height
+        if (rawW < 2 || rawH < 2 || dstWidthPx < 2 || dstHeightPx < 2) return false
+        val evenW = dstWidthPx and -2
+        val evenH = dstHeightPx and -2
+        val lumaSize = evenW * evenH
+        val totalSize = lumaSize + (lumaSize shr 1)
+        if (outNv12Bytes.size < totalSize) return false
+
+        val yDup = frame.yBuffer.duplicate()
+        val uDup = frame.uBuffer.duplicate()
+        val vDup = frame.vBuffer.duplicate()
+        val yLimit = yDup.limit()
+        val uLimit = uDup.limit()
+        val vLimit = vDup.limit()
+        if (yLimit <= 0 || uLimit <= 0 || vLimit <= 0) return false
+
+        val yRowStride = frame.yRowStride
+        val yPixStride = frame.yPixelStride
+        val uRowStride = frame.uRowStride
+        val uPixStride = frame.uPixelStride
+        val vRowStride = frame.vRowStride
+        val vPixStride = frame.vPixelStride
+
+        val rot = ((frame.rotationDegrees % 360) + 360) % 360
+        val uprightW = if (rot == 90 || rot == 270) rawH else rawW
+        val uprightH = if (rot == 90 || rot == 270) rawW else rawH
+
+        // Fast bulk path: canonical landscape (rot == 0), 1:1 dimensions, contiguous Y pixelStride == 1
+        if (rot == 0 && yPixStride == 1 && rawW == evenW && rawH == evenH) {
+            if (yRowStride == evenW && yLimit >= lumaSize) {
+                yDup.position(0)
+                yDup.get(outNv12Bytes, 0, lumaSize)
+            } else {
+                for (row in 0 until evenH) {
+                    val srcStart = row * yRowStride
+                    val copyLen = min(evenW, (yLimit - srcStart).coerceAtLeast(0))
+                    if (copyLen > 0) {
+                        yDup.position(srcStart)
+                        yDup.get(outNv12Bytes, row * evenW, copyLen)
+                    }
+                }
+            }
+            val uvCols = evenW shr 1
+            val uvRows = evenH shr 1
+            var uvDst = lumaSize
+            for (uvY in 0 until uvRows) {
+                val uRowBase = uvY * uRowStride
+                val vRowBase = uvY * vRowStride
+                for (uvX in 0 until uvCols) {
+                    val uRaw = uRowBase + uvX * uPixStride
+                    val vRaw = vRowBase + uvX * vPixStride
+                    val uIdx = if (uRaw < uLimit && uRaw >= 0) {
+                        uRaw
+                    } else {
+                        safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit)
+                    }
+                    val vIdx = if (vRaw < vLimit && vRaw >= 0) {
+                        vRaw
+                    } else {
+                        safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit)
+                    }
+                    outNv12Bytes[uvDst++] = uDup.get(uIdx)
+                    outNv12Bytes[uvDst++] = vDup.get(vIdx)
+                }
+            }
+            return true
+        }
+
+        // General reversible-landscape (180/90/270) or scaled fallback path
+        var dstYIdx = 0
+        for (dy in 0 until evenH) {
+            val uy = if (uprightH == evenH) dy else (dy * uprightH) / evenH
+            for (dx in 0 until evenW) {
+                val ux = if (uprightW == evenW) dx else (dx * uprightW) / evenW
+                val bx: Int
+                val by: Int
+                when (rot) {
+                    90 -> {
+                        bx = uy
+                        by = (rawH - 1 - ux).coerceIn(0, rawH - 1)
+                    }
+                    180 -> {
+                        bx = (rawW - 1 - ux).coerceIn(0, rawW - 1)
+                        by = (rawH - 1 - uy).coerceIn(0, rawH - 1)
+                    }
+                    270 -> {
+                        bx = (rawW - 1 - uy).coerceIn(0, rawW - 1)
+                        by = ux
+                    }
+                    else -> {
+                        bx = ux
+                        by = uy
+                    }
+                }
+                val yIdx = safeLumaByteIndex(bx, by, yRowStride, yPixStride, yLimit)
+                outNv12Bytes[dstYIdx++] = yDup.get(yIdx)
+            }
+        }
+
+        val uvCols = evenW shr 1
+        val uvRows = evenH shr 1
+        var uvDst = lumaSize
+        for (dy2 in 0 until uvRows) {
+            val uy = ((dy2 shl 1) * uprightH) / evenH
+            for (dx2 in 0 until uvCols) {
+                val ux = ((dx2 shl 1) * uprightW) / evenW
+                val bx: Int
+                val by: Int
+                when (rot) {
+                    90 -> {
+                        bx = uy
+                        by = (rawH - 1 - ux).coerceIn(0, rawH - 1)
+                    }
+                    180 -> {
+                        bx = (rawW - 1 - ux).coerceIn(0, rawW - 1)
+                        by = (rawH - 1 - uy).coerceIn(0, rawH - 1)
+                    }
+                    270 -> {
+                        bx = (rawW - 1 - uy).coerceIn(0, rawW - 1)
+                        by = ux
+                    }
+                    else -> {
+                        bx = ux
+                        by = uy
+                    }
+                }
+                val uvX = bx shr 1
+                val uvY = by shr 1
+                val uIdx = safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit)
+                val vIdx = safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit)
+                outNv12Bytes[uvDst++] = uDup.get(uIdx)
+                outNv12Bytes[uvDst++] = vDup.get(vIdx)
+            }
+        }
+        return true
+    }
+
     companion object {
         /** Native square tensor resolution in pixels for `rf_detr_nano_320_b1_w8dyn` Lock-On tracking. */
         const val LOCK_ON_CROP_SIZE_PX = 320

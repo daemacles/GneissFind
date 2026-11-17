@@ -24,7 +24,8 @@ import com.gneissfind.app.camera.PushBroomCameraController
 import com.gneissfind.app.inference.CocoStandInMetadata
 import com.gneissfind.app.inference.RfDetrTwoGraphGpuDetector
 import com.gneissfind.app.logging.FieldDataLogger
-import com.gneissfind.app.logging.FieldStripMetadata
+import com.gneissfind.app.logging.ReplayFrameRecord
+import com.gneissfind.app.logging.ReplayTraceHeader
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.TileDetection
@@ -308,40 +309,43 @@ class SonifierAndHostBridgeTest {
         assertThat(centerRay.worldPoint.xMeters).isWithin(0.001f).of(0.0f)
         assertThat(centerRay.gsdMmPerPx).isWithin(0.02f).of(0.59f)
 
-        val jsonLine = FieldDataLogger.buildMetadataJsonLine(
-            sessionId = "20261114_100000",
-            frameIndex = 1,
-            fileName = "strip_000001.png",
-            metadata = FieldStripMetadata(
-                timestampNs = 123456789L,
-                wallTimeMs = 1794650400000L,
-                stripWidthPx = 1792,
-                stripHeightPx = 384,
-                tileCount = 5,
+        val headerLine = FieldDataLogger.buildHeaderJsonLine(
+            ReplayTraceHeader(
+                schemaVersion = 1,
+                width = 1920,
+                height = 1080,
+                fps = 30,
                 zoomRatio = 2.0f,
-                exposureTimeNs = 2_000_000L,
-                sensorIso = 320,
-                shutterClamped = true,
-                exposureBiasEv = -0.5f,
-                imuPitchDeg = 45.0f,
-                referencePitchDeg = 45.0f,
-                cropY = 348,
-                isPitchClamped = false,
-                slantRangeMeters = centerRay.slantRangeMeters,
-                gsdMmPerPx = centerRay.gsdMmPerPx,
-                horizontalSpeedMps = 0.65f
+                focalLengthPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
+                refPitchDeg = 45.0f,
+                displayRotation = Surface.ROTATION_90,
+                gitHash = "M2D001"
             )
         )
-        val parsed = JSONObject(jsonLine)
-        assertThat(parsed.getInt("strip_width")).isEqualTo(1792)
-        assertThat(parsed.getInt("strip_height")).isEqualTo(384)
-        assertThat(parsed.getInt("tile_count")).isEqualTo(5)
-        assertThat(parsed.getDouble("zoom_ratio")).isWithin(0.01).of(2.0)
-        assertThat(parsed.getLong("exposure_ns")).isAtMost(2_000_000L)
-        assertThat(parsed.getInt("crop_y")).isEqualTo(348)
-        assertThat(parsed.getBoolean("is_pitch_clamped")).isFalse()
-        assertThat(parsed.getDouble("slant_range_m")).isWithin(0.02).of(1.50)
-        assertThat(parsed.getDouble("gsd_mm_px")).isWithin(0.02).of(0.59)
+        val parsedHeader = JSONObject(headerLine)
+        assertThat(parsedHeader.getString("type")).isEqualTo("header")
+        assertThat(parsedHeader.getInt("width")).isEqualTo(1920)
+        assertThat(parsedHeader.getInt("height")).isEqualTo(1080)
+        assertThat(parsedHeader.getInt("fps")).isEqualTo(30)
+        assertThat(parsedHeader.getDouble("zoom_ratio")).isWithin(0.01).of(2.0)
+
+        val frameLine = FieldDataLogger.buildFrameJsonLine(
+            ReplayFrameRecord(
+                frameIdx = 0,
+                ptsUs = 0L,
+                timestampNs = 123456789L,
+                exposureNs = 2_000_000L,
+                iso = 320,
+                zoomRatio = 2.0f,
+                shutterClamp = true,
+                evBias = -0.5f
+            )
+        )
+        val parsedFrame = JSONObject(frameLine)
+        assertThat(parsedFrame.getString("type")).isEqualTo("frame")
+        assertThat(parsedFrame.getLong("exposure_ns")).isAtMost(2_000_000L)
+        assertThat(parsedFrame.getBoolean("shutter_clamp")).isTrue()
+        assertThat(parsedFrame.getDouble("zoom_ratio")).isWithin(0.01).of(2.0)
     }
 
     @Test

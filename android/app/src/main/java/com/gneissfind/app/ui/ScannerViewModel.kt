@@ -28,7 +28,7 @@ import com.gneissfind.app.inference.RfDetrTwoGraphGpuDetector
 import com.gneissfind.app.inference.SyntheticStoneDetector
 import com.gneissfind.app.inference.SyntheticTargetProfile
 import com.gneissfind.app.logging.FieldDataLogger
-import com.gneissfind.app.logging.FieldStripMetadata
+import com.gneissfind.app.logging.FieldFrameTelemetry
 import com.gneissfind.app.model.AcquisitionStage
 import com.gneissfind.app.model.ConfirmedTarget
 import com.gneissfind.app.model.DetectorBackend
@@ -197,6 +197,7 @@ data class ScannerUiState(
     val audioPitchHz: Float = 0f,
     val audioCadenceHz: Float = 0f,
     val loggedFrameCount: Int = 0,
+    val loggedDurationSec: Int = 0,
     val fieldLogDirectory: String = ""
 ) {
     /** Resolves the currently active [DetectorSourceOption] from [detectorBackend], [liveModelProfile], and [syntheticProfile]. */
@@ -316,6 +317,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }
+        raycaster.onImuTraceSampleListener = { tMonoNs, rotMat9, rawPitchDeg ->
+            fieldLogger.recordImuSample(
+                timestampMonoNs = tMonoNs,
+                rotationMatrix9 = rotMat9,
+                pitchDeg = rawPitchDeg
+            )
+        }
         raycaster.onRealtimeImuPitchListener = { smoothedPitchDeg, rollDeg, refPitchDeg ->
             var updatedVisibleTargetsForAudio: List<ConfirmedTarget>? = null
             var currentSpeedForAudio: ScanSpeedState = ScanSpeedState.Normal(0f)
@@ -398,7 +406,17 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                         isPitchClamped = floatStab.isPitchClamped,
                         slantRangeMeters = slantR,
                         gsdMmPerPx = gsd,
-                        confirmedTargets = reprojectedTargets
+                        confirmedTargets = reprojectedTargets,
+                        loggedFrameCount = if (prev.operatingMode == OperatingMode.LOG_DATA) {
+                            fieldLogger.savedFrameCount
+                        } else {
+                            prev.loggedFrameCount
+                        },
+                        loggedDurationSec = if (prev.operatingMode == OperatingMode.LOG_DATA) {
+                            fieldLogger.recordedDurationSec
+                        } else {
+                            prev.loggedDurationSec
+                        }
                     )
                 }
             }
@@ -658,13 +676,20 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         cameraController.setTargetCameraFps(nextPower.targetCameraFps)
         if (mode == OperatingMode.LOG_DATA) {
             cameraController.setShutterClamp(true)
-            val dir = fieldLogger.startSession()
+            val snap = _uiState.value
+            val dir = fieldLogger.startSession(
+                initialZoomRatio = snap.activeZoomRatio,
+                initialFocalLengthPx = snap.verticalFocalLengthPx,
+                initialRefPitchDeg = snap.referencePitchDeg,
+                initialDisplayRotation = snap.displaySurfaceRotation
+            )
             _uiState.update {
                 it.copy(
                     operatingMode = mode,
                     patrolPowerState = nextPower,
                     shutterClampEnabled = true,
                     loggedFrameCount = 0,
+                    loggedDurationSec = 0,
                     fieldLogDirectory = dir.absolutePath
                 )
             }
@@ -674,7 +699,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 it.copy(
                     operatingMode = mode,
                     patrolPowerState = nextPower,
-                    loggedFrameCount = fieldLogger.savedFrameCount
+                    loggedFrameCount = fieldLogger.savedFrameCount,
+                    loggedDurationSec = fieldLogger.recordedDurationSec
                 )
             }
         }
@@ -887,6 +913,31 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val frameTs: Long
 
         try {
+            stateSnapshot = _uiState.value
+            isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
+            frameTs = imageProxy.imageInfo.timestamp
+            val yuvFrame = ImageProxyYuv420Frame(imageProxy)
+
+            // Feed 30 FPS 1080p hardware MediaCodec + trace.jsonl on every frame while MOD == LOG_DATA,
+            // strictly decoupled from inference sweep throttling and without binding a 3rd CameraX surface!
+            if (isLoggingMode && !raycaster.isReplayModeActive) {
+                fieldLogger.recordCameraFrame(
+                    frame = yuvFrame,
+                    cropper = cropper,
+                    telemetry = FieldFrameTelemetry(
+                        timestampMonoNs = GroundPlaneRaycaster.alignHardwareTimestampToMonotonicNs(frameTs),
+                        exposureTimeNs = exposureTelemetry.exposureTimeNs,
+                        sensorIso = exposureTelemetry.sensorIso,
+                        zoomRatio = exposureTelemetry.activeZoomRatio,
+                        focalLengthPx = exposureTelemetry.verticalFocalLengthPx,
+                        referencePitchDeg = stateSnapshot.referencePitchDeg,
+                        displayRotation = stateSnapshot.displaySurfaceRotation,
+                        shutterClamped = stateSnapshot.shutterClampEnabled,
+                        exposureBiasEv = stateSnapshot.exposureBiasEv
+                    )
+                )
+            }
+
             val nowWallMs = SystemClock.elapsedRealtime()
             // Avoid redundant 30 Hz CPU YUV decoding if an unread frame is already staged and < 22 ms old
             if (inferenceRunning.get() &&
@@ -903,10 +954,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             slot = freeSlot
             slot.isLockOnSlot = false
             lastProducerExtractWallMs = nowWallMs
-            stateSnapshot = _uiState.value
-            isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
             tileMode = stateSnapshot.swathTileMode
-            frameTs = imageProxy.imageInfo.timestamp
 
             poseSnapshot = raycaster.capturePoseSnapshot(
                 arFrame = null,
@@ -919,44 +967,17 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 zoomRatio = activeZoom
             )
 
-            val yuvFrame = ImageProxyYuv420Frame(imageProxy)
             geometry = cropper.extractTiles(
                 frame = yuvFrame,
                 outBuffers = slot.sweepBuffers,
                 cropY = poseSnapshot.cropY,
                 tileMode = tileMode,
                 isPitchClamped = poseSnapshot.isPitchClamped,
-                populateArgbStrip = isLoggingMode
+                populateArgbStrip = false
             )
         } finally {
             // Release Camera2 ImageReader Gralloc buffer immediately after ~3 ms CPU YUV extraction!
             imageProxy.close()
-        }
-
-        // Optional LOG DATA lossless strip + metadata.jsonl persistence (4 Hz)
-        if (isLoggingMode && slot.sweepBuffers.hasArgbPixels) {
-            fieldLogger.maybeRecordStripFrame(
-                stripArgbPixels = slot.sweepBuffers.stripArgbPixels,
-                metadata = FieldStripMetadata(
-                    timestampNs = frameTs,
-                    wallTimeMs = System.currentTimeMillis(),
-                    stripWidthPx = tileMode.stripWidthPx,
-                    stripHeightPx = StripRoiGeometry.STRIP_HEIGHT_PX,
-                    tileCount = tileMode.tileCount,
-                    zoomRatio = exposureTelemetry.activeZoomRatio,
-                    exposureTimeNs = exposureTelemetry.exposureTimeNs,
-                    sensorIso = exposureTelemetry.sensorIso,
-                    shutterClamped = stateSnapshot.shutterClampEnabled,
-                    exposureBiasEv = stateSnapshot.exposureBiasEv,
-                    imuPitchDeg = poseSnapshot.forwardPitchDeg,
-                    referencePitchDeg = poseSnapshot.referencePitchDeg,
-                    cropY = poseSnapshot.cropY,
-                    isPitchClamped = poseSnapshot.isPitchClamped,
-                    slantRangeMeters = poseSnapshot.centerSlantRangeMeters,
-                    gsdMmPerPx = centerGsdMmPerPx,
-                    horizontalSpeedMps = poseSnapshot.horizontalSpeedMps
-                )
-            )
         }
 
         slot.poseSnapshot = poseSnapshot
@@ -997,6 +1018,23 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 focalLengthPx = exposureTelemetry.verticalFocalLengthPx
             )
             val yuvFrame = ImageProxyYuv420Frame(imageProxy)
+            if (stateSnapshot.operatingMode == OperatingMode.LOG_DATA && !raycaster.isReplayModeActive) {
+                fieldLogger.recordCameraFrame(
+                    frame = yuvFrame,
+                    cropper = cropper,
+                    telemetry = FieldFrameTelemetry(
+                        timestampMonoNs = GroundPlaneRaycaster.alignHardwareTimestampToMonotonicNs(frameTs),
+                        exposureTimeNs = exposureTelemetry.exposureTimeNs,
+                        sensorIso = exposureTelemetry.sensorIso,
+                        zoomRatio = exposureTelemetry.activeZoomRatio,
+                        focalLengthPx = exposureTelemetry.verticalFocalLengthPx,
+                        referencePitchDeg = stateSnapshot.referencePitchDeg,
+                        displayRotation = stateSnapshot.displaySurfaceRotation,
+                        shutterClamped = stateSnapshot.shutterClampEnabled,
+                        exposureBiasEv = stateSnapshot.exposureBiasEv
+                    )
+                )
+            }
             extraction = cropper.extractUprightLumaAndLockOnCrop320(
                 frame = yuvFrame,
                 outLumaBytes = analyzerLumaScratch,
@@ -1307,6 +1345,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 audioPitchHz = audioTel.currentPitchHz,
                 audioCadenceHz = audioTel.currentPingCadenceHz,
                 loggedFrameCount = fieldLogger.savedFrameCount,
+                loggedDurationSec = fieldLogger.recordedDurationSec,
                 fieldLogDirectory = fieldLogger.currentSessionPath
             )
         }

@@ -257,6 +257,17 @@ class GroundPlaneRaycaster(
     @Volatile
     var onRealtimeImuPitchListener: ((smoothedPitchDeg: Float, rollDeg: Float, referencePitchDeg: Float) -> Unit)? = null
 
+    /**
+     * Optional `120 Hz` trace recorder callback invoked with monotonic `System.nanoTime()`-aligned
+     * timestamps and the remapped `3x3` `R_world_from_scr` rotation matrix while `MOD: LOG` is active.
+     */
+    @Volatile
+    var onImuTraceSampleListener: ((timestampMonoNs: Long, rotationMatrix9: FloatArray, rawPitchDeg: Float) -> Unit)? = null
+
+    /** When `true`, live hardware `SensorEvent` callbacks are ignored in favor of [injectReplayOrientationMatrix]. */
+    @Volatile
+    var isReplayModeActive: Boolean = false
+
     @Volatile
     var hasLiveImuStream: Boolean = false
         private set
@@ -389,6 +400,79 @@ class GroundPlaneRaycaster(
             ringWriteIndex = (ringWriteIndex + 1) % IMU_RING_CAPACITY
             if (ringCount < IMU_RING_CAPACITY) ringCount++
         }
+        onImuTraceSampleListener?.invoke(
+            alignHardwareTimestampToMonotonicNs(timestampNs),
+            mat,
+            pitchDeg
+        )
+    }
+
+    /**
+     * Injects a recorded `trace.jsonl` `120 Hz` IMU `R_world_from_scr` 9-element matrix at [timestampNs]
+     * during deterministic [com.gneissfind.app.camera.ReplayCameraSource] playback, driving both the
+     * historical frame-lookup ring buffer and the `120 Hz` EIS/reticle display callback.
+     */
+    fun injectReplayOrientationMatrix(
+        timestampNs: Long,
+        rotationMatrix9: FloatArray,
+        rawPitchOverrideDeg: Float? = null
+    ) {
+        if (rotationMatrix9.size < 9) return
+        val (computedPitch, computedRoll) = computePitchAndRollDegrees(rotationMatrix9)
+        val rawPitch = rawPitchOverrideDeg?.takeIf { it.isFinite() } ?: computedPitch
+        latestRawPitchDeg = rawPitch
+        hasLiveImuStream = true
+
+        val dtSec = if (lastGameRotationTimestampNs != 0L && timestampNs > lastGameRotationTimestampNs) {
+            ((timestampNs - lastGameRotationTimestampNs) * 1e-9f).coerceIn(0.002f, 0.1f)
+        } else {
+            0.008f
+        }
+        lastGameRotationTimestampNs = timestampNs
+
+        if (!hasInitializedDisplayPitch) {
+            currentForwardPitchDeg = rawPitch
+            currentRollDeg = computedRoll
+            hasInitializedDisplayPitch = true
+        } else {
+            val pitchDelta = abs(rawPitch - currentForwardPitchDeg)
+            val motionBlend = ((pitchDelta - 0.15f) / 1.10f).coerceIn(0f, 1f)
+            val tauSec = 0.045f * (1f - motionBlend) + 0.014f * motionBlend
+            val alpha = (dtSec / (tauSec + dtSec)).coerceIn(0.08f, 0.78f)
+            currentForwardPitchDeg += (rawPitch - currentForwardPitchDeg) * alpha
+            currentRollDeg += (computedRoll - currentRollDeg) * alpha
+        }
+
+        synchronized(imuRingLock) {
+            System.arraycopy(rotationMatrix9, 0, latestRemappedRotationMatrix, 0, 9)
+            ringTimestampsNs[ringWriteIndex] = timestampNs
+            ringPitchDeg[ringWriteIndex] = rawPitch
+            ringRollDeg[ringWriteIndex] = computedRoll
+            System.arraycopy(rotationMatrix9, 0, ringRotationMatrices, ringWriteIndex * 9, 9)
+            ringWriteIndex = (ringWriteIndex + 1) % IMU_RING_CAPACITY
+            if (ringCount < IMU_RING_CAPACITY) ringCount++
+        }
+
+        val listener = onRealtimeImuPitchListener
+        if (listener != null &&
+            (lastRealtimeCallbackNs == 0L || abs(timestampNs - lastRealtimeCallbackNs) >= MIN_DISPLAY_UPDATE_INTERVAL_NS)
+        ) {
+            lastRealtimeCallbackNs = timestampNs
+            val displayPitch = simulatedPitchOverrideDeg ?: currentForwardPitchDeg
+            listener.invoke(displayPitch, currentRollDeg, referencePitchDeg)
+        }
+    }
+
+    /** Clears historical IMU ring samples when switching between live CameraX and replay sessions. */
+    fun resetRingBuffer(initialReferencePitchDeg: Float = referencePitchDeg) {
+        synchronized(imuRingLock) {
+            ringWriteIndex = 0
+            ringCount = 0
+        }
+        hasInitializedDisplayPitch = false
+        lastGameRotationTimestampNs = 0L
+        lastRealtimeCallbackNs = 0L
+        setReferencePitchDegrees(initialReferencePitchDeg)
     }
 
     /**
@@ -415,6 +499,7 @@ class GroundPlaneRaycaster(
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        if (isReplayModeActive) return
         when (event.sensor.type) {
             Sensor.TYPE_GAME_ROTATION_VECTOR -> {
                 SensorManager.getRotationMatrixFromVector(rawRotationMatrix, event.values)
@@ -459,6 +544,12 @@ class GroundPlaneRaycaster(
                     ringWriteIndex = (ringWriteIndex + 1) % IMU_RING_CAPACITY
                     if (ringCount < IMU_RING_CAPACITY) ringCount++
                 }
+
+                onImuTraceSampleListener?.invoke(
+                    alignHardwareTimestampToMonotonicNs(event.timestamp),
+                    remappedRotationMatrix,
+                    rawPitch
+                )
 
                 val listener = onRealtimeImuPitchListener
                 if (listener != null &&
@@ -783,6 +874,25 @@ class GroundPlaneRaycaster(
 
         private val MIN_DOWNWARD_SIN = sin(Math.toRadians(10.0)).toFloat()
         private val MAX_DOWNWARD_SIN = sin(Math.toRadians(88.0)).toFloat()
+
+        /**
+         * Aligns a Camera2 `SENSOR_TIMESTAMP` or SensorManager `event.timestamp` (`CLOCK_BOOTTIME`
+         * or `CLOCK_MONOTONIC`) onto the JVM `System.nanoTime()` (`CLOCK_MONOTONIC`) timeline with
+         * sub-microsecond fidelity so `trace.jsonl` `imu` and `frame` records share one clock.
+         */
+        fun alignHardwareTimestampToMonotonicNs(hardwareTimestampNs: Long): Long {
+            if (hardwareTimestampNs <= 0L) return System.nanoTime()
+            val monoNow = System.nanoTime()
+            val bootNow = runCatching { android.os.SystemClock.elapsedRealtimeNanos() }.getOrDefault(0L)
+            if (bootNow <= 0L) return hardwareTimestampNs
+            val diffMono = abs(hardwareTimestampNs - monoNow)
+            val diffBoot = abs(hardwareTimestampNs - bootNow)
+            return if (diffBoot < diffMono) {
+                hardwareTimestampNs + (monoNow - bootNow)
+            } else {
+                hardwareTimestampNs
+            }
+        }
 
         /**
          * Builds an orthonormal 3x3 landscape rotation matrix (`R_world_from_scr`, row-major) from
