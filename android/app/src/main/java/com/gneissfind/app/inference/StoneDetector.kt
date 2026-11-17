@@ -25,6 +25,9 @@ import com.gneissfind.app.vision.PushBroomSweepBuffers
  * @property rollingAvgLatencyMs Smoothed average of recent sweep latencies, ms.
  * @property isHardwareGraphActive True if this result came from the real on-device model rather
  *   than a simulation.
+ * @property maxAlertableCandidateScore Highest raw confidence score in `[0.0, 1.0]` observed on
+ *   any user-alertable [com.gneissfind.app.model.StoneClass] query during this sweep (including
+ *   sub-threshold `0.30..0.35` candidates used to wake `PATROL_IDLE`).
  */
 data class SweepInferenceResult(
     val tileDetections: List<TileDetection>,
@@ -33,7 +36,8 @@ data class SweepInferenceResult(
     val part2LatencyMs: Float,
     val totalSweepLatencyMs: Float,
     val rollingAvgLatencyMs: Float,
-    val isHardwareGraphActive: Boolean
+    val isHardwareGraphActive: Boolean,
+    val maxAlertableCandidateScore: Float = 0f
 )
 
 /**

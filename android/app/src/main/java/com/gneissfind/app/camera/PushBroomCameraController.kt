@@ -55,6 +55,7 @@ import kotlin.math.tan
  * @property verticalFocalLengthPx Calibrated vertical pinhole focal length $f_y$ in output stream pixels (`~2985 px` at `2.0x` on `1920x1080`).
  * @property streamWidth Width of the analyzed `YUV_420_888` [ImageProxy] stream in pixels ([PushBroomCameraController.TARGET_WIDTH_1080P]).
  * @property streamHeight Height of the analyzed `YUV_420_888` [ImageProxy] stream in pixels ([PushBroomCameraController.TARGET_HEIGHT_1080P]).
+ * @property measuredCameraFps Smoothed hardware `YUV_420_888` sensor capture frame rate in Hz (`~30.0` active, `~15.0` idle).
  */
 data class CameraExposureTelemetry(
     val exposureTimeNs: Long = PushBroomCameraController.MAX_SHUTTER_EXPOSURE_NS,
@@ -62,7 +63,8 @@ data class CameraExposureTelemetry(
     val activeZoomRatio: Float = 2.0f,
     val verticalFocalLengthPx: Float = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX,
     val streamWidth: Int = PushBroomCameraController.TARGET_WIDTH_1080P,
-    val streamHeight: Int = PushBroomCameraController.TARGET_HEIGHT_1080P
+    val streamHeight: Int = PushBroomCameraController.TARGET_HEIGHT_1080P,
+    val measuredCameraFps: Float = 30.0f
 )
 
 /**
@@ -112,8 +114,20 @@ class PushBroomCameraController(
     /** Maximum hardware digital zoom ratio queried from `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`. */
     private var hardwareMaxZoomRatio: Float = 8.0f
 
+    /** Hardware-supported AE FPS ranges queried from `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`. */
+    private var availableFpsRanges: Array<Range<Int>> = emptyArray()
+
+    /** Maximum sensor frame duration (`ns`) queried from `SENSOR_INFO_MAX_FRAME_DURATION`. */
+    private var sensorMaxFrameDurationNs: Long = 100_000_000L
+
     /** Last zoom ratio pushed to `cameraControl.setZoomRatio(...)` to avoid redundant IPC calls. */
     private var lastAppliedZoomRatio: Float = -1.0f
+
+    /** Last target camera FPS pushed to `Camera2CameraControl`. */
+    private var lastAppliedCameraFps: Int = -1
+
+    private var prevAnalyzerFrameTsNs: Long = 0L
+    private var smoothedCameraFps: Float = 30.0f
 
     /** Active landscape display rotation ([Surface.ROTATION_90] or [Surface.ROTATION_270]). */
     @Volatile
@@ -123,6 +137,11 @@ class PushBroomCameraController(
     /** Whether manual `CONTROL_AE_MODE_OFF` shutter clamping (`<=` [MAX_SHUTTER_EXPOSURE_NS]) is active. */
     @Volatile
     var shutterClampEnabled: Boolean = true
+        private set
+
+    /** Target Camera2 sensor frame rate (`30` in `PATROL_ACTIVE` / `LOCK-ON`, `15` in `PATROL_IDLE`). */
+    @Volatile
+    var targetCameraFps: Int = ACTIVE_PATROL_FPS
         private set
 
     /** User-selected canopy exposure compensation bias in EV stops within `[MIN_CANOPY_EV_BIAS]..[MAX_CANOPY_EV_BIAS]`. */
@@ -265,9 +284,20 @@ class PushBroomCameraController(
 
         val imageAnalysis = analysisBuilder.build().also { analysis ->
             analysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                val tsNs = imageProxy.imageInfo.timestamp
+                if (prevAnalyzerFrameTsNs != 0L && tsNs > prevAnalyzerFrameTsNs) {
+                    val dtSec = (tsNs - prevAnalyzerFrameTsNs) * 1e-9f
+                    if (dtSec in 0.010f..0.500f) {
+                        val instFps = 1.0f / dtSec
+                        smoothedCameraFps = smoothedCameraFps * 0.80f + instFps * 0.20f
+                    }
+                }
+                prevAnalyzerFrameTsNs = tsNs
+
                 val curTelemetry = latestTelemetry.copy(
                     streamWidth = imageProxy.width,
-                    streamHeight = imageProxy.height
+                    streamHeight = imageProxy.height,
+                    measuredCameraFps = smoothedCameraFps
                 )
                 latestTelemetry = curTelemetry
 
@@ -288,6 +318,7 @@ class PushBroomCameraController(
         )
         boundCamera = camera
         lastAppliedZoomRatio = -1.0f
+        lastAppliedCameraFps = -1
 
         // Query hardware ISO, exposure, max digital zoom & sensor array dimensions synchronously
         // via Camera2CameraInfo so initial 2.0x zoom never races CameraX's uninitialized zoomState.
@@ -301,6 +332,12 @@ class PushBroomCameraController(
             }
             chars.getCameraCharacteristic(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.let {
                 if (it > 1.0f) hardwareMaxZoomRatio = it
+            }
+            chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.let {
+                availableFpsRanges = it
+            }
+            chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION)?.let {
+                if (it >= FRAME_DURATION_30_FPS_NS) sensorMaxFrameDurationNs = it
             }
             activeArraySize = chars.getCameraCharacteristic(
                 CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE
@@ -320,6 +357,21 @@ class PushBroomCameraController(
     fun setShutterClamp(enabled: Boolean) {
         shutterClampEnabled = enabled
         applyZoomAndExposureControls(forceZoomUpdate = false)
+    }
+
+    /**
+     * Dynamically switches Camera2 `CONTROL_AE_TARGET_FPS_RANGE` (and `SENSOR_FRAME_DURATION` when
+     * `CONTROL_AE_MODE_OFF` shutter clamp is active) between `30 FPS` (`PATROL_ACTIVE` / `LOCK-ON`)
+     * and `15 FPS` (`PATROL_IDLE`) in `< 50 ms` without reopening the CameraX session.
+     *
+     * @param fps Desired capture rate (`15` for `PATROL_IDLE`, `30` otherwise).
+     */
+    fun setTargetCameraFps(fps: Int) {
+        val normalized = if (fps <= IDLE_PATROL_FPS) IDLE_PATROL_FPS else ACTIVE_PATROL_FPS
+        if (targetCameraFps != normalized) {
+            targetCameraFps = normalized
+            applyZoomAndExposureControls(forceZoomUpdate = false)
+        }
     }
 
     /**
@@ -366,6 +418,12 @@ class PushBroomCameraController(
 
         val c2Control = Camera2CameraControl.from(camera.cameraControl)
         val evState = camera.cameraInfo.exposureState
+        val desiredFps = targetCameraFps
+        val fpsRange = resolveHardwareFpsRange(desiredFps)
+        val frameDurationNs = (
+            if (desiredFps <= IDLE_PATROL_FPS) FRAME_DURATION_15_FPS_NS else FRAME_DURATION_30_FPS_NS
+        ).coerceAtMost(sensorMaxFrameDurationNs)
+
         if (shutterClampEnabled) {
             if (evState.isExposureCompensationSupported && evState.exposureCompensationIndex != 0) {
                 camera.cameraControl.setExposureCompensationIndex(0)
@@ -385,6 +443,14 @@ class PushBroomCameraController(
                     CameraMetadata.CONTROL_AE_MODE_OFF
                 )
                 .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    fpsRange
+                )
+                .setCaptureRequestOption(
+                    CaptureRequest.SENSOR_FRAME_DURATION,
+                    frameDurationNs
+                )
+                .setCaptureRequestOption(
                     CaptureRequest.SENSOR_EXPOSURE_TIME,
                     clampedExpNs
                 )
@@ -395,8 +461,18 @@ class PushBroomCameraController(
                 .build()
             c2Control.setCaptureRequestOptions(options)
         } else {
-            // Clear manual AE/shutter/ISO overrides so CameraX restores native CONTROL_AE_MODE_ON.
-            c2Control.clearCaptureRequestOptions()
+            if (desiredFps <= IDLE_PATROL_FPS) {
+                val idleOptions = CaptureRequestOptions.Builder()
+                    .setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                        fpsRange
+                    )
+                    .build()
+                c2Control.setCaptureRequestOptions(idleOptions)
+            } else {
+                // Clear manual AE/shutter/ISO/FPS overrides so CameraX restores native 30 FPS CONTROL_AE_MODE_ON.
+                c2Control.clearCaptureRequestOptions()
+            }
 
             if (evState.isExposureCompensationSupported) {
                 val step = evState.exposureCompensationStep.toFloat().coerceAtLeast(0.1f)
@@ -405,6 +481,24 @@ class PushBroomCameraController(
                 camera.cameraControl.setExposureCompensationIndex(index)
             }
         }
+
+        if (lastAppliedCameraFps != desiredFps) {
+            lastAppliedCameraFps = desiredFps
+            Log.i(
+                TAG,
+                "PATROL_DUTY_FPS applied targetFps=$desiredFps range=$fpsRange frameDurNs=$frameDurationNs shutterClamp=$shutterClampEnabled"
+            )
+        }
+    }
+
+    /** Resolves the best hardware-advertised [Range] matching [desiredFps] (`15` or `30`). */
+    private fun resolveHardwareFpsRange(desiredFps: Int): Range<Int> {
+        val exact = Range(desiredFps, desiredFps)
+        if (availableFpsRanges.any { it == exact }) return exact
+        val matchingUpper = availableFpsRanges
+            .filter { it.upper == desiredFps }
+            .maxByOrNull { it.lower }
+        return matchingUpper ?: exact
     }
 
     /** Timestamp (`ns`) of the last closed-loop ISO servo adjustment (`350 ms` minimum interval). */
@@ -462,6 +556,18 @@ class PushBroomCameraController(
 
         /** Target height (`1080 px`) of the `16:9` landscape `YUV_420_888` analysis stream (`AGENTS.md` §3). */
         const val TARGET_HEIGHT_1080P = 1080
+
+        /** Active camera frame rate (`30 FPS`) during `PATROL_ACTIVE`, `LOCK-ON`, `PINPOINT`, and `LOG_DATA`. */
+        const val ACTIVE_PATROL_FPS = 30
+
+        /** Throttled camera frame rate (`15 FPS`) during `PATROL_IDLE` thermal/OLED duty-cycling. */
+        const val IDLE_PATROL_FPS = 15
+
+        /** Manual `SENSOR_FRAME_DURATION` (`33.33 ms`) corresponding to `30 FPS` when `CONTROL_AE_MODE_OFF` is active. */
+        const val FRAME_DURATION_30_FPS_NS = 33_333_333L
+
+        /** Manual `SENSOR_FRAME_DURATION` (`66.67 ms`) corresponding to `15 FPS` when `CONTROL_AE_MODE_OFF` is active. */
+        const val FRAME_DURATION_15_FPS_NS = 66_666_667L
 
         /**
          * Maximum manual exposure time (`2,000,000 ns` = `1/500 s`) when `EXP CLAMP` is enabled.

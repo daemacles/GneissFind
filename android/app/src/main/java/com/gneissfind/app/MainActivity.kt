@@ -17,6 +17,7 @@ import android.graphics.Color as AndroidColor
 import android.hardware.display.DisplayManager
 import android.media.AudioManager
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -138,6 +139,15 @@ class MainActivity : ComponentActivity() {
 
                 val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
+                LaunchedEffect(uiState.patrolPowerState) {
+                    val targetHz = uiState.patrolPowerState.preferredRefreshRateHz
+                    val params = window.attributes
+                    if (params.preferredRefreshRate != targetHz) {
+                        params.preferredRefreshRate = targetHz
+                        window.attributes = params
+                    }
+                }
+
                 ScannerScreen(
                     uiState = uiState,
                     hasCameraPermission = hasCameraPermission,
@@ -161,6 +171,13 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            viewModel.onUserTouchInteraction()
+        }
+        return super.dispatchTouchEvent(ev)
     }
 
     /** Returns the current display [Surface] rotation, defaulting to [Surface.ROTATION_90] if unavailable. */

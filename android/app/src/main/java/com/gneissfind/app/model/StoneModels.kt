@@ -583,3 +583,125 @@ sealed interface ScanSpeedState {
      */
     data class SpeedWarning(val currentSpeedMps: Float) : ScanSpeedState
 }
+
+/**
+ * Thermal and OLED duty-cycling sub-state while operating in Stage 1 (`PATROL`) scan mode
+ * (`.agents/rules/android-camera-ar.md §2`).
+ *
+ * @property targetCameraFps Target Camera2 `CONTROL_AE_TARGET_FPS_RANGE` rate (`30` active, `15` idle).
+ * @property preferredRefreshRateHz Window `preferredRefreshRate` in Hz (`120f` active, `30f` idle).
+ * @property statusBadge Uppercase HUD telemetry string describing the active patrol power state.
+ */
+enum class PatrolPowerState(
+    val targetCameraFps: Int,
+    val preferredRefreshRateHz: Float,
+    val statusBadge: String
+) {
+    /** Full `30 FPS` camera capture and `120 Hz` RenderNode EIS active. */
+    PATROL_ACTIVE(
+        targetCameraFps = 30,
+        preferredRefreshRateHz = 120f,
+        statusBadge = "PATROL • 30 FPS"
+    ),
+
+    /**
+     * Low-power `15 FPS` camera capture and `30 Hz` display refresh engaged after `5.0 s` with
+     * zero alertable candidates (`score >= 0.30`) and no touch input.
+     */
+    PATROL_IDLE(
+        targetCameraFps = 15,
+        preferredRefreshRateHz = 30f,
+        statusBadge = "EYES-UP PATROL • 15 FPS"
+    )
+}
+
+/**
+ * Stage of the 3-stage `PATROL -> LOCK-ON -> PINPOINT` acquisition funnel
+ * (`.agents/rules/android-camera-ar.md §5`).
+ *
+ * @property shortBadge Compact uppercase stage label rendered on the LCARS HUD.
+ */
+enum class AcquisitionStage(val shortBadge: String) {
+    /** Stage 1: Wide `1792 px` push-broom swath search (`B=3` / `B=5`). */
+    PATROL("PATROL"),
+
+    /** Stage 2: Full-screen `16:9` foveated `B=1` `320x320` neural tracking + parallax triangulation. */
+    LOCK_ON_NEURAL("LOCK-ON B=1"),
+
+    /** Stage 3: Full-screen `16:9` `30 FPS` OpenCV `AKAZE` gravel-constellation guidance + `1 Hz` neural refresh. */
+    PINPOINT_CONSTELLATION("PINPOINT AKAZE")
+}
+
+/**
+ * Viewport-edge re-acquisition indicator rendered when a locked 3D target moves outside the
+ * `16:9` camera frame during the `15.0 s` lost-track grace window.
+ *
+ * @property edgeXNorm Clamped normalized horizontal position in `[0.0, 1.0]` on the `16:9` viewport.
+ * @property edgeYNorm Clamped normalized vertical position in `[0.0, 1.0]` on the `16:9` viewport.
+ * @property directionRad Screen-space angle (`atan2(dy, dx)`, radians) pointing toward the off-screen 3D anchor.
+ * @property angularOffsetDeg Great-circle angular separation (degrees) from camera optical center to the 3D anchor.
+ */
+data class OffScreenChevron(
+    val edgeXNorm: Float,
+    val edgeYNorm: Float,
+    val directionRad: Float,
+    val angularOffsetDeg: Float
+)
+
+/**
+ * Immutable HUD state snapshot for Stage 2 (`LOCK_ON_NEURAL`) and Stage 3 (`PINPOINT_CONSTELLATION`)
+ * rendered over the full uncropped `16:9` (`1920x1080`) camera viewport.
+ *
+ * @property stage Current [AcquisitionStage] (`PATROL` when unlocked).
+ * @property lockedTrackId Track identifier locked when transitioning out of `PATROL`.
+ * @property stoneClass Target [StoneClass] (updated at `1 Hz` during `PINPOINT_CONSTELLATION`).
+ * @property smoothedConfidence Exponentially smoothed classification confidence in `[0.0, 1.0]`.
+ * @property estimatedDiameterMm Estimated physical stone diameter in millimeters.
+ * @property slantRangeMeters Current 3D slant range from camera to target in meters.
+ * @property sigma3dMm 3D sphere-of-confusion radius in millimeters from multi-view ray triangulation.
+ * @property sigmaRadiusPx Uncertainty circle radius projected into `1920x1080` stream pixels.
+ * @property parallaxAngleDeg Accumulated multi-view baseline parallax angle in degrees.
+ * @property triangulatedViews Count of distinct camera viewpoints contributing to `sigma3dMm`.
+ * @property akazeInliers RANSAC/MAGSAC homography inlier count in `PINPOINT_CONSTELLATION`.
+ * @property frameLeftPx Target box left X coordinate in `1920x1080` camera pixels.
+ * @property frameTopPx Target box top Y coordinate in `1920x1080` camera pixels.
+ * @property frameRightPx Target box right X coordinate in `1920x1080` camera pixels.
+ * @property frameBottomPx Target box bottom Y coordinate in `1920x1080` camera pixels.
+ * @property cropLeftPx Active foveated crop / constellation collar left X in `1920x1080` pixels.
+ * @property cropTopPx Active foveated crop / constellation collar top Y in `1920x1080` pixels.
+ * @property cropSizePx Active square crop width/height in `1920x1080` pixels (`320` for `B=1`).
+ * @property isTargetInFrame True when the projected 3D anchor / tracked box lies inside `1920x1080`.
+ * @property isLostTrackGraceActive True while counting down the `15.0 s` lost-track standby window.
+ * @property lostTrackRemainingSec Seconds remaining (`[0.0, 15.0]`) before auto-returning to `PATROL`.
+ * @property offScreenChevron Directional edge chevron when [isTargetInFrame] is `false`.
+ * @property trackingSourceBadge Short telemetry source tag (`"RF-DETR B=1"`, `"AKAZE"`, or `"STANDBY"`).
+ */
+data class LockOnHudState(
+    val stage: AcquisitionStage = AcquisitionStage.PATROL,
+    val lockedTrackId: Long = -1L,
+    val stoneClass: StoneClass = StoneClass.CHALCEDONY_AGATE,
+    val smoothedConfidence: Float = 0f,
+    val estimatedDiameterMm: Float = 30f,
+    val slantRangeMeters: Float = 1.0f,
+    val sigma3dMm: Float = 120f,
+    val sigmaRadiusPx: Float = 64f,
+    val parallaxAngleDeg: Float = 0f,
+    val triangulatedViews: Int = 0,
+    val akazeInliers: Int = 0,
+    val frameLeftPx: Float = 900f,
+    val frameTopPx: Float = 480f,
+    val frameRightPx: Float = 1020f,
+    val frameBottomPx: Float = 600f,
+    val cropLeftPx: Int = 800,
+    val cropTopPx: Int = 380,
+    val cropSizePx: Int = 320,
+    val isTargetInFrame: Boolean = true,
+    val isLostTrackGraceActive: Boolean = false,
+    val lostTrackRemainingSec: Float = 15.0f,
+    val offScreenChevron: OffScreenChevron? = null,
+    val trackingSourceBadge: String = "RF-DETR B=1"
+) {
+    /** True when either Stage 2 (`LOCK_ON_NEURAL`) or Stage 3 (`PINPOINT_CONSTELLATION`) is active. */
+    val isLocked: Boolean
+        get() = stage != AcquisitionStage.PATROL
+}

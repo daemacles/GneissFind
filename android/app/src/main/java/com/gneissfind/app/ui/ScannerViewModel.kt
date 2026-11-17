@@ -29,9 +29,12 @@ import com.gneissfind.app.inference.SyntheticStoneDetector
 import com.gneissfind.app.inference.SyntheticTargetProfile
 import com.gneissfind.app.logging.FieldDataLogger
 import com.gneissfind.app.logging.FieldStripMetadata
+import com.gneissfind.app.model.AcquisitionStage
 import com.gneissfind.app.model.ConfirmedTarget
 import com.gneissfind.app.model.DetectorBackend
+import com.gneissfind.app.model.LockOnHudState
 import com.gneissfind.app.model.OperatingMode
+import com.gneissfind.app.model.PatrolPowerState
 import com.gneissfind.app.model.ScanSpeedState
 import com.gneissfind.app.model.StoneClass
 import com.gneissfind.app.model.StripDetection
@@ -39,6 +42,7 @@ import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
 import com.gneissfind.app.tracking.MotionPoseSnapshot
+import com.gneissfind.app.tracking.PatrolDutyCycleController
 import com.gneissfind.app.tracking.ProjectedCandidate
 import com.gneissfind.app.tracking.TemporalTargetTracker
 import com.gneissfind.app.vision.ImageProxyYuv420Frame
@@ -153,6 +157,11 @@ data class ScannerUiState(
     val shutterClampEnabled: Boolean = true,
     val twoXCropEnabled: Boolean = true,
     val eisPitchLockEnabled: Boolean = true,
+    val eyesUpPatrolEnabled: Boolean = true,
+    val patrolPowerState: PatrolPowerState = PatrolPowerState.PATROL_ACTIVE,
+    val acquisitionStage: AcquisitionStage = AcquisitionStage.PATROL,
+    val lockOnHudState: LockOnHudState = LockOnHudState(),
+    val cameraStreamFps: Float = 30.0f,
     val exposureBiasEv: Float = 0.0f,
     val isAudioMuted: Boolean = false,
     val simulatedSpeedOverrideMps: Float? = null,
@@ -253,6 +262,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     private val raycaster = GroundPlaneRaycaster(appContext)
     private val tracker = TemporalTargetTracker()
+    private val patrolDutyController = PatrolDutyCycleController()
     private val sonifier = MetalDetectorSonifier()
     private val fieldLogger = FieldDataLogger(appContext)
 
@@ -382,15 +392,51 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
+     * Records a user screen/UI touch interaction and wakes `PATROL_IDLE` to `PATROL_ACTIVE`
+     * (`30 FPS` Camera2 + `120 Hz` display refresh) in `< 50 ms`.
+     */
+    fun onUserTouchInteraction() {
+        val nextPower = patrolDutyController.onUserInteraction(System.nanoTime())
+        cameraController.setTargetCameraFps(nextPower.targetCameraFps)
+        if (_uiState.value.patrolPowerState != nextPower) {
+            _uiState.update { it.copy(patrolPowerState = nextPower) }
+        }
+    }
+
+    /** Enables or disables the `"EYES-UP"` (`EYE`) `90%` OLED-saving veil during `PATROL_IDLE`. */
+    fun setEyesUpPatrolEnabled(enabled: Boolean) {
+        val nextPower = patrolDutyController.onUserInteraction(System.nanoTime())
+        cameraController.setTargetCameraFps(nextPower.targetCameraFps)
+        _uiState.update {
+            it.copy(
+                eyesUpPatrolEnabled = enabled,
+                patrolPowerState = nextPower
+            )
+        }
+    }
+
+    /** Toggles the `"EYES-UP"` (`EYE`) OLED-saving veil preference. */
+    fun toggleEyesUpPatrol() {
+        setEyesUpPatrolEnabled(!_uiState.value.eyesUpPatrolEnabled)
+    }
+
+    /**
      * Switches between [OperatingMode.SCAN] and [OperatingMode.LOG_DATA].
      */
     fun setOperatingMode(mode: OperatingMode) {
+        val nextPower = patrolDutyController.onContextChanged(
+            operatingMode = mode,
+            acquisitionStage = _uiState.value.acquisitionStage,
+            nowNs = System.nanoTime()
+        )
+        cameraController.setTargetCameraFps(nextPower.targetCameraFps)
         if (mode == OperatingMode.LOG_DATA) {
             cameraController.setShutterClamp(true)
             val dir = fieldLogger.startSession()
             _uiState.update {
                 it.copy(
                     operatingMode = mode,
+                    patrolPowerState = nextPower,
                     shutterClampEnabled = true,
                     loggedFrameCount = 0,
                     fieldLogDirectory = dir.absolutePath
@@ -401,6 +447,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update {
                 it.copy(
                     operatingMode = mode,
+                    patrolPowerState = nextPower,
                     loggedFrameCount = fieldLogger.savedFrameCount
                 )
             }
@@ -800,6 +847,22 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             currentSpeedMps = poseSnapshot.horizontalSpeedMps
         )
 
+        val enabledSet = _uiState.value.enabledClasses
+        val maxEnabledDetScore = filteredDetections.maxOfOrNull { it.confidence } ?: 0f
+        val effectiveAlertableScore = if (enabledSet.size == StoneClass.alertableClasses.size) {
+            maxOf(inferenceResult.maxAlertableCandidateScore, maxEnabledDetScore)
+        } else {
+            maxEnabledDetScore
+        }
+        val currentUi = _uiState.value
+        val nextPowerState = patrolDutyController.onSweepCompleted(
+            maxAlertableScore = effectiveAlertableScore,
+            operatingMode = currentUi.operatingMode,
+            acquisitionStage = currentUi.acquisitionStage,
+            nowNs = nowWallNs
+        )
+        cameraController.setTargetCameraFps(nextPowerState.targetCameraFps)
+
         val useLiveImuDisplay = raycaster.hasLiveImuStream
         val currentDisplayCropY = if (useLiveImuDisplay) {
             _uiState.value.displayCropYFloat
@@ -826,6 +889,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { prev ->
             prev.copy(
                 detectorStatus = activeDetector.statusSummary,
+                patrolPowerState = nextPowerState,
+                cameraStreamFps = exposureTelemetry.measuredCameraFps,
                 stripGeometry = geometry,
                 rawStripDetections = filteredDetections,
                 confirmedTargets = reprojectedConfirmed,

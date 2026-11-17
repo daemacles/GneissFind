@@ -471,6 +471,7 @@ class RfDetrTwoGraphGpuDetector(
     private val cachedTileDetections = Array(StripRoiGeometry.MAX_TILES) { ArrayList<TileDetection>(8) }
     private val cachedTileSweepStamp = LongArray(StripRoiGeometry.MAX_TILES) { -10L }
     private var priorityEvenTileIndex: Int = 2
+    private val maxAlertableScoreScratch = FloatArray(1)
 
     // Legacy fallback profiler buffers used only when .tflite assets are absent in unit tests
     private val stubEncoderLogits = FloatArray(DEFAULT_ENCODER_ANCHORS * NUM_CLASSES)
@@ -1671,6 +1672,7 @@ class RfDetrTwoGraphGpuDetector(
         var part2NsAcc = 0L
 
         val detections = ArrayList<TileDetection>(16)
+        maxAlertableScoreScratch[0] = 0f
         val requestedSwathTiles = sweepBuffers.activeTileCount.coerceIn(1, StripRoiGeometry.MAX_TILES)
         val useInterleaveThisSweep = interleaveEvenOdd &&
             compiledBatchSize == 3 &&
@@ -1815,7 +1817,8 @@ class RfDetrTwoGraphGpuDetector(
                         classScores = predScores,
                         metadata = metadata,
                         confidenceThreshold = confidenceThreshold,
-                        outDetections = detections
+                        outDetections = detections,
+                        outMaxAlertableScore = maxAlertableScoreScratch
                     )
                 }
             }
@@ -1857,7 +1860,8 @@ class RfDetrTwoGraphGpuDetector(
                         classScores = predScores,
                         metadata = metadata,
                         confidenceThreshold = confidenceThreshold,
-                        outDetections = detections
+                        outDetections = detections,
+                        outMaxAlertableScore = maxAlertableScoreScratch
                     )
                 }
             }
@@ -1926,6 +1930,12 @@ class RfDetrTwoGraphGpuDetector(
             )
         }
 
+        for (det in detections) {
+            if (StoneClass.fromId(det.classId)?.isUserAlertable == true && det.confidence > maxAlertableScoreScratch[0]) {
+                maxAlertableScoreScratch[0] = det.confidence
+            }
+        }
+
         return SweepInferenceResult(
             tileDetections = detections,
             part1LatencyMs = p1Ms,
@@ -1933,7 +1943,8 @@ class RfDetrTwoGraphGpuDetector(
             part2LatencyMs = p2Ms,
             totalSweepLatencyMs = totalMs,
             rollingAvgLatencyMs = rollingLatencyMs,
-            isHardwareGraphActive = hardwareGraphsLoaded
+            isHardwareGraphActive = hardwareGraphsLoaded,
+            maxAlertableCandidateScore = maxAlertableScoreScratch[0]
         )
     }
 
@@ -1959,7 +1970,8 @@ class RfDetrTwoGraphGpuDetector(
                     classScores = classScores,
                     metadata = metadata,
                     confidenceThreshold = confidenceThreshold,
-                    outDetections = raw6
+                    outDetections = raw6,
+                    outMaxAlertableScore = maxAlertableScoreScratch
                 )
                 val stripXOffset = SIX_TILE_256_X_OFFSETS[b].toFloat()
                 val scaleX = SIX_TILE_WINDOW_WIDTH_PX.toFloat() / StripRoiGeometry.TILE_SIZE_PX.toFloat()
@@ -1994,7 +2006,8 @@ class RfDetrTwoGraphGpuDetector(
                     classScores = classScores,
                     metadata = metadata,
                     confidenceThreshold = confidenceThreshold,
-                    outDetections = cache
+                    outDetections = cache,
+                    outMaxAlertableScore = maxAlertableScoreScratch
                 )
                 cachedTileSweepStamp[tileIdx] = sweepCount
                 if (tileIdx % 2 == 0) {
@@ -2021,7 +2034,8 @@ class RfDetrTwoGraphGpuDetector(
             classScores = classScores,
             metadata = metadata,
             confidenceThreshold = confidenceThreshold,
-            outDetections = outDetections
+            outDetections = outDetections,
+            outMaxAlertableScore = maxAlertableScoreScratch
         )
     }
 
@@ -2380,7 +2394,8 @@ class RfDetrTwoGraphGpuDetector(
             classScores: FloatArray,
             metadata: CocoStandInMetadata,
             confidenceThreshold: Float = metadata.scoreThreshold,
-            outDetections: MutableList<TileDetection>
+            outDetections: MutableList<TileDetection>,
+            outMaxAlertableScore: FloatArray? = null
         ) {
             for (tileIdx in 0 until activeTileCount) {
                 decodeCocoSingleTilePredictions(
@@ -2390,7 +2405,8 @@ class RfDetrTwoGraphGpuDetector(
                     classScores = classScores,
                     metadata = metadata,
                     confidenceThreshold = confidenceThreshold,
-                    outDetections = outDetections
+                    outDetections = outDetections,
+                    outMaxAlertableScore = outMaxAlertableScore
                 )
             }
         }
@@ -2411,7 +2427,8 @@ class RfDetrTwoGraphGpuDetector(
             metadata: CocoStandInMetadata,
             confidenceThreshold: Float = metadata.scoreThreshold,
             outDetections: MutableList<TileDetection>,
-            targetBoxScalePx: Float = StripRoiGeometry.TILE_SIZE_PX.toFloat()
+            targetBoxScalePx: Float = StripRoiGeometry.TILE_SIZE_PX.toFloat(),
+            outMaxAlertableScore: FloatArray? = null
         ) {
             val numQueries = metadata.numQueries
             val numClasses = metadata.numClasses
@@ -2445,8 +2462,6 @@ class RfDetrTwoGraphGpuDetector(
                 } else {
                     1.0f / (1.0f + exp(-bestRaw))
                 }
-                if (prob < confidenceThreshold) continue
-
                 val mappedStoneClassId = if (bestCocoClass in lut.indices) {
                     lut[bestCocoClass]
                 } else if (metadata.unmappedConfidentToHardConfuser) {
@@ -2455,6 +2470,16 @@ class RfDetrTwoGraphGpuDetector(
                     -1
                 }
                 if (mappedStoneClassId < 0) continue
+
+                if (outMaxAlertableScore != null &&
+                    outMaxAlertableScore.isNotEmpty() &&
+                    prob > outMaxAlertableScore[0] &&
+                    StoneClass.fromId(mappedStoneClassId)?.isUserAlertable == true
+                ) {
+                    outMaxAlertableScore[0] = prob
+                }
+
+                if (prob < confidenceThreshold) continue
 
                 val boxBase = batchBoxOffset + q * 4
                 val cx = boxesCxCyWhNorm[boxBase] * tileSize

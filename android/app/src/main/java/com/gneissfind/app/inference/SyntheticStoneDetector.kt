@@ -225,6 +225,14 @@ class SyntheticStoneDetector(
         val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000.0).toFloat()
         rollingLatencyMs = rollingLatencyMs * 0.85f + elapsedMs * 0.15f
 
+        val maxAlertableScore = detections.fold(0f) { acc, det ->
+            if (StoneClass.fromId(det.classId)?.isUserAlertable == true && det.confidence > acc) {
+                det.confidence
+            } else {
+                acc
+            }
+        }
+
         return SweepInferenceResult(
             tileDetections = detections,
             // Synthetic split proportions (55% Part 1 / 15% Top-K bridge / 30% Part 2) for HUD telemetry display.
@@ -233,7 +241,8 @@ class SyntheticStoneDetector(
             part2LatencyMs = elapsedMs * 0.30f,
             totalSweepLatencyMs = elapsedMs,
             rollingAvgLatencyMs = rollingLatencyMs,
-            isHardwareGraphActive = false
+            isHardwareGraphActive = false,
+            maxAlertableCandidateScore = maxAlertableScore
         )
     }
 
