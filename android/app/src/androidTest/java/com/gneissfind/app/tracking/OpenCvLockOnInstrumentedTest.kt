@@ -278,6 +278,99 @@ class OpenCvLockOnInstrumentedTest {
         }
     }
 
+    @Test
+    fun fourEdgeSweep160FramesNeverThrowsSubmatExceptionOnHardwareJni() {
+        assertThat(OpenCvConstellationTracker.ensureOpenCvInitialized()).isTrue()
+        val width = 1920
+        val height = 1080
+        val baseMat = synthesizeGravelBedWithSmoothAgate(width, height)
+        val lumaBytes = ByteArray(width * height)
+        baseMat.get(0, 0, lumaBytes)
+
+        val tracker = OpenCvConstellationTracker()
+        try {
+            // Seed at center first
+            assertThat(
+                tracker.seedConstellationCollar(
+                    lumaBytes = lumaBytes,
+                    widthPx = width,
+                    heightPx = height,
+                    stoneLeftPx = 924f,
+                    stoneTopPx = 504f,
+                    stoneRightPx = 996f,
+                    stoneBottomPx = 576f
+                )
+            ).isTrue()
+
+            // Sweep x in -400..2320 and y in -400..1480 across 168 frames (all 4 edges + corners + NaN/Inf)
+            var framesTested = 0
+            for (step in 0 until 42) {
+                val t = step / 41f
+                val coords = arrayOf(
+                    Pair(-400f + t * 2720f, 540f),
+                    Pair(1925f, -400f + t * 1880f),
+                    Pair(2320f - t * 2720f, 1085f),
+                    Pair(-400f, 1480f - t * 1880f)
+                )
+                for ((cx, cy) in coords) {
+                    tracker.trackGravelFlowCorrespondences(
+                        lumaBytes = lumaBytes,
+                        widthPx = width,
+                        heightPx = height,
+                        excludeLeftPx = cx - 36f,
+                        excludeTopPx = cy - 36f,
+                        excludeRightPx = cx + 36f,
+                        excludeBottomPx = cy + 36f
+                    )
+                    val match = tracker.matchConstellationFrame(
+                        lumaBytes = null,
+                        widthPx = width,
+                        heightPx = height,
+                        predictedCenterXPx = cx,
+                        predictedCenterYPx = cy
+                    )
+                    assertThat(match.inliers).isAtLeast(0)
+                    if (framesTested % 16 == 0) {
+                        tracker.seedConstellationCollar(
+                            lumaBytes = null,
+                            widthPx = width,
+                            heightPx = height,
+                            stoneLeftPx = cx - 36f,
+                            stoneTopPx = cy - 36f,
+                            stoneRightPx = cx + 36f,
+                            stoneBottomPx = cy + 36f
+                        )
+                    }
+                    framesTested++
+                }
+            }
+            assertThat(framesTested).isAtLeast(160)
+
+            // Also verify NaN / Infinity inputs never throw CvException or IllegalArgumentException
+            for (bad in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+                tracker.trackGravelFlowCorrespondences(
+                    lumaBytes = lumaBytes,
+                    widthPx = width,
+                    heightPx = height,
+                    excludeLeftPx = bad,
+                    excludeTopPx = bad,
+                    excludeRightPx = bad,
+                    excludeBottomPx = bad
+                )
+                tracker.matchConstellationFrame(
+                    lumaBytes = null,
+                    widthPx = width,
+                    heightPx = height,
+                    predictedCenterXPx = bad,
+                    predictedCenterYPx = bad
+                )
+            }
+        } finally {
+            baseMat.release()
+            tracker.close()
+        }
+    }
+
     private fun synthesizeGravelBedWithSmoothAgate(width: Int, height: Int): Mat {
         val mat = Mat(height, width, CvType.CV_8UC1, Scalar(96.0))
         val rng = Random(424242L)

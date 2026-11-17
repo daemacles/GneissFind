@@ -173,15 +173,35 @@ class OpenCvConstellationTracker : AutoCloseable {
             halfMaskMat = it
         }
         mask.setTo(Scalar(255.0))
-        // Mask out the stone + 24 px specular halo on the half-res frame so wet glints never bias VO
-        val exL = ((excludeLeftPx * 0.5f).roundToInt() - 12).coerceIn(0, halfW - 1)
-        val exT = ((excludeTopPx * 0.5f).roundToInt() - 12).coerceIn(0, halfH - 1)
-        val exR = ((excludeRightPx * 0.5f).roundToInt() + 12).coerceIn(exL + 1, halfW)
-        val exB = ((excludeBottomPx * 0.5f).roundToInt() + 12).coerceIn(exT + 1, halfH)
-        if (exR > exL && exB > exT) {
-            val sub = mask.submat(exT, exB, exL, exR)
-            sub.setTo(Scalar(0.0))
-            sub.release()
+        // Mask out the stone + 24 px specular halo on the half-res frame when inside viewport bounds
+        if (excludeLeftPx.isFinite() && excludeTopPx.isFinite() &&
+            excludeRightPx.isFinite() && excludeBottomPx.isFinite() &&
+            excludeRightPx > 0f && excludeBottomPx > 0f &&
+            excludeLeftPx < widthPx.toFloat() && excludeTopPx < heightPx.toFloat()
+        ) {
+            val rawExL = (excludeLeftPx.finiteOr(0f) * 0.5f).roundToInt() - 12
+            val rawExT = (excludeTopPx.finiteOr(0f) * 0.5f).roundToInt() - 12
+            val rawExR = (excludeRightPx.finiteOr(0f) * 0.5f).roundToInt() + 12
+            val rawExB = (excludeBottomPx.finiteOr(0f) * 0.5f).roundToInt() + 12
+            val clampedL = rawExL.coerceIn(0, (halfW - 2).coerceAtLeast(0))
+            val clampedT = rawExT.coerceIn(0, (halfH - 2).coerceAtLeast(0))
+            val clampedR = rawExR.coerceIn(clampedL, halfW)
+            val clampedB = rawExB.coerceIn(clampedT, halfH)
+            if (clampedR - clampedL >= 2 && clampedB - clampedT >= 2) {
+                val safeRect = computeSafeSubmatRect(
+                    cols = halfW,
+                    rows = halfH,
+                    rawX = clampedL,
+                    rawY = clampedT,
+                    rawW = clampedR - clampedL,
+                    rawH = clampedB - clampedT
+                )
+                if (safeRect != null) {
+                    val sub = mask.submat(safeRect)
+                    sub.setTo(Scalar(0.0))
+                    sub.release()
+                }
+            }
         }
 
         val corners = MatOfPoint()
@@ -384,25 +404,43 @@ class OpenCvConstellationTracker : AutoCloseable {
         baseScale: Float = 1.0f
     ): Boolean {
         if (!ensureOpenCvInitialized()) return false
+        if (widthPx < 4 || heightPx < 4) return false
         val fullMat = ensureFullGrayMat(widthPx, heightPx)
         if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
             fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
         }
 
-        val stoneW = (stoneRightPx - stoneLeftPx).coerceAtLeast(16f)
-        val stoneH = (stoneBottomPx - stoneTopPx).coerceAtLeast(16f)
-        val stoneCenterX = (stoneLeftPx + stoneRightPx) * 0.5f
-        val stoneCenterY = (stoneTopPx + stoneBottomPx) * 0.5f
+        val sL = stoneLeftPx.finiteOr(widthPx * 0.5f - 24f)
+        val sT = stoneTopPx.finiteOr(heightPx * 0.5f - 24f)
+        val sR = stoneRightPx.finiteOr(sL + 48f)
+        val sB = stoneBottomPx.finiteOr(sT + 48f)
 
+        val stoneW = (sR - sL).coerceIn(16f, widthPx.toFloat())
+        val stoneH = (sB - sT).coerceIn(16f, heightPx.toFloat())
+        val stoneCenterX = (sL + sR) * 0.5f
+        val stoneCenterY = (sT + sB) * 0.5f
+
+        val maxSquare = min(widthPx, heightPx).coerceAtLeast(2)
         val collarSide = (COLLAR_DIAMETER_MULTIPLIER * max(stoneW, stoneH))
+            .finiteOr(MIN_COLLAR_SIZE_PX.toFloat())
             .roundToInt()
-            .coerceIn(MIN_COLLAR_SIZE_PX, MAX_COLLAR_SIZE_PX)
-            .coerceAtMost(min(widthPx, heightPx))
+            .coerceIn(min(MIN_COLLAR_SIZE_PX, maxSquare), max(MIN_COLLAR_SIZE_PX, MAX_COLLAR_SIZE_PX))
+            .coerceAtMost(maxSquare)
 
-        val collarLeft = (stoneCenterX - collarSide * 0.5f).roundToInt()
-            .coerceIn(0, (widthPx - collarSide).coerceAtLeast(0))
-        val collarTop = (stoneCenterY - collarSide * 0.5f).roundToInt()
-            .coerceIn(0, (heightPx - collarSide).coerceAtLeast(0))
+        val rawCollarLeft = (stoneCenterX - collarSide * 0.5f).finiteOr(0f).roundToInt()
+        val rawCollarTop = (stoneCenterY - collarSide * 0.5f).finiteOr(0f).roundToInt()
+        val collarRect = computeSafeSubmatRect(
+            cols = widthPx,
+            rows = heightPx,
+            rawX = rawCollarLeft,
+            rawY = rawCollarTop,
+            rawW = collarSide,
+            rawH = collarSide
+        ) ?: return false
+        val collarLeft = collarRect.x
+        val collarTop = collarRect.y
+        val effectiveCollarW = collarRect.width
+        val effectiveCollarH = collarRect.height
 
         val detector = ensureAkaze()
         val patchMat = prevOrAllocMat(
@@ -412,7 +450,7 @@ class OpenCvConstellationTracker : AutoCloseable {
             CvType.CV_8UC1
         ).also { canonicalPatchMat = it }
         val maskMat = ensureEmptyMaskMat()
-        val collarSub = fullMat.submat(Rect(collarLeft, collarTop, collarSide, collarSide))
+        val collarSub = fullMat.submat(collarRect)
         val keypoints = MatOfKeyPoint()
         val descriptors = Mat()
 
@@ -432,20 +470,21 @@ class OpenCvConstellationTracker : AutoCloseable {
                 return false
             }
 
-            val scaleFromCanonical = collarSide.toDouble() / CANONICAL_PATCH_PX.toDouble()
+            val scaleXFromCanonical = effectiveCollarW.toDouble() / CANONICAL_PATCH_PX.toDouble()
+            val scaleYFromCanonical = effectiveCollarH.toDouble() / CANONICAL_PATCH_PX.toDouble()
             refDescriptors?.release()
             refDescriptors = descriptors
             refKeypointCoords = Array(kpArray.size) { idx ->
                 val p = kpArray[idx].pt
-                Point(p.x * scaleFromCanonical, p.y * scaleFromCanonical)
+                Point(p.x * scaleXFromCanonical, p.y * scaleYFromCanonical)
             }
-            refCollarWidthPx = collarSide
-            refCollarHeightPx = collarSide
-            refStoneLocalLeft = stoneLeftPx - collarLeft
-            refStoneLocalTop = stoneTopPx - collarTop
-            refStoneLocalRight = stoneRightPx - collarLeft
-            refStoneLocalBottom = stoneBottomPx - collarTop
-            keyframeBaseScale = baseScale
+            refCollarWidthPx = effectiveCollarW
+            refCollarHeightPx = effectiveCollarH
+            refStoneLocalLeft = sL - collarLeft
+            refStoneLocalTop = sT - collarTop
+            refStoneLocalRight = sR - collarLeft
+            refStoneLocalBottom = sB - collarTop
+            keyframeBaseScale = baseScale.finiteOr(1.0f)
             latestRelativeScale = 1.0f
             hasSeededConstellation = true
             return true
@@ -484,20 +523,37 @@ class OpenCvConstellationTracker : AutoCloseable {
             return ConstellationMatchResult(matched = false, inliers = 0)
         }
 
+        if (widthPx < 4 || heightPx < 4) {
+            return ConstellationMatchResult(matched = false, inliers = 0)
+        }
         val fullMat = ensureFullGrayMat(widthPx, heightPx)
         if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
             fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
         }
 
-        val searchSide = (refCollarWidthPx * latestRelativeScale.coerceIn(0.75f, 1.95f) * 1.18f)
+        val maxSquare = min(widthPx, heightPx).coerceAtLeast(2)
+        val searchSide = (refCollarWidthPx * latestRelativeScale.finiteOr(1f).coerceIn(0.75f, 1.95f) * 1.18f)
+            .finiteOr(MIN_COLLAR_SIZE_PX.toFloat())
             .roundToInt()
-            .coerceIn(MIN_COLLAR_SIZE_PX, MAX_SEARCH_SIZE_PX)
-            .coerceAtMost(min(widthPx, heightPx))
+            .coerceIn(min(MIN_COLLAR_SIZE_PX, maxSquare), max(MIN_COLLAR_SIZE_PX, MAX_SEARCH_SIZE_PX))
+            .coerceAtMost(maxSquare)
 
-        val searchLeft = (predictedCenterXPx - searchSide * 0.5f).roundToInt()
-            .coerceIn(0, (widthPx - searchSide).coerceAtLeast(0))
-        val searchTop = (predictedCenterYPx - searchSide * 0.5f).roundToInt()
-            .coerceIn(0, (heightPx - searchSide).coerceAtLeast(0))
+        val safePredX = predictedCenterXPx.finiteOr(widthPx * 0.5f)
+        val safePredY = predictedCenterYPx.finiteOr(heightPx * 0.5f)
+        val rawSearchLeft = (safePredX - searchSide * 0.5f).finiteOr(0f).roundToInt()
+        val rawSearchTop = (safePredY - searchSide * 0.5f).finiteOr(0f).roundToInt()
+        val searchRect = computeSafeSubmatRect(
+            cols = widthPx,
+            rows = heightPx,
+            rawX = rawSearchLeft,
+            rawY = rawSearchTop,
+            rawW = searchSide,
+            rawH = searchSide
+        ) ?: return ConstellationMatchResult(matched = false, inliers = 0)
+        val searchLeft = searchRect.x
+        val searchTop = searchRect.y
+        val effectiveSearchW = searchRect.width
+        val effectiveSearchH = searchRect.height
 
         val detector = ensureAkaze()
         val matcher = ensureBfMatcher()
@@ -508,7 +564,7 @@ class OpenCvConstellationTracker : AutoCloseable {
             CvType.CV_8UC1
         ).also { canonicalPatchMat = it }
         val maskMat = ensureEmptyMaskMat()
-        val searchSub = fullMat.submat(Rect(searchLeft, searchTop, searchSide, searchSide))
+        val searchSub = fullMat.submat(searchRect)
         val liveKeypoints = MatOfKeyPoint()
         val liveDescriptors = Mat()
         val knnMatches = ArrayList<MatOfDMatch>()
@@ -533,7 +589,8 @@ class OpenCvConstellationTracker : AutoCloseable {
 
             matcher.knnMatch(activeRefDesc, liveDescriptors, knnMatches, 2)
 
-            val searchScaleFromCanonical = searchSide.toDouble() / CANONICAL_PATCH_PX.toDouble()
+            val searchScaleXFromCanonical = effectiveSearchW.toDouble() / CANONICAL_PATCH_PX.toDouble()
+            val searchScaleYFromCanonical = effectiveSearchH.toDouble() / CANONICAL_PATCH_PX.toDouble()
             val goodSrc = ArrayList<Point>(knnMatches.size)
             val goodDst = ArrayList<Point>(knnMatches.size)
             for (pairMat in knnMatches) {
@@ -546,8 +603,8 @@ class OpenCvConstellationTracker : AutoCloseable {
                         val dstPt = liveKpArr[tIdx].pt
                         goodDst.add(
                             Point(
-                                searchLeft + dstPt.x * searchScaleFromCanonical,
-                                searchTop + dstPt.y * searchScaleFromCanonical
+                                searchLeft + dstPt.x * searchScaleXFromCanonical,
+                                searchTop + dstPt.y * searchScaleYFromCanonical
                             )
                         )
                     }
@@ -621,8 +678,8 @@ class OpenCvConstellationTracker : AutoCloseable {
                 }
 
                 // Reject spurious repetitive-texture jumps far from predicted target position
-                val jumpDistPx = hypot(projCx - predictedCenterXPx, projCy - predictedCenterYPx)
-                val maxJumpPx = max(96f, searchSide * 0.28f)
+                val jumpDistPx = hypot(projCx - safePredX, projCy - safePredY)
+                val maxJumpPx = max(96f, effectiveSearchW * 0.28f)
                 if (jumpDistPx > maxJumpPx) {
                     val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
                     return ConstellationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
@@ -799,6 +856,31 @@ class OpenCvConstellationTracker : AutoCloseable {
 
         @Volatile
         private var openCvLoaded: Boolean = false
+
+        /**
+         * Clamps a candidate `Rect(rawX, rawY, rawW, rawH)` strictly inside `[0..cols] x [0..rows]`
+         * with `width >= 2` and `height >= 2` so `Mat.submat(Rect)` can never throw a C++ `CvException`
+         * (`0 <= x && x + width <= m.cols && 0 <= y && y + height <= m.rows`) at right/bottom edges
+         * (`.agents/rules/android-camera-ar.md §1.2`).
+         */
+        fun computeSafeSubmatRect(
+            cols: Int,
+            rows: Int,
+            rawX: Int,
+            rawY: Int,
+            rawW: Int,
+            rawH: Int
+        ): Rect? {
+            if (cols < 2 || rows < 2) return null
+            val safeX = rawX.coerceIn(0, cols - 2)
+            val safeY = rawY.coerceIn(0, rows - 2)
+            val safeW = rawW.coerceIn(2, cols - safeX)
+            val safeH = rawH.coerceIn(2, rows - safeY)
+            return Rect(safeX, safeY, safeW, safeH)
+        }
+
+        private fun Float.finiteOr(fallback: Float): Float =
+            if (isFinite()) coerceIn(-100_000f, 100_000f) else fallback
 
         /**
          * Initializes the native `libopencv_java4.so` library once via `OpenCVLoader.initLocal()`.

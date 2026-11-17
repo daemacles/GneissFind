@@ -813,6 +813,154 @@ class LockOnPinpointControllerTest {
         controller.close()
     }
 
+    @Test
+    fun `four-edge off-screen sweep 160+ frames never crashes on right x=1920 or bottom y=1080 coerceIn`() {
+        // Direct regression test for Pixel 10 Pro XL tombstone:
+        // IllegalArgumentException: Cannot coerce value to an empty range: maximum 1920.0 is less than minimum 1925.0037
+        // at LockOnPinpointController.onNeuralB1Detections when display pose pans off the right (x >= 1920)
+        // or bottom (y >= 1080) edge while an in-flight B=1 crop detection completes!
+        for (edgeVal in listOf(-400f, 0f, 1915f, 1920f, 2320f, Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            val box = LockOnPinpointController.clampBoxToFrame(
+                rawLeft = edgeVal,
+                rawTop = edgeVal,
+                rawRight = edgeVal + 24f,
+                rawBottom = edgeVal + 24f,
+                minSpanPx = 8f,
+                frameWidthPx = 1920,
+                frameHeightPx = 1080
+            )
+            assertTrue(box[0] in 0f..1912f)
+            assertTrue(box[1] in 0f..1072f)
+            assertTrue(box[2] in (box[0] + 8f)..1920f)
+            assertTrue(box[3] in (box[1] + 8f)..1080f)
+        }
+
+        val controller = LockOnPinpointController()
+        val geom = StripRoiGeometry()
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val rotCenter = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        val dummyLuma = ByteArray(1920 * 1080)
+
+        val target = buildConfirmedTarget(trackId = 204L, stripCenterX = 896f, slantRangeMeters = 1.25f)
+        var tNs = 30_000_000_000L
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rotCenter,
+            timestampNs = tNs
+        )
+
+        // Sweep across all 4 edges (-400..2320 in X via yaw, -400..1480 in Y via pitch) for 180 frames,
+        // firing 120Hz display reprojection, 30Hz luma frame, AND delayed B=1 crop completion!
+        var totalFrames = 0
+        // 1) Left <-> Right yaw sweep (-38 deg .. +38 deg maps target across x = -500 .. +2420!)
+        // 2) Top <-> Bottom pitch sweep (+18 deg .. +72 deg maps target across y = -500 .. +1580!)
+        for (i in 0 until 90) {
+            val frac = i / 89f
+            val yawSweepDeg = -38f + frac * 76f // sweeps target right past x=1920, then left past x=0
+            val rotDisplayYaw = GroundPlaneRaycaster.buildLandscapeRotationMatrix(
+                pitchDeg = 45f,
+                rollDeg = 0f,
+                yawDeg = yawSweepDeg
+            )
+            tNs += 33_333_333L
+            val hudYaw120 = controller.reprojectForDisplay120Hz(rotDisplayYaw, focalPx, tNs)
+            assertTrue(hudYaw120.frameLeftPx.isFinite() && hudYaw120.frameRightPx.isFinite())
+            hudYaw120.offScreenChevron?.let { chev ->
+                assertTrue(chev.edgeXNorm in 0.05f..0.95f)
+                assertTrue(chev.edgeYNorm in 0.07f..0.93f)
+                assertTrue(chev.directionRad.isFinite())
+                assertTrue(chev.angularOffsetDeg.isFinite())
+            }
+
+            val poseYaw = MotionPoseSnapshot(
+                cameraWorldPosition = WorldPoint3D(0f, 1.06f, 0f),
+                forwardPitchDeg = 45f,
+                rawPitchDeg = 45f,
+                rollDeg = 0f,
+                referencePitchDeg = 45f,
+                cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = false,
+                centerSlantRangeMeters = 1.25f,
+                horizontalSpeedMps = 0f,
+                arPlaneLocked = false,
+                timestampNs = tNs,
+                verticalFocalLengthPx = focalPx,
+                rotationMatrix = rotDisplayYaw
+            )
+            val dirYaw = controller.onCameraLumaFrame(dummyLuma, 1920, 1080, poseYaw, tNs)
+            assertTrue(dirYaw.desiredCropCenterXPx in 0f..1920f)
+            assertTrue(dirYaw.desiredCropCenterYPx in 0f..1080f)
+
+            // Fire delayed B=1 detection captured at rotCenter while displayRotationMatrix is off-screen right/left!
+            val capturePose = poseYaw.copy(rotationMatrix = rotCenter)
+            val hudAfterB1Yaw = controller.onNeuralB1Detections(
+                cropDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = StoneClass.CHALCEDONY_AGATE.id,
+                        confidence = 0.88f,
+                        leftPx = 140f,
+                        topPx = 140f,
+                        rightPx = 180f,
+                        bottomPx = 180f
+                    )
+                ),
+                cropLeftPx = 800,
+                cropTopPx = 380,
+                poseSnapshot = capturePose,
+                timestampNs = tNs + 5_000_000L,
+                displayRotationMatrix = rotDisplayYaw,
+                cropSizePx = 320
+            )
+            assertTrue(hudAfterB1Yaw.stage != AcquisitionStage.PATROL)
+            totalFrames++
+
+            // Vertical pitch sweep across top (y < -400) and bottom (y > 1480)
+            val pitchSweepDeg = 18f + frac * 54f
+            val rotDisplayPitch = GroundPlaneRaycaster.buildLandscapeRotationMatrix(
+                pitchDeg = pitchSweepDeg,
+                rollDeg = 0f,
+                yawDeg = 0f
+            )
+            tNs += 33_333_333L
+            val hudPitch120 = controller.reprojectForDisplay120Hz(rotDisplayPitch, focalPx, tNs)
+            assertTrue(hudPitch120.frameTopPx.isFinite() && hudPitch120.frameBottomPx.isFinite())
+            val posePitch = poseYaw.copy(
+                forwardPitchDeg = pitchSweepDeg,
+                rawPitchDeg = pitchSweepDeg,
+                timestampNs = tNs,
+                rotationMatrix = rotDisplayPitch
+            )
+            controller.onCameraLumaFrame(dummyLuma, 1920, 1080, posePitch, tNs)
+            val hudAfterB1Pitch = controller.onNeuralB1Detections(
+                cropDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = StoneClass.CHALCEDONY_AGATE.id,
+                        confidence = 0.88f,
+                        leftPx = 140f,
+                        topPx = 140f,
+                        rightPx = 180f,
+                        bottomPx = 180f
+                    )
+                ),
+                cropLeftPx = 1600,
+                cropTopPx = 760,
+                poseSnapshot = capturePose,
+                timestampNs = tNs + 5_000_000L,
+                displayRotationMatrix = rotDisplayPitch,
+                cropSizePx = 320
+            )
+            assertTrue(hudAfterB1Pitch.stage != AcquisitionStage.PATROL)
+            totalFrames++
+        }
+        assertEquals(180, totalFrames)
+        controller.close()
+    }
+
     private fun buildConfirmedTarget(
         trackId: Long,
         stripCenterX: Float,

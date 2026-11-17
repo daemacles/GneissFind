@@ -262,6 +262,27 @@ Full report, 27-configuration Pareto table, and Tensor G5 NPU postmortem: [`docs
 
 ---
 
+### Milestone 2D — Deterministic Video+IMU Replay Harness, Right-Edge Crash Elimination & Two-Tier Occlusion Lock-On
+
+1. **Forensic Crash Postmortem & Right/Bottom Off-Screen Boundary Hardening (`LockOnPinpointController.kt`, `PushBroomCropper.kt`, `OpenCvConstellationTracker.kt`, `ScannerScreen.kt`):**
+   - **Forensic Crash Capture (`adb logcat -b crash -d` + `dumpsys activity exit-info com.gneissfind.app` on Pixel 10 Pro XL `58110DLCQ00003`):**
+     - Captured 9 identical `APP CRASH(EXCEPTION)` tombstones (`ApplicationExitInfo #2..#10`, thread `GneissFind-Inference`):
+       ```text
+       java.lang.IllegalArgumentException: Cannot coerce value to an empty range: maximum 1920.0 is less than minimum 1925.0037.
+         at kotlin.ranges.RangesKt___RangesKt.coerceIn(_Ranges.kt:1477)
+         at com.gneissfind.app.tracking.LockOnPinpointController.onNeuralB1Detections(LockOnPinpointController.kt:847)
+       ```
+       (alongside `maximum 1920.0 is less than minimum 1928.0` at line `847` and `maximum 1080.0 is less than minimum 1088.0` at line `848`).
+     - **Why Only Right (`x >= 1920`) and Bottom (`y >= 1080`) Crashed (Never Left/Top):** `LockOnPinpointController.onNeuralB1Detections` clamped `sLeft = (seedProj.uPx - seedHalfW).coerceIn(0f, 1920f)` and then `sRight = (seedProj.uPx + seedHalfW).coerceIn(sLeft + 8f, 1920f)` (and identically `fRight` with `fLeft + 4f` at line `679` and `sRight` at line `741`). When a locked target panned off the **left** (`uPx < 0`) or **top** (`vPx < 0`) edge, `sLeft = 0f` (`0f + 8f <= 1920f`, non-empty). When the camera panned left so the target exited the **right** (`uPx - seedHalfW > 1912f`) or **bottom** (`vPx - seedHalfH > 1072f`) edge during the `~88 ms` window while an in-flight `B=1` GPU crop was finishing, `sLeft` clamped to `(1912f..1920f]`, making `sLeft + 8f > 1920f` and throwing `IllegalArgumentException`!
+   - **Four-Layer Boundary Hardening:**
+     1. `LockOnPinpointController.clampBoxToFrame`: Clamps `maxLeft = (frameW - spanX).coerceAtLeast(0f)` before computing `minRight = (safeLeft + spanX).coerceAtMost(frameW)`, plus `finiteOr` `NaN`/`Infinity` sanitization across all pinhole projections and off-screen chevrons.
+     2. `PushBroomCropper.safeChromaByteIndex` & `safeLumaByteIndex`: Duplicates `ByteBuffer` views per call and steps semi-planar `NV12`/`NV21` (`pixelStride = 2`) bottom-right `(x = 1919, y = 1079)` chroma indices back by a multiple of `pixelStride` whenever `uvY * rowStride + uvX * 2 >= buffer.limit()`, preventing `IndexOutOfBoundsException` without swapping `U`/`V` channel parity.
+     3. `OpenCvConstellationTracker.computeSafeSubmatRect`: Enforces `0 <= x <= cols - 2`, `0 <= y <= rows - 2`, `2 <= w <= cols - x`, `2 <= h <= rows - y` + `finiteOr` before `.roundToInt()` across KLT mask exclusion, `seedConstellationCollar`, and `matchConstellationFrame`.
+     4. `ScannerScreen` (`safeCanvasClamp` / `drawLockOnFullFrameOverlay`): Sanitizes all `DrawScope` coordinates against `NaN`/`Infinity`, prevents negative `Size(w, h)` allocations, and guards `sigmaPxScaled` and off-screen chevron badge clamping against narrow/edge viewports.
+   - **Verification:** Added `160–180`-frame deterministic 4-edge sweep tests (`x = -400..2320`, `y = -400..1480`, `NaN`, `±Infinity`, and strict `NV21` truncated chroma limit) in `PushBroomCropperTest`, `LockOnPinpointControllerTest`, and `OpenCvLockOnInstrumentedTest`.
+
+---
+
 ## 4. Current Android Architecture & Interfaces for Milestone 3 / 4 Coordination
 
 > [!TIP]

@@ -289,4 +289,124 @@ class PushBroomCropperTest {
         assertThat(unified.confidence).isWithin(1e-4f).of(0.88f)
         assertThat(unified.widthPx).isWithin(1e-3f).of(120f)
     }
+
+    /**
+     * Strict Android Camera2 semi-planar `NV21`/`NV12` `YUV_420_888` fixture (`pixelStride = 2`)
+     * whose chroma `ByteBuffer.limit()` equals `(width / 2 - 1) * 2 + 1 + (height / 2 - 1) * rowStride`
+     * (`1,036,799` for `1920x1080`)—omitting the final interleaved byte at `(uvX = 959, uvY = 539)`
+     * where `uvY * rowStride + uvX * 2 == 1,036,798` on one plane and `1,036,799` (out-of-bounds!)
+     * when `limit` is truncated by 1 byte on Android HALs (`.agents/rules/android-camera-ar.md §1.1`).
+     */
+    private class StrictSemiPlanarNv21Frame(
+        override val width: Int = 1920,
+        override val height: Int = 1080,
+        override val rotationDegrees: Int = 0,
+        override val timestampNs: Long = 2_000_000_000L
+    ) : Yuv420Frame {
+        override val yRowStride: Int = width + 64
+        override val yPixelStride: Int = 1
+        override val uRowStride: Int = width + 64
+        override val uPixelStride: Int = 2
+        override val vRowStride: Int = width + 64
+        override val vPixelStride: Int = 2
+
+        private val exactLumaLimit = (height - 1) * yRowStride + width
+        // Exact Android YUV_420_888 semi-planar second-plane limit where last pixel (uvX=w/2-1, uvY=h/2-1)
+        // has NO trailing interleaved partner byte, so uvY * rowStride + uvX * 2 == limit - 1, and
+        // even tighter (limit - 1) tests the exact overrun case!
+        private val strictChromaLimit = (height / 2 - 1) * uRowStride + (width / 2 - 1) * 2
+
+        override val yBuffer: ByteBuffer = ByteBuffer.allocate(exactLumaLimit).apply {
+            for (i in 0 until exactLumaLimit) put(i, (120 + (i % 80)).toByte())
+            limit(exactLumaLimit)
+        }
+        override val uBuffer: ByteBuffer = ByteBuffer.allocate(strictChromaLimit).apply {
+            for (i in 0 until strictChromaLimit) put(i, if (i % 2 == 0) 110.toByte() else 146.toByte())
+            limit(strictChromaLimit)
+        }
+        override val vBuffer: ByteBuffer = ByteBuffer.allocate(strictChromaLimit).apply {
+            for (i in 0 until strictChromaLimit) put(i, if (i % 2 == 0) 146.toByte() else 110.toByte())
+            limit(strictChromaLimit)
+        }
+    }
+
+    @Test
+    fun semiPlanarNv21LastPixelChromaLimit_sweeps160FramesAcrossAllFourEdgesAndRotationsWithoutOverrun() {
+        val cropper = PushBroomCropper(applyImageNetNormalization = true)
+        val lumaOut = ByteArray(1920 * 1080)
+        val rgb320Out = FloatArray(320 * 320 * 3)
+        val sweepBuffers = PushBroomSweepBuffers()
+
+        // Verify parity-preserving chroma step-back on pixelStride=2 when rawIdx == bufferLimit
+        val steppedIdx = PushBroomCropper.safeChromaByteIndex(
+            uvX = 959,
+            uvY = 539,
+            rowStride = 1920,
+            pixelStride = 2,
+            bufferLimit = 539 * 1920 + 959 * 2 // rawIdx == bufferLimit (out of bounds by 1!)
+        )
+        assertThat(steppedIdx).isEqualTo(539 * 1920 + 958 * 2) // Preserves even parity (no U/V swap!)
+
+        // Sweep extractTiles at bottom-most cropY=696 (hits y=1079, x=1919 in 0/90/180/270 deg)
+        for (rot in listOf(0, 90, 180, 270)) {
+            val rawW = if (rot == 90 || rot == 270) 1080 else 1920
+            val rawH = if (rot == 90 || rot == 270) 1920 else 1080
+            val nvFrame = StrictSemiPlanarNv21Frame(width = rawW, height = rawH, rotationDegrees = rot)
+            val geom = cropper.extractTiles(
+                frame = nvFrame,
+                outBuffers = sweepBuffers,
+                cropY = StripRoiGeometry.MAX_CROP_Y_PX,
+                tileMode = SwathTileMode.FIVE_TILE,
+                populateArgbStrip = true
+            )
+            assertThat(geom.uprightFrameWidth).isEqualTo(1920)
+            assertThat(geom.uprightFrameHeight).isEqualTo(1080)
+        }
+
+        // Sweep 160+ Lock-On crop extractions across all 4 edges: x in -400..2320, y in -400..1480 + NaN/Inf
+        val nvLandscape = StrictSemiPlanarNv21Frame(width = 1920, height = 1080, rotationDegrees = 0)
+        var frameCounter = 0
+        for (step in 0 until 42) {
+            val t = step / 41f
+            val sweepPoints = arrayOf(
+                Pair(-400f + t * 2720f, 540f),   // Left -> Right (-400 .. +2320)
+                Pair(1919.9f, -400f + t * 1880f), // Top -> Bottom along x = 1919.9 (-400 .. +1480)
+                Pair(2320f - t * 2720f, 1079.9f), // Bottom-Right -> Bottom-Left along y = 1079.9
+                Pair(-400f, 1480f - t * 1880f)    // Left edge Bottom -> Top
+            )
+            for ((cx, cy) in sweepPoints) {
+                val cropSize = if (frameCounter % 2 == 0) 320 else 640
+                val ext = cropper.extractUprightLumaAndLockOnCrop320(
+                    frame = nvLandscape,
+                    outLumaBytes = if (frameCounter % 8 == 0) lumaOut else ByteArray(0),
+                    outCrop320RgbFloats = rgb320Out,
+                    cropCenterXPx = cx,
+                    cropCenterYPx = cy,
+                    sourceCropSizePx = cropSize,
+                    extractRgbCrop = true
+                )
+                assertThat(ext.cropLeftPx).isIn(0..(1920 - cropSize))
+                assertThat(ext.cropTopPx).isIn(0..(1080 - cropSize))
+                assertThat(rgb320Out[0].isFinite()).isTrue()
+                assertThat(rgb320Out[rgb320Out.lastIndex].isFinite()).isTrue()
+                frameCounter++
+            }
+        }
+        assertThat(frameCounter).isAtLeast(160)
+
+        // Verify NaN and Infinity crop centers never throw in roundToInt() or coerceIn()
+        for (bad in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            val ext = cropper.extractUprightLumaAndLockOnCrop320(
+                frame = nvLandscape,
+                outLumaBytes = ByteArray(0),
+                outCrop320RgbFloats = rgb320Out,
+                cropCenterXPx = bad,
+                cropCenterYPx = bad,
+                sourceCropSizePx = 640,
+                extractRgbCrop = true
+            )
+            assertThat(ext.cropLeftPx).isIn(0..(1920 - 640))
+            assertThat(ext.cropTopPx).isIn(0..(1080 - 640))
+        }
+    }
 }

@@ -1182,22 +1182,24 @@ private fun DrawScope.drawPatrolStripOverlay(
                 target.hitCountInWindow,
                 target.windowSize
             )
-            val calloutW = labelPaint.measureText(callout) + 10.dp.toPx()
-            val calloutH = 16.dp.toPx()
-            val calloutLeft = left.coerceIn(
+            val calloutW = (labelPaint.measureText(callout) + 10.dp.toPx()).finiteOr(60f).coerceAtLeast(1f)
+            val calloutH = 16.dp.toPx().coerceAtLeast(1f)
+            val calloutLeft = safeCanvasClamp(
+                left,
                 stripLeft + 2f,
                 max(stripLeft + 2f, stripRight - calloutW - 2f)
             )
-            val calloutTop = if (top - calloutH - 3.dp.toPx() >= 0f) {
+            val rawCalloutTop = if (top - calloutH - 3.dp.toPx() >= 0f) {
                 top - calloutH - 3.dp.toPx()
             } else {
                 min(size.height - calloutH, bottom + 3.dp.toPx())
             }
+            val calloutTop = safeCanvasClamp(rawCalloutTop, 0f, max(0f, size.height - calloutH))
 
             drawRect(
                 color = LcarsColors.CanvasBlack,
                 topLeft = Offset(calloutLeft, calloutTop),
-                size = Size(calloutW, calloutH)
+                size = Size(calloutW.coerceAtLeast(0f), calloutH.coerceAtLeast(0f))
             )
             labelPaint.color = reticleColor.toArgb()
             drawContext.canvas.nativeCanvas.drawText(
@@ -1254,23 +1256,47 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
     labelPaint: Paint,
     hudPaint: Paint
 ) {
-    val fLeft = transform.frameLeftPx
-    val fTop = transform.frameTopPx
-    val fRight = fLeft + transform.renderedFrameWidthPx
-    val fBottom = fTop + transform.renderedFrameHeightPx
+    if (size.width <= 1f || size.height <= 1f ||
+        transform.renderedFrameWidthPx <= 1f || transform.renderedFrameHeightPx <= 1f ||
+        !transform.scale.isFinite() || transform.scale <= 0f
+    ) {
+        return
+    }
+    val fLeft = safeCanvasClamp(transform.frameLeftPx, 0f, size.width)
+    val fTop = safeCanvasClamp(transform.frameTopPx, 0f, size.height)
+    val renderedW = transform.renderedFrameWidthPx.finiteOr(size.width).coerceAtLeast(1f)
+    val renderedH = transform.renderedFrameHeightPx.finiteOr(size.height).coerceAtLeast(1f)
+    val fRight = safeCanvasClamp(fLeft + renderedW, fLeft, size.width)
+    val fBottom = safeCanvasClamp(fTop + renderedH, fTop, size.height)
 
     // Pure #000000 pillarbox/letterbox outside the uncropped 16:9 (1920x1080) sensor frame
     if (fLeft > 0f) {
-        drawRect(color = LcarsColors.CanvasBlack, topLeft = Offset(0f, 0f), size = Size(fLeft, size.height))
+        drawRect(
+            color = LcarsColors.CanvasBlack,
+            topLeft = Offset(0f, 0f),
+            size = Size(fLeft.coerceAtLeast(0f), size.height.coerceAtLeast(0f))
+        )
     }
     if (fRight < size.width) {
-        drawRect(color = LcarsColors.CanvasBlack, topLeft = Offset(fRight, 0f), size = Size(size.width - fRight, size.height))
+        drawRect(
+            color = LcarsColors.CanvasBlack,
+            topLeft = Offset(fRight, 0f),
+            size = Size((size.width - fRight).coerceAtLeast(0f), size.height.coerceAtLeast(0f))
+        )
     }
     if (fTop > 0f) {
-        drawRect(color = LcarsColors.CanvasBlack, topLeft = Offset(0f, 0f), size = Size(size.width, fTop))
+        drawRect(
+            color = LcarsColors.CanvasBlack,
+            topLeft = Offset(0f, 0f),
+            size = Size(size.width.coerceAtLeast(0f), fTop.coerceAtLeast(0f))
+        )
     }
     if (fBottom < size.height) {
-        drawRect(color = LcarsColors.CanvasBlack, topLeft = Offset(0f, fBottom), size = Size(size.width, size.height - fBottom))
+        drawRect(
+            color = LcarsColors.CanvasBlack,
+            topLeft = Offset(0f, fBottom),
+            size = Size(size.width.coerceAtLeast(0f), (size.height - fBottom).coerceAtLeast(0f))
+        )
     }
 
     val isPinpoint = hud.stage == AcquisitionStage.PINPOINT_CONSTELLATION
@@ -1283,17 +1309,18 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
     drawRect(
         color = frameBorderColor,
         topLeft = Offset(fLeft, fTop),
-        size = Size(transform.renderedFrameWidthPx, transform.renderedFrameHeightPx),
+        size = Size((fRight - fLeft).coerceAtLeast(0f), (fBottom - fTop).coerceAtLeast(0f)),
         style = Stroke(width = 1.5.dp.toPx())
     )
 
     // Mode tag in top-left of 16:9 frame
+    val safeLostSec = hud.lostTrackRemainingSec.finiteOr(0f).coerceIn(0f, 99f)
     val modeTag = when {
         !hud.isTargetInFrame -> "OFF-SCREEN HOLD • PAN TOWARD CHEVRON"
         hud.isLostTrackGraceActive -> String.format(
             Locale.US,
             "HOLDING ANCHOR • %.0fS GRACE",
-            hud.lostTrackRemainingSec
+            safeLostSec
         )
         isAkazeLocked -> "PINPOINT 16:9 • 30HZ AKAZE + 1HZ B=1"
         isPinpoint -> "RE-ACQUIRING 16:9 • B=1 WIDE SEARCH"
@@ -1305,8 +1332,8 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
         )
     }
     hudPaint.textSize = 10.dp.toPx()
-    val modeTagW = hudPaint.measureText(modeTag) + 12.dp.toPx()
-    val modeTagH = 15.dp.toPx()
+    val modeTagW = (hudPaint.measureText(modeTag) + 12.dp.toPx()).finiteOr(80f).coerceAtLeast(1f)
+    val modeTagH = 15.dp.toPx().coerceAtLeast(1f)
     drawRect(
         color = LcarsColors.CanvasBlack,
         topLeft = Offset(fLeft + 4.dp.toPx(), fTop + 4.dp.toPx()),
@@ -1322,10 +1349,10 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
 
     // High-visibility adaptive [320..640] neural detector window rendered cleanly without inner text clutter
     if (hud.isTargetInFrame) {
-        val cL = (fLeft + hud.cropLeftPx * transform.scale).coerceIn(fLeft, fRight)
-        val cT = (fTop + hud.cropTopPx * transform.scale).coerceIn(fTop, fBottom)
-        val cR = (fLeft + (hud.cropLeftPx + hud.cropSizePx) * transform.scale).coerceIn(cL, fRight)
-        val cB = (fTop + (hud.cropTopPx + hud.cropSizePx) * transform.scale).coerceIn(cT, fBottom)
+        val cL = safeCanvasClamp(fLeft + hud.cropLeftPx * transform.scale, fLeft, fRight)
+        val cT = safeCanvasClamp(fTop + hud.cropTopPx * transform.scale, fTop, fBottom)
+        val cR = safeCanvasClamp(fLeft + (hud.cropLeftPx + hud.cropSizePx) * transform.scale, cL, fRight)
+        val cB = safeCanvasClamp(fTop + (hud.cropTopPx + hud.cropSizePx) * transform.scale, cT, fBottom)
         val cSize = Size(max(1f, cR - cL), max(1f, cB - cT))
         val cropDash = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
 
@@ -1348,31 +1375,31 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
     if (hud.isTargetInFrame) {
         // World-locked 1 Hz neural detector stone box inside the detector window during PINPOINT
         if (isPinpoint && hud.hasNeuralDetectorBox) {
-            val nLeft = (fLeft + hud.neuralBoxLeftPx * transform.scale).coerceIn(fLeft, fRight)
-            val nTop = (fTop + hud.neuralBoxTopPx * transform.scale).coerceIn(fTop, fBottom)
-            val nRight = (fLeft + hud.neuralBoxRightPx * transform.scale).coerceIn(nLeft, fRight)
-            val nBottom = (fTop + hud.neuralBoxBottomPx * transform.scale).coerceIn(nTop, fBottom)
+            val nLeft = safeCanvasClamp(fLeft + hud.neuralBoxLeftPx * transform.scale, fLeft, fRight)
+            val nTop = safeCanvasClamp(fTop + hud.neuralBoxTopPx * transform.scale, fTop, fBottom)
+            val nRight = safeCanvasClamp(fLeft + hud.neuralBoxRightPx * transform.scale, nLeft, fRight)
+            val nBottom = safeCanvasClamp(fTop + hud.neuralBoxBottomPx * transform.scale, nTop, fBottom)
             if (nRight - nLeft >= 8f && nBottom - nTop >= 8f) {
                 val neuralDash = PathEffect.dashPathEffect(floatArrayOf(6f, 4f), 0f)
                 drawRect(
                     color = Color(0xCC000000),
                     topLeft = Offset(nLeft, nTop),
-                    size = Size(nRight - nLeft, nBottom - nTop),
+                    size = Size((nRight - nLeft).coerceAtLeast(0f), (nBottom - nTop).coerceAtLeast(0f)),
                     style = Stroke(width = 3.2.dp.toPx())
                 )
                 drawRect(
                     color = LcarsColors.IceBlue,
                     topLeft = Offset(nLeft, nTop),
-                    size = Size(nRight - nLeft, nBottom - nTop),
+                    size = Size((nRight - nLeft).coerceAtLeast(0f), (nBottom - nTop).coerceAtLeast(0f)),
                     style = Stroke(width = 1.6.dp.toPx(), pathEffect = neuralDash)
                 )
             }
         }
 
-        val left = (fLeft + hud.frameLeftPx * transform.scale).coerceIn(fLeft, fRight)
-        val top = (fTop + hud.frameTopPx * transform.scale).coerceIn(fTop, fBottom)
-        val right = (fLeft + hud.frameRightPx * transform.scale).coerceIn(fLeft, fRight)
-        val bottom = (fTop + hud.frameBottomPx * transform.scale).coerceIn(fTop, fBottom)
+        val left = safeCanvasClamp(fLeft + hud.frameLeftPx * transform.scale, fLeft, fRight)
+        val top = safeCanvasClamp(fTop + hud.frameTopPx * transform.scale, fTop, fBottom)
+        val right = safeCanvasClamp(fLeft + hud.frameRightPx * transform.scale, left, fRight)
+        val bottom = safeCanvasClamp(fTop + hud.frameBottomPx * transform.scale, top, fBottom)
         val cx = (left + right) * 0.5f
         val cy = (top + bottom) * 0.5f
 
@@ -1384,10 +1411,9 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
             foregroundColor = mineralColor
         )
 
-        val sigmaPxScaled = (hud.sigmaRadiusPx * transform.scale).coerceIn(
-            8.dp.toPx(),
-            min(transform.renderedFrameWidthPx, transform.renderedFrameHeightPx) * 0.44f
-        )
+        val minSigmaPx = 8.dp.toPx()
+        val maxSigmaPx = max(minSigmaPx, min(fRight - fLeft, fBottom - fTop) * 0.44f)
+        val sigmaPxScaled = safeCanvasClamp(hud.sigmaRadiusPx * transform.scale, minSigmaPx, maxSigmaPx)
 
         if (isAkazeLocked) {
             // Solid double-ring crosshair ONLY when AKAZE texture constellation (>= 12 PTS) is actively locked
@@ -1454,30 +1480,37 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
         // Off-screen directional re-acquisition chevron during 15s grace window (.agents/rules/lcars-ui.md §4)
         val chevron = hud.offScreenChevron
         if (chevron != null) {
-            val edgeX = fLeft + chevron.edgeXNorm * transform.renderedFrameWidthPx
-            val edgeY = fTop + chevron.edgeYNorm * transform.renderedFrameHeightPx
-            val dirX = cos(chevron.directionRad)
-            val dirY = sin(chevron.directionRad)
+            val safeEdgeXNorm = safeCanvasClamp(chevron.edgeXNorm, 0.05f, 0.95f)
+            val safeEdgeYNorm = safeCanvasClamp(chevron.edgeYNorm, 0.07f, 0.93f)
+            val safeDirRad = chevron.directionRad.finiteOr(0f)
+            val edgeX = safeCanvasClamp(fLeft + safeEdgeXNorm * (fRight - fLeft), fLeft, fRight)
+            val edgeY = safeCanvasClamp(fTop + safeEdgeYNorm * (fBottom - fTop), fTop, fBottom)
+            val dirX = cos(safeDirRad).finiteOr(1f)
+            val dirY = sin(safeDirRad).finiteOr(0f)
             val perpX = -dirY
             val perpY = dirX
 
             val tipLen = 12.dp.toPx()
             val wingSpan = 9.dp.toPx()
-            val tip = Offset(edgeX + dirX * tipLen * 0.5f, edgeY + dirY * tipLen * 0.5f)
+            val tip = Offset(
+                safeCanvasClamp(edgeX + dirX * tipLen * 0.5f, 0f, size.width),
+                safeCanvasClamp(edgeY + dirY * tipLen * 0.5f, 0f, size.height)
+            )
             val wingA = Offset(
-                edgeX - dirX * tipLen * 0.5f + perpX * wingSpan,
-                edgeY - dirY * tipLen * 0.5f + perpY * wingSpan
+                safeCanvasClamp(edgeX - dirX * tipLen * 0.5f + perpX * wingSpan, 0f, size.width),
+                safeCanvasClamp(edgeY - dirY * tipLen * 0.5f + perpY * wingSpan, 0f, size.height)
             )
             val wingB = Offset(
-                edgeX - dirX * tipLen * 0.5f - perpX * wingSpan,
-                edgeY - dirY * tipLen * 0.5f - perpY * wingSpan
+                safeCanvasClamp(edgeX - dirX * tipLen * 0.5f - perpX * wingSpan, 0f, size.width),
+                safeCanvasClamp(edgeY - dirY * tipLen * 0.5f - perpY * wingSpan, 0f, size.height)
             )
             val chevPath = Path().apply {
                 moveTo(wingA.x, wingA.y)
                 lineTo(tip.x, tip.y)
                 lineTo(wingB.x, wingB.y)
             }
-            val pulsedColor = mineralColor.copy(alpha = chevronPulseAlpha)
+            val safePulse = safeCanvasClamp(chevronPulseAlpha, 0.1f, 1f)
+            val pulsedColor = mineralColor.copy(alpha = safePulse)
             drawPath(
                 path = chevPath,
                 color = LcarsColors.CanvasBlack,
@@ -1489,31 +1522,38 @@ private fun DrawScope.drawLockOnFullFrameOverlay(
                 style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
             )
 
-            val degClamped = chevron.angularOffsetDeg.coerceIn(0f, 99f)
+            val degClamped = safeCanvasClamp(chevron.angularOffsetDeg, 0f, 99f)
             val chevLabel = String.format(
                 Locale.US,
                 "%02.0f° • %02.0fS",
                 degClamped,
-                hud.lostTrackRemainingSec
+                safeLostSec
             )
             labelPaint.textSize = 11.dp.toPx()
-            val fixedBoxW = labelPaint.measureText("99° • 15S") + 14.dp.toPx()
-            val textW = labelPaint.measureText(chevLabel)
-            val ch = 18.dp.toPx()
-            val cl = (edgeX - fixedBoxW * 0.5f - dirX * (fixedBoxW * 0.42f)).coerceIn(
-                fLeft + 14.dp.toPx(),
-                max(fLeft + 14.dp.toPx(), fRight - fixedBoxW - 14.dp.toPx())
+            val rawBoxW = (labelPaint.measureText("99° • 15S") + 14.dp.toPx()).finiteOr(84f)
+            val fixedBoxW = rawBoxW.coerceIn(1f, max(1f, fRight - fLeft))
+            val textW = labelPaint.measureText(chevLabel).finiteOr(fixedBoxW * 0.8f)
+            val ch = 18.dp.toPx().coerceIn(1f, max(1f, fBottom - fTop))
+            val minCl = min(fLeft + 14.dp.toPx(), max(fLeft, fRight - fixedBoxW))
+            val maxCl = max(minCl, fRight - fixedBoxW - 14.dp.toPx())
+            val cl = safeCanvasClamp(
+                edgeX - fixedBoxW * 0.5f - dirX * (fixedBoxW * 0.42f),
+                minCl,
+                maxCl
             )
-            val ct = (edgeY - ch * 0.5f - dirY * 14.dp.toPx()).coerceIn(
-                fTop + 6.dp.toPx(),
-                max(fTop + 6.dp.toPx(), fBottom - ch - 6.dp.toPx())
+            val minCt = min(fTop + 6.dp.toPx(), max(fTop, fBottom - ch))
+            val maxCt = max(minCt, fBottom - ch - 6.dp.toPx())
+            val ct = safeCanvasClamp(
+                edgeY - ch * 0.5f - dirY * 14.dp.toPx(),
+                minCt,
+                maxCt
             )
             drawRect(
                 color = LcarsColors.CanvasBlack,
                 topLeft = Offset(cl, ct),
-                size = Size(fixedBoxW, ch)
+                size = Size(fixedBoxW.coerceAtLeast(0f), ch.coerceAtLeast(0f))
             )
-            labelPaint.color = LcarsColors.GoldenAmber.copy(alpha = chevronPulseAlpha).toArgb()
+            labelPaint.color = LcarsColors.GoldenAmber.copy(alpha = safePulse).toArgb()
             drawContext.canvas.nativeCanvas.drawText(
                 chevLabel,
                 cl + (fixedBoxW - textW) * 0.5f,
@@ -2693,6 +2733,15 @@ private fun formatShutterFraction(exposureNs: Long): String {
     if (exposureNs <= 0L) return "1/500S"
     val denom = (1_000_000_000.0 / exposureNs.toDouble()).roundToInt().coerceAtLeast(1)
     return "1/${denom}S"
+}
+
+private fun Float.finiteOr(fallback: Float): Float =
+    if (isFinite()) this else fallback
+
+private fun safeCanvasClamp(value: Float, minVal: Float, maxVal: Float): Float {
+    val lo = minVal.finiteOr(0f)
+    val hi = max(lo, maxVal.finiteOr(lo))
+    return value.finiteOr(lo).coerceIn(lo, hi)
 }
 
 @Preview(

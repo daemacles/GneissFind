@@ -22,6 +22,7 @@ import com.gneissfind.app.vision.PushBroomCropper
 import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -524,8 +525,12 @@ class LockOnPinpointController(
                         nowNs = timestampNs,
                         sourceBadge = "AKAZE"
                     )
-                    val cropCx = ((hud.frameLeftPx + hud.frameRightPx) * 0.5f).coerceIn(0f, widthPx.toFloat())
-                    val cropCy = ((hud.frameTopPx + hud.frameBottomPx) * 0.5f).coerceIn(0f, heightPx.toFloat())
+                    val cropCx = ((hud.frameLeftPx + hud.frameRightPx) * 0.5f)
+                        .finiteOr(widthPx * 0.5f)
+                        .coerceIn(0f, widthPx.coerceAtLeast(1).toFloat())
+                    val cropCy = ((hud.frameTopPx + hud.frameBottomPx) * 0.5f)
+                        .finiteOr(heightPx * 0.5f)
+                        .coerceIn(0f, heightPx.coerceAtLeast(1).toFloat())
                     return LockOnFrameDirective(
                         hudState = hud,
                         shouldRunNeuralB1 = needs1HzRefresh,
@@ -568,8 +573,8 @@ class LockOnPinpointController(
                 rawCenterY in -reachMarginPx..(heightPx + reachMarginPx) &&
                 (hud.offScreenChevron?.angularOffsetDeg ?: 0f) <= 45f
             )
-        val cropCx = rawCenterX.coerceIn(0f, widthPx.toFloat())
-        val cropCy = rawCenterY.coerceIn(0f, heightPx.toFloat())
+        val cropCx = rawCenterX.finiteOr(widthPx * 0.5f).coerceIn(0f, widthPx.coerceAtLeast(1).toFloat())
+        val cropCy = rawCenterY.finiteOr(heightPx * 0.5f).coerceIn(0f, heightPx.coerceAtLeast(1).toFloat())
         return LockOnFrameDirective(
             hudState = hud,
             shouldRunNeuralB1 = canReachInEdgeCrop,
@@ -671,14 +676,19 @@ class LockOnPinpointController(
             wasTargetOffScreen = false
             lostTrackStartNs = 0L
 
-            val fLeft = (cropLeftPx + matchedDet.leftPx * cropScale)
-                .coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat())
-            val fTop = (cropTopPx + matchedDet.topPx * cropScale)
-                .coerceIn(0f, StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat())
-            val fRight = (cropLeftPx + matchedDet.rightPx * cropScale)
-                .coerceIn(fLeft + 4f, StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX.toFloat())
-            val fBottom = (cropTopPx + matchedDet.bottomPx * cropScale)
-                .coerceIn(fTop + 4f, StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX.toFloat())
+            val clampedDetBox = clampBoxToFrame(
+                rawLeft = cropLeftPx + matchedDet.leftPx * cropScale,
+                rawTop = cropTopPx + matchedDet.topPx * cropScale,
+                rawRight = cropLeftPx + matchedDet.rightPx * cropScale,
+                rawBottom = cropTopPx + matchedDet.bottomPx * cropScale,
+                minSpanPx = 4f,
+                frameWidthPx = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
+                frameHeightPx = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
+            )
+            val fLeft = clampedDetBox[0]
+            val fTop = clampedDetBox[1]
+            val fRight = clampedDetBox[2]
+            val fBottom = clampedDetBox[3]
 
             val obsU = (fLeft + fRight) * 0.5f
             val obsV = (fTop + fBottom) * 0.5f
@@ -736,10 +746,19 @@ class LockOnPinpointController(
                     )
                     val seedHalfW = max(12f, angularWidthRad * focalPx * 0.5f)
                     val seedHalfH = max(12f, angularHeightRad * focalPx * 0.5f)
-                    val sLeft = (seedProj.uPx - seedHalfW).coerceIn(0f, latestLumaWidth.toFloat())
-                    val sTop = (seedProj.vPx - seedHalfH).coerceIn(0f, latestLumaHeight.toFloat())
-                    val sRight = (seedProj.uPx + seedHalfW).coerceIn(sLeft + 8f, latestLumaWidth.toFloat())
-                    val sBottom = (seedProj.vPx + seedHalfH).coerceIn(sTop + 8f, latestLumaHeight.toFloat())
+                    val clampedSeed = clampBoxToFrame(
+                        rawLeft = seedProj.uPx - seedHalfW,
+                        rawTop = seedProj.vPx - seedHalfH,
+                        rawRight = seedProj.uPx + seedHalfW,
+                        rawBottom = seedProj.vPx + seedHalfH,
+                        minSpanPx = 8f,
+                        frameWidthPx = latestLumaWidth,
+                        frameHeightPx = latestLumaHeight
+                    )
+                    val sLeft = clampedSeed[0]
+                    val sTop = clampedSeed[1]
+                    val sRight = clampedSeed[2]
+                    val sBottom = clampedSeed[3]
                     if (seedProj.inFront &&
                         seedProj.uPx in 64f..(latestLumaWidth - 64f) &&
                         seedProj.vPx in 64f..(latestLumaHeight - 64f)
@@ -842,10 +861,19 @@ class LockOnPinpointController(
                 )
                 val seedHalfW = max(12f, angularWidthRad * focalPx * 0.5f)
                 val seedHalfH = max(12f, angularHeightRad * focalPx * 0.5f)
-                val sLeft = (seedProj.uPx - seedHalfW).coerceIn(0f, latestLumaWidth.toFloat())
-                val sTop = (seedProj.vPx - seedHalfH).coerceIn(0f, latestLumaHeight.toFloat())
-                val sRight = (seedProj.uPx + seedHalfW).coerceIn(sLeft + 8f, latestLumaWidth.toFloat())
-                val sBottom = (seedProj.vPx + seedHalfH).coerceIn(sTop + 8f, latestLumaHeight.toFloat())
+                val clampedSeed = clampBoxToFrame(
+                    rawLeft = seedProj.uPx - seedHalfW,
+                    rawTop = seedProj.vPx - seedHalfH,
+                    rawRight = seedProj.uPx + seedHalfW,
+                    rawBottom = seedProj.vPx + seedHalfH,
+                    minSpanPx = 8f,
+                    frameWidthPx = latestLumaWidth,
+                    frameHeightPx = latestLumaHeight
+                )
+                val sLeft = clampedSeed[0]
+                val sTop = clampedSeed[1]
+                val sRight = clampedSeed[2]
+                val sBottom = clampedSeed[3]
 
                 // Check Stage 2 -> Stage 3 handover criterion: sigma_3D < 0.5 * D, >= 4 views, >= 3.0 deg parallax
                 if (stage == AcquisitionStage.LOCK_ON_NEURAL &&
@@ -955,8 +983,11 @@ class LockOnPinpointController(
         if (needsWideSearch) {
             return PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX
         }
-        val apparentSpanPx = max(angularWidthRad, angularHeightRad) * f
-        return (apparentSpanPx * 2.4f).roundToInt()
+        val apparentSpanPx = (max(angularWidthRad, angularHeightRad) * f)
+            .finiteOr(PushBroomCropper.LOCK_ON_CROP_SIZE_PX.toFloat())
+        return (apparentSpanPx * 2.4f)
+            .finiteOr(PushBroomCropper.LOCK_ON_CROP_SIZE_PX.toFloat())
+            .roundToInt()
             .coerceIn(
                 PushBroomCropper.LOCK_ON_CROP_SIZE_PX,
                 PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX
@@ -1550,27 +1581,31 @@ class LockOnPinpointController(
             frameWidthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
             frameHeightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
         ): PinholeProjection {
-            val dEast = targetEnu[0] - camPosEnu[0]
-            val dNorth = targetEnu[1] - camPosEnu[1]
-            val dUp = targetEnu[2] - camPosEnu[2]
-            val rangeM = sqrt(dEast * dEast + dNorth * dNorth + dUp * dUp).coerceAtLeast(1e-4f)
+            val safeW = frameWidthPx.coerceAtLeast(1)
+            val safeH = frameHeightPx.coerceAtLeast(1)
+            val dEast = (targetEnu[0] - camPosEnu[0]).finiteOr(0f)
+            val dNorth = (targetEnu[1] - camPosEnu[1]).finiteOr(1f)
+            val dUp = (targetEnu[2] - camPosEnu[2]).finiteOr(-1f)
+            val rangeM = sqrt(dEast * dEast + dNorth * dNorth + dUp * dUp)
+                .finiteOr(1.5f)
+                .coerceAtLeast(1e-4f)
 
-            val xScr = rWorldFromScr[0] * dEast + rWorldFromScr[3] * dNorth + rWorldFromScr[6] * dUp
-            val yScr = rWorldFromScr[1] * dEast + rWorldFromScr[4] * dNorth + rWorldFromScr[7] * dUp
-            val zScr = rWorldFromScr[2] * dEast + rWorldFromScr[5] * dNorth + rWorldFromScr[8] * dUp
+            val xScr = (rWorldFromScr[0] * dEast + rWorldFromScr[3] * dNorth + rWorldFromScr[6] * dUp).finiteOr(0f)
+            val yScr = (rWorldFromScr[1] * dEast + rWorldFromScr[4] * dNorth + rWorldFromScr[7] * dUp).finiteOr(0f)
+            val zScr = (rWorldFromScr[2] * dEast + rWorldFromScr[5] * dNorth + rWorldFromScr[8] * dUp).finiteOr(-1f)
 
             val xCv = xScr
             val yCv = -yScr
             val zCv = -zScr
-            val f = focalLengthPx.coerceAtLeast(100f)
-            val cx = frameWidthPx * 0.5f
-            val cy = frameHeightPx * 0.5f
+            val f = focalLengthPx.finiteOr(2000f).coerceAtLeast(100f)
+            val cx = safeW * 0.5f
+            val cy = safeH * 0.5f
 
             if (zCv <= 0.05f) {
-                val norm2d = hypot(xCv, yCv).coerceAtLeast(1e-4f)
+                val norm2d = hypot(xCv, yCv).finiteOr(1f).coerceAtLeast(1e-4f)
                 return PinholeProjection(
-                    uPx = cx + (xCv / norm2d) * frameWidthPx * 2.0f,
-                    vPx = cy + (yCv / norm2d) * frameHeightPx * 2.0f,
+                    uPx = (cx + (xCv / norm2d) * safeW * 2.0f).finiteOr(cx),
+                    vPx = (cy + (yCv / norm2d) * safeH * 2.0f).finiteOr(cy),
                     xCv = xCv,
                     yCv = yCv,
                     zCv = zCv,
@@ -1580,8 +1615,8 @@ class LockOnPinpointController(
             }
 
             return PinholeProjection(
-                uPx = cx + f * (xCv / zCv),
-                vPx = cy + f * (yCv / zCv),
+                uPx = (cx + f * (xCv / zCv)).finiteOr(cx),
+                vPx = (cy + f * (yCv / zCv)).finiteOr(cy),
                 xCv = xCv,
                 yCv = yCv,
                 zCv = zCv,
@@ -1595,26 +1630,34 @@ class LockOnPinpointController(
             frameWidthPx: Int,
             frameHeightPx: Int
         ): OffScreenChevron {
-            val cx = frameWidthPx * 0.5f
-            val cy = frameHeightPx * 0.5f
-            val dx = if (proj.inFront) proj.uPx - cx else proj.xCv
-            var dy = if (proj.inFront) proj.vPx - cy else proj.yCv
+            val safeW = frameWidthPx.coerceAtLeast(1).toFloat()
+            val safeH = frameHeightPx.coerceAtLeast(1).toFloat()
+            val cx = safeW * 0.5f
+            val cy = safeH * 0.5f
+            val rawDx = if (proj.inFront) proj.uPx - cx else proj.xCv
+            val rawDy = if (proj.inFront) proj.vPx - cy else proj.yCv
+            val dx = rawDx.finiteOr(0f)
+            var dy = rawDy.finiteOr(1f)
             if (abs(dx) < 1e-4f && abs(dy) < 1e-4f) {
                 dy = 1f
             }
 
-            val dirRad = atan2(dy, dx)
-            val halfSpanX = frameWidthPx * 0.45f
-            val halfSpanY = frameHeightPx * 0.43f
-            val scaleX = if (abs(dx) > 1e-5f) halfSpanX / abs(dx) else Float.POSITIVE_INFINITY
-            val scaleY = if (abs(dy) > 1e-5f) halfSpanY / abs(dy) else Float.POSITIVE_INFINITY
-            val t = min(scaleX, scaleY)
+            val dirRad = atan2(dy, dx).finiteOr(0f)
+            val ux = cos(dirRad)
+            val uy = sin(dirRad)
+            val halfSpanX = safeW * 0.45f
+            val halfSpanY = safeH * 0.43f
+            val scaleX = if (abs(ux) > 1e-5f) halfSpanX / abs(ux) else Float.POSITIVE_INFINITY
+            val scaleY = if (abs(uy) > 1e-5f) halfSpanY / abs(uy) else Float.POSITIVE_INFINITY
+            val distToEdge = min(scaleX, scaleY).finiteOr(min(halfSpanX, halfSpanY))
 
-            val edgeXNorm = ((cx + dx * t) / frameWidthPx.coerceAtLeast(1)).coerceIn(0.05f, 0.95f)
-            val edgeYNorm = ((cy + dy * t) / frameHeightPx.coerceAtLeast(1)).coerceIn(0.07f, 0.93f)
+            val edgeXNorm = ((cx + ux * distToEdge) / safeW).finiteOr(0.5f).coerceIn(0.05f, 0.95f)
+            val edgeYNorm = ((cy + uy * distToEdge) / safeH).finiteOr(0.5f).coerceIn(0.07f, 0.93f)
 
-            val cosAngle = (proj.zCv / proj.slantRangeM.coerceAtLeast(1e-4f)).coerceIn(-1.0f, 1.0f)
-            val angularOffsetDeg = Math.toDegrees(acos(cosAngle.toDouble())).toFloat()
+            val cosAngle = (proj.zCv / proj.slantRangeM.coerceAtLeast(1e-4f))
+                .finiteOr(0f)
+                .coerceIn(-1.0f, 1.0f)
+            val angularOffsetDeg = Math.toDegrees(acos(cosAngle.toDouble())).toFloat().finiteOr(45f)
 
             return OffScreenChevron(
                 edgeXNorm = edgeXNorm,
@@ -1623,6 +1666,38 @@ class LockOnPinpointController(
                 angularOffsetDeg = angularOffsetDeg
             )
         }
+
+        /**
+         * Clamps `[rawLeft, rawTop, rawRight, rawBottom]` strictly inside `[0..frameWidthPx] x [0..frameHeightPx]`
+         * with guaranteed non-empty `[min..max]` ranges even when `rawLeft >= frameWidthPx` or `NaN`/`Infinity`
+         * occurs at the right/bottom edges (`x >= 1920`, `y >= 1080`).
+         */
+        internal fun clampBoxToFrame(
+            rawLeft: Float,
+            rawTop: Float,
+            rawRight: Float,
+            rawBottom: Float,
+            minSpanPx: Float = 8f,
+            frameWidthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
+            frameHeightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
+        ): FloatArray {
+            val frameW = frameWidthPx.coerceAtLeast(1).toFloat()
+            val frameH = frameHeightPx.coerceAtLeast(1).toFloat()
+            val spanX = minSpanPx.finiteOr(4f).coerceIn(1f, frameW)
+            val spanY = minSpanPx.finiteOr(4f).coerceIn(1f, frameH)
+            val maxLeft = (frameW - spanX).coerceAtLeast(0f)
+            val maxTop = (frameH - spanY).coerceAtLeast(0f)
+            val safeLeft = rawLeft.finiteOr(0f).coerceIn(0f, maxLeft)
+            val safeTop = rawTop.finiteOr(0f).coerceIn(0f, maxTop)
+            val minRight = (safeLeft + spanX).coerceAtMost(frameW)
+            val minBottom = (safeTop + spanY).coerceAtMost(frameH)
+            val safeRight = rawRight.finiteOr(minRight).coerceIn(minRight, frameW)
+            val safeBottom = rawBottom.finiteOr(minBottom).coerceIn(minBottom, frameH)
+            return floatArrayOf(safeLeft, safeTop, safeRight, safeBottom)
+        }
+
+        private fun Float.finiteOr(fallback: Float): Float =
+            if (isFinite()) coerceIn(-100_000f, 100_000f) else fallback
 
         private fun computeDistanceEnu(a: FloatArray, b: FloatArray): Float {
             val dx = a[0] - b[0]

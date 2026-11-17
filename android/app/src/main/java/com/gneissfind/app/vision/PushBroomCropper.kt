@@ -273,9 +273,9 @@ class PushBroomCropper(
         outBuffers.timestampNs = frame.timestampNs
         outBuffers.hasArgbPixels = populateArgbStrip
 
-        val yBuf = frame.yBuffer
-        val uBuf = frame.uBuffer
-        val vBuf = frame.vBuffer
+        val yBuf = frame.yBuffer.duplicate()
+        val uBuf = frame.uBuffer.duplicate()
+        val vBuf = frame.vBuffer.duplicate()
         val yRowStride = frame.yRowStride
         val yPixStride = frame.yPixelStride
         val uRowStride = frame.uRowStride
@@ -286,6 +286,9 @@ class PushBroomCropper(
         val yLimit = yBuf.limit()
         val uLimit = uBuf.limit()
         val vLimit = vBuf.limit()
+        if (yLimit <= 0 || uLimit <= 0 || vLimit <= 0 || rawW <= 0 || rawH <= 0) {
+            return geometry
+        }
 
         val uprightW = geometry.uprightFrameWidth
         val uprightH = geometry.uprightFrameHeight
@@ -343,11 +346,11 @@ class PushBroomCropper(
                     }
                 }
 
-                val yIndex = (by * yRowStride + bx * yPixStride).coerceIn(0, yLimit - 1)
+                val yIndex = safeLumaByteIndex(bx, by, yRowStride, yPixStride, yLimit)
                 val uvX = bx shr 1
                 val uvY = by shr 1
-                val uIndex = (uvY * uRowStride + uvX * uPixStride).coerceIn(0, uLimit - 1)
-                val vIndex = (uvY * vRowStride + uvX * vPixStride).coerceIn(0, vLimit - 1)
+                val uIndex = safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit)
+                val vIndex = safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit)
 
                 val yVal = (yBuf.get(yIndex).toInt() and 0xFF)
                 val uVal = (uBuf.get(uIndex).toInt() and 0xFF) - 128
@@ -681,7 +684,7 @@ class PushBroomCropper(
                                 by = uy
                             }
                         }
-                        val yIndex = (by * yRowStride + bx * yPixStride).coerceIn(0, yLimit - 1)
+                        val yIndex = safeLumaByteIndex(bx, by, yRowStride, yPixStride, yLimit)
                         outLumaBytes[dstIdx++] = yDup.get(yIndex)
                     }
                 }
@@ -702,74 +705,80 @@ class PushBroomCropper(
             frameHeightPx = uprightH
         )
 
-        if (extractRgbCrop && outCrop320RgbFloats.size >= tensorSize * tensorSize * 3) {
-            val uBuf = frame.uBuffer
-            val vBuf = frame.vBuffer
+        if (extractRgbCrop &&
+            yLimit > 0 &&
+            rawW > 0 &&
+            rawH > 0 &&
+            outCrop320RgbFloats.size >= tensorSize * tensorSize * 3
+        ) {
+            val uBuf = frame.uBuffer.duplicate()
+            val vBuf = frame.vBuffer.duplicate()
             val uRowStride = frame.uRowStride
             val uPixStride = frame.uPixelStride
             val vRowStride = frame.vRowStride
             val vPixStride = frame.vPixelStride
             val uLimit = uBuf.limit()
             val vLimit = vBuf.limit()
-
-            var dstFloatIdx = 0
-            for (cy in 0 until tensorSize) {
-                val srcOffsetY = if (roiSizePx == tensorSize) {
-                    cy
-                } else {
-                    (cy * roiSizePx + (roiSizePx shr 1)) / tensorSize
-                }
-                val uy = (cropTop + srcOffsetY).coerceIn(0, (uprightH - 1).coerceAtLeast(0))
-                for (cx in 0 until tensorSize) {
-                    val srcOffsetX = if (roiSizePx == tensorSize) {
-                        cx
+            if (uLimit > 0 && vLimit > 0) {
+                var dstFloatIdx = 0
+                for (cy in 0 until tensorSize) {
+                    val srcOffsetY = if (roiSizePx == tensorSize) {
+                        cy
                     } else {
-                        (cx * roiSizePx + (roiSizePx shr 1)) / tensorSize
+                        (cy * roiSizePx + (roiSizePx shr 1)) / tensorSize
                     }
-                    val ux = (cropLeft + srcOffsetX).coerceIn(0, (uprightW - 1).coerceAtLeast(0))
-                    val bx: Int
-                    val by: Int
-                    when (rot) {
-                        90 -> {
-                            bx = uy
-                            by = (rawH - 1 - ux).coerceIn(0, rawH - 1)
+                    val uy = (cropTop + srcOffsetY).coerceIn(0, (uprightH - 1).coerceAtLeast(0))
+                    for (cx in 0 until tensorSize) {
+                        val srcOffsetX = if (roiSizePx == tensorSize) {
+                            cx
+                        } else {
+                            (cx * roiSizePx + (roiSizePx shr 1)) / tensorSize
                         }
-                        180 -> {
-                            bx = (rawW - 1 - ux).coerceIn(0, rawW - 1)
-                            by = (rawH - 1 - uy).coerceIn(0, rawH - 1)
+                        val ux = (cropLeft + srcOffsetX).coerceIn(0, (uprightW - 1).coerceAtLeast(0))
+                        val bx: Int
+                        val by: Int
+                        when (rot) {
+                            90 -> {
+                                bx = uy
+                                by = (rawH - 1 - ux).coerceIn(0, rawH - 1)
+                            }
+                            180 -> {
+                                bx = (rawW - 1 - ux).coerceIn(0, rawW - 1)
+                                by = (rawH - 1 - uy).coerceIn(0, rawH - 1)
+                            }
+                            270 -> {
+                                bx = (rawW - 1 - uy).coerceIn(0, rawW - 1)
+                                by = ux
+                            }
+                            else -> {
+                                bx = ux
+                                by = uy
+                            }
                         }
-                        270 -> {
-                            bx = (rawW - 1 - uy).coerceIn(0, rawW - 1)
-                            by = ux
+
+                        val yIndex = safeLumaByteIndex(bx, by, yRowStride, yPixStride, yLimit)
+                        val uvX = bx shr 1
+                        val uvY = by shr 1
+                        val uIndex = safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit)
+                        val vIndex = safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit)
+
+                        val yVal = yDup.get(yIndex).toInt() and 0xFF
+                        val uVal = (uBuf.get(uIndex).toInt() and 0xFF) - 128
+                        val vVal = (vBuf.get(vIndex).toInt() and 0xFF) - 128
+
+                        val r8 = (yVal + ((1436 * vVal) shr 10)).coerceIn(0, 255)
+                        val g8 = (yVal - ((352 * uVal + 731 * vVal) shr 10)).coerceIn(0, 255)
+                        val b8 = (yVal + ((1815 * uVal) shr 10)).coerceIn(0, 255)
+
+                        if (applyImageNetNormalization) {
+                            outCrop320RgbFloats[dstFloatIdx++] = (r8 * INV_255 - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R
+                            outCrop320RgbFloats[dstFloatIdx++] = (g8 * INV_255 - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G
+                            outCrop320RgbFloats[dstFloatIdx++] = (b8 * INV_255 - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B
+                        } else {
+                            outCrop320RgbFloats[dstFloatIdx++] = r8 * INV_255
+                            outCrop320RgbFloats[dstFloatIdx++] = g8 * INV_255
+                            outCrop320RgbFloats[dstFloatIdx++] = b8 * INV_255
                         }
-                        else -> {
-                            bx = ux
-                            by = uy
-                        }
-                    }
-
-                    val yIndex = (by * yRowStride + bx * yPixStride).coerceIn(0, yLimit - 1)
-                    val uvX = bx shr 1
-                    val uvY = by shr 1
-                    val uIndex = (uvY * uRowStride + uvX * uPixStride).coerceIn(0, uLimit - 1)
-                    val vIndex = (uvY * vRowStride + uvX * vPixStride).coerceIn(0, vLimit - 1)
-
-                    val yVal = yDup.get(yIndex).toInt() and 0xFF
-                    val uVal = (uBuf.get(uIndex).toInt() and 0xFF) - 128
-                    val vVal = (vBuf.get(vIndex).toInt() and 0xFF) - 128
-
-                    val r8 = (yVal + ((1436 * vVal) shr 10)).coerceIn(0, 255)
-                    val g8 = (yVal - ((352 * uVal + 731 * vVal) shr 10)).coerceIn(0, 255)
-                    val b8 = (yVal + ((1815 * uVal) shr 10)).coerceIn(0, 255)
-
-                    if (applyImageNetNormalization) {
-                        outCrop320RgbFloats[dstFloatIdx++] = (r8 * INV_255 - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R
-                        outCrop320RgbFloats[dstFloatIdx++] = (g8 * INV_255 - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G
-                        outCrop320RgbFloats[dstFloatIdx++] = (b8 * INV_255 - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B
-                    } else {
-                        outCrop320RgbFloats[dstFloatIdx++] = r8 * INV_255
-                        outCrop320RgbFloats[dstFloatIdx++] = g8 * INV_255
-                        outCrop320RgbFloats[dstFloatIdx++] = b8 * INV_255
                     }
                 }
             }
@@ -860,11 +869,63 @@ class PushBroomCropper(
             frameWidthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
             frameHeightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
         ): Pair<Int, Int> {
-            val maxLeft = (frameWidthPx - cropSizePx).coerceAtLeast(0)
-            val maxTop = (frameHeightPx - cropSizePx).coerceAtLeast(0)
-            val rawLeft = (centerXPx - cropSizePx * 0.5f).roundToInt()
-            val rawTop = (centerYPx - cropSizePx * 0.5f).roundToInt()
+            val safeW = frameWidthPx.coerceAtLeast(1)
+            val safeH = frameHeightPx.coerceAtLeast(1)
+            val safeSize = cropSizePx.coerceIn(1, min(safeW, safeH))
+            val maxLeft = (safeW - safeSize).coerceAtLeast(0)
+            val maxTop = (safeH - safeSize).coerceAtLeast(0)
+            val finiteCx = if (centerXPx.isFinite()) {
+                centerXPx.coerceIn(-100_000f, 100_000f)
+            } else {
+                safeW * 0.5f
+            }
+            val finiteCy = if (centerYPx.isFinite()) {
+                centerYPx.coerceIn(-100_000f, 100_000f)
+            } else {
+                safeH * 0.5f
+            }
+            val rawLeft = (finiteCx - safeSize * 0.5f).roundToInt()
+            val rawTop = (finiteCy - safeSize * 0.5f).roundToInt()
             return Pair(rawLeft.coerceIn(0, maxLeft), rawTop.coerceIn(0, maxTop))
+        }
+
+        /**
+         * Resolves a guaranteed in-bounds `Y` luminance byte offset in `[0, bufferLimit - 1]`.
+         */
+        internal fun safeLumaByteIndex(
+            bx: Int,
+            by: Int,
+            rowStride: Int,
+            pixelStride: Int,
+            bufferLimit: Int
+        ): Int {
+            if (bufferLimit <= 1) return 0
+            val safeStride = pixelStride.coerceAtLeast(1)
+            return (by * rowStride + bx * safeStride).coerceIn(0, bufferLimit - 1)
+        }
+
+        /**
+         * Resolves a guaranteed in-bounds `U`/`V` chroma byte offset in `[0, bufferLimit - 1]`
+         * while preserving semi-planar `NV12`/`NV21` (`pixelStride == 2`) channel parity on the
+         * bottom-right corner (`x = 1918..1919, y = 1078..1079`) where Android's `YUV_420_888`
+         * chroma `ByteBuffer.limit()` omits the trailing interleaved byte (`.agents/rules/android-camera-ar.md §1.1`).
+         */
+        internal fun safeChromaByteIndex(
+            uvX: Int,
+            uvY: Int,
+            rowStride: Int,
+            pixelStride: Int,
+            bufferLimit: Int
+        ): Int {
+            if (bufferLimit <= 1) return 0
+            val maxValid = bufferLimit - 1
+            val safeStride = pixelStride.coerceAtLeast(1)
+            var rawIdx = uvY * rowStride + uvX * safeStride
+            if (rawIdx > maxValid) {
+                val deficitSteps = ((rawIdx - maxValid + safeStride - 1) / safeStride).coerceAtLeast(1)
+                rawIdx -= deficitSteps * safeStride
+            }
+            return rawIdx.coerceIn(0, maxValid)
         }
 
         /**
