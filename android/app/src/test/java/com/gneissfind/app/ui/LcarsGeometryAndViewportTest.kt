@@ -108,6 +108,40 @@ class LcarsGeometryAndViewportTest {
     }
 
     @Test
+    fun `computePanoramicViewportTransform fullFrameLockOn fits uncropped 16x9 frame with EIS disabled`() {
+        val viewW = 1900f
+        val viewH = 410f
+
+        val t0 = computePanoramicViewportTransform(
+            viewportWidthPx = viewW,
+            viewportHeightPx = viewH,
+            cropYFloat = 0f,
+            swathTileMode = SwathTileMode.FIVE_TILE,
+            fullFrameLockOn = true
+        )
+        val t696 = computePanoramicViewportTransform(
+            viewportWidthPx = viewW,
+            viewportHeightPx = viewH,
+            cropYFloat = StripRoiGeometry.MAX_CROP_Y_PX.toFloat(),
+            swathTileMode = SwathTileMode.FIVE_TILE,
+            fullFrameLockOn = true
+        )
+
+        // Entire 1920x1080 16:9 frame fits inside [0..viewW] x [0..viewH] with zero cropping
+        assertThat(t0.frameLeftPx).isAtLeast(0f)
+        assertThat(t0.frameTopPx).isAtLeast(0f)
+        assertThat(t0.frameLeftPx + t0.renderedFrameWidthPx).isAtMost(viewW + 0.01f)
+        assertThat(t0.frameTopPx + t0.renderedFrameHeightPx).isAtMost(viewH + 0.01f)
+        assertThat(t0.renderedFrameWidthPx / t0.renderedFrameHeightPx)
+            .isWithin(1e-4f)
+            .of(16f / 9f)
+
+        // Frame position is invariant to cropYFloat when fullFrameLockOn = true (EIS translation disabled)
+        assertThat(t0.frameTopPx).isEqualTo(t696.frameTopPx)
+        assertThat(t0.frameLeftPx).isEqualTo(t696.frameLeftPx)
+    }
+
+    @Test
     fun `withValueLevel preserves HSV hue and saturation while stepping value by parameterized percentage`() {
         val families = listOf(
             LcarsColors.GoldenAmber,

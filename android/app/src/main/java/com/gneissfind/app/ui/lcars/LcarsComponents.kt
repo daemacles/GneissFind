@@ -455,7 +455,9 @@ fun LcarsElbow(
     outerRadius: Dp = LcarsOuterRadius,
     innerRadius: Dp = LcarsInnerRadius,
     armLabel: String? = null,
-    stemCode: String? = null
+    stemCode: String? = null,
+    armTextStyle: TextStyle = LcarsTypography.ElbowCode,
+    stemTextStyle: TextStyle = LcarsTypography.MicroCode
 ) {
     Box(modifier = modifier) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -487,7 +489,7 @@ fun LcarsElbow(
             ) {
                 Text(
                     text = armLabel.uppercase(Locale.US),
-                    style = LcarsTypography.ElbowCode,
+                    style = armTextStyle,
                     color = LcarsColors.CanvasBlack,
                     maxLines = 1,
                     overflow = TextOverflow.Clip
@@ -511,7 +513,7 @@ fun LcarsElbow(
             ) {
                 Text(
                     text = stemCode.uppercase(Locale.US),
-                    style = LcarsTypography.MicroCode,
+                    style = stemTextStyle,
                     color = LcarsColors.CanvasBlack,
                     maxLines = 1,
                     overflow = TextOverflow.Clip

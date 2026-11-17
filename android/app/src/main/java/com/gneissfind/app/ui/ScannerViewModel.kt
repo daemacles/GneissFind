@@ -488,14 +488,17 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Enters Stage 2 (`LOCK_ON_NEURAL`) on the visible [ConfirmedTarget] with the smallest
+     * Enters Stage 2 (`LOCK_ON_NEURAL`) on the visible enabled [ConfirmedTarget] with the smallest
      * [ConfirmedTarget.slantRangeMeters] (tie-breaking by horizontal proximity to viewport center).
      */
     fun lockNearestTarget() {
         val current = _uiState.value
         if (current.operatingMode != OperatingMode.SCAN) return
+        val enabledTargets = current.confirmedTargets.filter {
+            current.enabledClasses.contains(it.stoneClass)
+        }
         val nearest = LockOnPinpointController.selectNearestVisibleTarget(
-            targets = current.confirmedTargets,
+            targets = enabledTargets,
             stripGeometry = current.stripGeometry
         ) ?: return
         activateLockOnTarget(nearest)
@@ -503,9 +506,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Hit-tests a tap inside the `PATROL` push-broom viewport (`normalizedStripX`, `normalizedStripY`
-     * in `[0.0, 1.0]`) and enters `LOCK_ON_NEURAL` if a visible reticle was tapped.
+     * relative to the active strip ROI) and enters `LOCK_ON_NEURAL` if a visible enabled reticle
+     * was tapped within [minTouchSlopStripPx] (`>= 48.dp` screen-space equivalent).
      */
-    fun onPatrolViewportTapped(normalizedStripX: Float, normalizedStripY: Float) {
+    fun onPatrolViewportTapped(
+        normalizedStripX: Float,
+        normalizedStripY: Float,
+        minTouchSlopStripPx: Float = 56f
+    ) {
         onUserTouchInteraction()
         val current = _uiState.value
         if (current.operatingMode != OperatingMode.SCAN ||
@@ -513,12 +521,16 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         ) {
             return
         }
-        val tapX = normalizedStripX.coerceIn(0f, 1f) * current.stripGeometry.stripWidthPx
-        val tapY = normalizedStripY.coerceIn(0f, 1f) * StripRoiGeometry.STRIP_HEIGHT_PX
+        val tapX = normalizedStripX.coerceIn(-0.15f, 1.15f) * current.stripGeometry.stripWidthPx
+        val tapY = normalizedStripY.coerceIn(-0.25f, 1.25f) * StripRoiGeometry.STRIP_HEIGHT_PX
+        val enabledTargets = current.confirmedTargets.filter {
+            current.enabledClasses.contains(it.stoneClass)
+        }
         val hit = LockOnPinpointController.findTappedTargetInStrip(
-            targets = current.confirmedTargets,
+            targets = enabledTargets,
             tapStripXPx = tapX,
-            tapStripYPx = tapY
+            tapStripYPx = tapY,
+            touchSlopPx = minTouchSlopStripPx.coerceAtLeast(56f)
         ) ?: return
         activateLockOnTarget(hit)
     }

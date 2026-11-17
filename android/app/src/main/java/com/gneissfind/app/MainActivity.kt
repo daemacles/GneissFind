@@ -167,7 +167,9 @@ class MainActivity : ComponentActivity() {
                     onToggleTwoXCrop = viewModel::setTwoXCropEnabled,
                     onChangeExposureBias = viewModel::setExposureBiasEv,
                     onToggleAudioMute = viewModel::setAudioMuted,
-                    onToggleOverspeedTest = viewModel::toggleOverspeedTest
+                    onToggleEyesUpPatrol = viewModel::toggleEyesUpPatrol,
+                    onPatrolViewportTapped = viewModel::onPatrolViewportTapped,
+                    onToggleCentralLock = viewModel::toggleCentralLockButton
                 )
             }
         }
