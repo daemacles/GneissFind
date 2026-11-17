@@ -211,3 +211,64 @@ def test_generated_android_coco_metadata_json() -> None:
     assert stand_in_map["JASPER_RED_YELLOW"]["class_id"] == 53
     assert stand_in_map["GREEN_GEM_ROCK"]["class_id"] == 90
     assert stand_in_map["PETRIFIED_WOOD"]["class_id"] == 75
+
+
+def test_lockon_320_b1_w8dyn_gpu_cleanliness_and_stand_in_parity() -> None:
+    """Verifies the Milestone 2C B=1 320x320 K=100 W8-Dyn Lock-On split graphs and metadata."""
+    forbidden_gpu_ops = ("TOPK_V2", "GATHER_ND", "BROADCAST_TO", "FLOOR_DIV", "RELU_0_TO_1")
+    p1_name = "rf_detr_nano_part1_b1_320_w8dyn.tflite"
+    p2_name = "rf_detr_nano_part2_b1_320_k100_w8dyn.tflite"
+
+    assets_dir = METADATA_PATH.parent
+    for filename in (p1_name, p2_name):
+        artifact_path = ARTIFACTS_DIR / filename
+        asset_path = assets_dir / filename
+        assert artifact_path.is_file(), f"Missing Lock-On artifact {artifact_path}"
+        assert asset_path.is_file(), f"Missing staged Lock-On asset {asset_path}"
+        interp = Interpreter(model_path=str(artifact_path))
+        ops = Counter(op["op_name"] for op in interp._get_ops_details())
+        for op_name in forbidden_gpu_ops:
+            assert ops[op_name] == 0, f"{filename} unexpectedly contains {op_name}"
+        max_rank = max(len(t["shape"]) for t in interp.get_tensor_details())
+        assert max_rank <= 4, f"{filename} has tensor rank {max_rank} > 4"
+
+    lwdetr_320, eager_detector = load_prepared_lwdetr(resolution=320, num_queries=100)
+    pt_wrapper_320 = FusedRfDetrSingleGraph(lwdetr_320).eval()
+    interp_p1 = Interpreter(model_path=str(ARTIFACTS_DIR / p1_name), num_threads=4)
+    interp_p2 = Interpreter(model_path=str(ARTIFACTS_DIR / p2_name), num_threads=4)
+    interp_p1.allocate_tensors()
+    interp_p2.allocate_tensors()
+
+    assert interp_p1.get_input_details()[0]["shape"].tolist() == [1, 320, 320, 3]
+    assert interp_p1.get_output_details()[0]["shape"].tolist() == [1, 400, 256]
+    assert interp_p2.get_output_details()[0]["shape"].tolist() == [1, 100, 4]
+    assert interp_p2.get_output_details()[1]["shape"].tolist() == [1, 100, 91]
+
+    reports = verify_stand_in_fixtures(
+        pytorch_wrapper=pt_wrapper_320,
+        eager_detector=eager_detector,
+        tflite_runner=lambda b: run_two_graph_tflite(interp_p1, interp_p2, b, top_k=100),
+        fixtures_dir=FIXTURES_DIR,
+        min_box_iou=0.90,
+        max_score_tol=0.08,
+        resolution=320,
+        compare_class_max_scores=True,
+    )
+    assert {r.coco_label: r.empirical_class_id for r in reports} == {
+        "cup": 47,
+        "apple": 53,
+        "toothbrush": 90,
+        "remote": 75,
+    }
+
+    lockon_meta_path = assets_dir / "rf_detr_320_b1_metadata.json"
+    assert lockon_meta_path.is_file(), f"Missing {lockon_meta_path}"
+    payload = json.loads(lockon_meta_path.read_text(encoding="utf-8"))
+    assert payload["model_name"] == "rf_detr_nano_320_b1_w8dyn"
+    assert payload["input_resolution"] == 320
+    assert payload["batch_size"] == 1
+    assert payload["num_queries"] == 100
+    assert payload["encoder_grid_hw"] == [20, 20]
+    assert payload["num_encoder_tokens"] == 400
+    assert payload["quantization"] == "dynamic_wi8_afp32"
+

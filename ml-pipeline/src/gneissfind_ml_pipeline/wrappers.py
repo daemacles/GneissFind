@@ -623,9 +623,12 @@ def host_select_topk_queries(
         ``(B, top_k, C)``, ``(B, top_k, 4)``, and ``(B, top_k)``.
     """
     batch_size, num_tokens, _ = output_memory_prenorm.shape
-    proposals_table = (
-        base_proposals if base_proposals is not None else build_base_proposals_np()
-    )
+    if base_proposals is not None:
+        proposals_table = base_proposals
+    else:
+        grid_side = int(round(num_tokens**0.5))
+        grid_hw = (grid_side, grid_side) if grid_side * grid_side == num_tokens else ENCODER_GRID_HW
+        proposals_table = build_base_proposals_np(grid_hw=grid_hw)
     token_order = np.arange(num_tokens, dtype=np.int64)
 
     selected_indices = np.empty((batch_size, top_k), dtype=np.int64)

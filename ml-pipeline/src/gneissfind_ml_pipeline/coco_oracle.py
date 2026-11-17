@@ -318,24 +318,32 @@ def verify_stand_in_fixtures(
     fixtures_dir: Path,
     min_box_iou: float = 0.85,
     max_score_tol: float = 1e-2,
+    resolution: int = DEFAULT_INPUT_RESOLUTION,
+    compare_class_max_scores: bool = False,
 ) -> list[FixtureParityReport]:
     """Empirically verifies COCO class IDs and PyTorch-vs-LiteRT parity on the 4 stand-in fixtures.
 
     Asserts on every fixture that:
     1. Both PyTorch and LiteRT activate the same top-1 integer ``class_id``.
     2. ``COCO_CLASSES[class_id]`` equals the expected household label (``cup``, ``apple``,
-       ``toothbrush``, ``remote``), Cross-checked against ``eager_detector.predict()``.
-    3. ``|pt_scores - tflite_scores| <= max_score_tol`` across all ``300 x 91`` query/class entries.
+       ``toothbrush``, ``remote``), cross-checked against ``eager_detector.predict()``.
+    3. ``|pt_scores - tflite_scores| <= max_score_tol`` across all query/class entries (or across
+       permutation-invariant per-class maxima when ``compare_class_max_scores=True`` for quantized
+       two-stage models where ``TopK`` rank ties can permute query indices).
     4. Pixel-space ``xyxy`` IoU between PyTorch and LiteRT top-1 boxes is ``>= min_box_iou``.
 
     Args:
         pytorch_wrapper: Eval-mode :class:`FusedRfDetrSingleGraph` instance.
         eager_detector: Unmodified ``RFDETRNano`` detector for ``predict()`` cross-checking.
-        tflite_runner: Callable ``(nhwc_1x384x384x3) -> (boxes_cxcywh, scores)`` backed by LiteRT.
+        tflite_runner: Callable ``(nhwc_1xHxWx3) -> (boxes_cxcywh, scores)`` backed by LiteRT.
         fixtures_dir: Directory containing ``sample_cup.jpg``, ``sample_apple.jpg``,
             ``sample_toothbrush.jpg``, and ``sample_remote.jpg``.
         min_box_iou: Minimum required top-1 bounding-box IoU between PyTorch and LiteRT.
-        max_score_tol: Maximum tolerated absolute probability difference across all queries.
+        max_score_tol: Maximum tolerated absolute probability difference.
+        resolution: Square input resolution in pixels (``384`` default, ``320`` for Lock-On).
+        compare_class_max_scores: When ``True``, measures max score delta over per-class max
+            probabilities ``(91,)`` so ``W8-Dyn`` Stage-1 ``TopK`` rank tie swaps do not trigger
+            spurious index-aligned diffs.
 
     Returns:
         Ordered list of :class:`FixtureParityReport`, one per entry in ``STAND_IN_SPECS``.
@@ -350,7 +358,7 @@ def verify_stand_in_fixtures(
         if not fixture_path.is_file():
             raise FileNotFoundError(f"Missing stand-in verification fixture: {fixture_path}")
 
-        nhwc = load_nhwc_rgb_01(fixture_path)
+        nhwc = load_nhwc_rgb_01(fixture_path, resolution=resolution)
         with torch.no_grad():
             pt_boxes_t, pt_scores_t = pytorch_wrapper(torch.from_numpy(nhwc))
         pt_boxes = pt_boxes_t.numpy()[0]
@@ -360,7 +368,12 @@ def verify_stand_in_fixtures(
         tf_boxes = tf_boxes_b[0]
         tf_scores = tf_scores_b[0]
 
-        max_score_diff = float(np.max(np.abs(pt_scores - tf_scores)))
+        if compare_class_max_scores:
+            max_score_diff = float(
+                np.max(np.abs(np.max(pt_scores, axis=0) - np.max(tf_scores, axis=0)))
+            )
+        else:
+            max_score_diff = float(np.max(np.abs(pt_scores - tf_scores)))
         confident_q = np.max(pt_scores, axis=-1) >= 0.05
         # Measure box delta on confident queries so rank-300 background TopK ties (~1e-3 score)
         # do not masquerade as coordinate drift.
@@ -394,8 +407,8 @@ def verify_stand_in_fixtures(
             f"{spec.coco_label}: RFDETRNano.predict top class {eager_preds.class_id[:1]} != {pt_cid}"
         )
 
-        pt_xyxy = cxcywh_norm_to_xyxy_px(pt_boxes[pt_q])
-        tf_xyxy = cxcywh_norm_to_xyxy_px(tf_boxes[tf_q])
+        pt_xyxy = cxcywh_norm_to_xyxy_px(pt_boxes[pt_q], resolution=resolution)
+        tf_xyxy = cxcywh_norm_to_xyxy_px(tf_boxes[tf_q], resolution=resolution)
         iou = compute_xyxy_iou(pt_xyxy, tf_xyxy)
         assert iou >= min_box_iou, (
             f"{spec.coco_label}: top box IoU {iou:.4f} < {min_box_iou}"
@@ -420,6 +433,10 @@ def verify_stand_in_fixtures(
 def build_coco_metadata(
     reports: list[FixtureParityReport],
     *,
+    model_name: str = "rf_detr_nano_coco",
+    input_resolution: int = DEFAULT_INPUT_RESOLUTION,
+    encoder_grid_hw: tuple[int, int] = ENCODER_GRID_HW,
+    quantization: str | None = None,
     batch_size: int = 5,
     topology: str = "two_graph",
     num_queries: int = 300,
@@ -429,13 +446,17 @@ def build_coco_metadata(
     part1_asset: str = "rf_detr_nano_part1_backbone_encoder.tflite",
     part2_asset: str = "rf_detr_nano_part2_decoder_head.tflite",
 ) -> dict[str, Any]:
-    """Constructs the JSON-serializable ``rf_detr_coco_metadata.json`` payload from verified reports.
+    """Constructs the JSON-serializable COCO metadata payload from verified reports.
 
-    Follows the schema specified in `.agents/rules/litert-inference.md` §4 while adding explicit
+    Follows the schema specified in `.agents/rules/litert-inference.md` while adding explicit
     tensor layout, proposal grid, and asset filename metadata for the Kotlin GPU runner.
 
     Args:
         reports: Empirically verified :class:`FixtureParityReport` entries for all 4 target classes.
+        model_name: Logical model identifier written into ``model_name``.
+        input_resolution: Square input resolution in pixels (``384`` or ``320``).
+        encoder_grid_hw: ``(height, width)`` of the encoder feature token grid.
+        quantization: Optional weight quantization recipe string (e.g., ``"dynamic_wi8_afp32"``).
         batch_size: Default static tile batch size bundled into ``assets/`` (``1`` or ``5``).
         topology: Default bundled graph topology (``"single_graph"`` or ``"two_graph"``).
         num_queries: Decoder object query count per tile.
@@ -468,10 +489,10 @@ def build_coco_metadata(
             "top_box_iou": round(rep.top_box_iou, 6),
         }
 
-    return {
-        "model_name": "rf_detr_nano_coco",
+    payload: dict[str, Any] = {
+        "model_name": model_name,
         "rfdetr_version": pkg_version("rfdetr"),
-        "input_resolution": DEFAULT_INPUT_RESOLUTION,
+        "input_resolution": input_resolution,
         "input_layout": "NHWC_RGB_FLOAT32_0_TO_1",
         "fused_normalization": {
             "mean": list(IMAGENET_MEAN_RGB),
@@ -484,8 +505,8 @@ def build_coco_metadata(
             "part1": part1_asset,
             "part2": part2_asset,
         },
-        "encoder_grid_hw": list(ENCODER_GRID_HW),
-        "num_encoder_tokens": ENCODER_GRID_HW[0] * ENCODER_GRID_HW[1],
+        "encoder_grid_hw": list(encoder_grid_hw),
+        "num_encoder_tokens": encoder_grid_hw[0] * encoder_grid_hw[1],
         "hidden_dim": 256,
         "proposal_default_wh": DEFAULT_PROPOSAL_WH,
         "num_queries": num_queries,
@@ -499,6 +520,9 @@ def build_coco_metadata(
         "unmapped_confident_to_hard_confuser": True,
         "empirical_verification": verification_summary,
     }
+    if quantization is not None:
+        payload["quantization"] = quantization
+    return payload
 
 
 def write_coco_metadata(metadata: dict[str, Any], output_path: Path) -> Path:
