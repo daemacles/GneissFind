@@ -85,7 +85,9 @@ dependencies {
 
     implementation(libs.google.ar.core)
     implementation(libs.litert)
+    implementation(libs.litert.api)
     implementation(libs.litert.gpu)
+    implementation(libs.litert.npu.google.tensor)
 
     implementation(libs.kotlinx.coroutines.android)
 

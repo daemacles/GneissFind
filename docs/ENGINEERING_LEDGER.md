@@ -196,6 +196,27 @@ All 19 Kotlin source and test files under `android/app/src` were annotated to co
 
 ---
 
+### 3.6. Milestone 2B — >= 5.0 Hz Sustained Full-Swath Detection, `W8-Dyn` GPU Quantization & 180s Thermal Soaks (`exp/m2b-fps-exploration`)
+
+Full report, 27-configuration Pareto table, and Tensor G5 NPU postmortem: [`docs/M2B_OVERNIGHT_REPORT.md`](M2B_OVERNIGHT_REPORT.md).
+
+1. **Root Cause of Live-App (`420–577 ms`) vs. CLI (`117.7 ms`) Latency Gap:**
+   - Holding CameraX `ImageProxy` (`HardwareBuffer` / Gralloc surface) open on `GneissFind-Analyzer` for the entire `350–500 ms` GPU inference starved the Camera2 `ImageReader` queue and contended with 120 Hz `PreviewView` rendering.
+   - `RfDetrTwoGraphGpuDetector` previously performed a synchronous `5.9 MB` GPU->CPU->GPU copy of `part1Outputs[0]` (`encMemory`) into `part2Inputs[0]` every sweep.
+   - `104.5 MB` of unquantized model weights saturated LPDDR5X bandwidth when running concurrently with Camera2 ISP (`1656x1240` RAW10 + YUV420) and 120 Hz SurfaceFlinger composition, driving `pixel-thermal` into `Thermal Status: 1` within 50 seconds.
+2. **Architectural & Model Optimizations Implemented:**
+   - **3-Slot Lock-Free Producer-Consumer Pipeline (`ScannerViewModel.kt`):** `onFrameCaptured` extracts the `1792x384` YUV tiles into a 3-slot `PreparedSweepSlot` ring buffer in `~3 ms` on `GneissFind-Analyzer`, calls `imageProxy.close()` immediately, and dispatches GPU inference asynchronously on a dedicated `GneissFind-Inference` thread (`420.4 ms -> 352.7 ms` on the `384 B=5` baseline alone).
+   - **Zero-Copy `encMemory` GPU Buffer Binding (`RfDetrTwoGraphGpuDetector.kt`):** Passes `part1Outputs[0]` directly as `part2Inputs[0]` (`part2ZeroCopyInputs`), eliminating the `5.9 MB` host copy.
+   - **`W8-Dyn` (`dynamic_wi8_afp32`) GPU Weight Quantization + LiteRT `2.3.2` (`allowSrcQuantizedFcConvOps = true`):** Compresses `RF-DETR-Nano Part 1 + Part 2` by **`3.7x` (`104.5 MB -> 28.1 MB`)** with **0.0% recall loss** (unlike static `W8A8` which collapses ViT small-pebble recall from `100% -> 12.5%` and triggers `kLiteRtStatusErrorNotFound` / JNI faults under `Accelerator.NPU`), cutting `Part 1` GPU time by `28–33%`.
+   - **Top-K=`100` Decoder Surgery + Priority-Aware `B=3` Even/Odd Sub-Swath Interleaving:** Reduces Stage-2 decoder queries from `300 -> 100` (`-46%` Part 2 latency, `0.0%` recall loss) and interleaves `{0, 2, 4}` and `{1, prio, 3}` tiles while always including the highest-priority active target tile on every sweep.
+3. **180-Second Continuous Live-App Thermal Soak Results on Pixel 10 Pro XL (`58110DLCQ00003`):**
+   - **`S-01` (`RF-DETR 256 B=3 W8-DYN`, Default Apache-2.0):** **`108.2 ms` (`9.24 FPS`) cold** (beating the `>= 8.0 FPS` stretch goal) and **`152.2 ms` (`6.57 FPS` batch / priority target tile, `3.29 Hz` full 5-tile swath) sustained at `t = 150..180s`** (`100%` Med recall, `87.5%` Small `38-45px` recall).
+   - **`S-02` (`RF-DETR 320 B=3 W8-DYN`, `100%` Small Recall Apache-2.0):** **`141.5 ms` (`7.07 FPS`) cold** and **`187.9–204.2 ms` (`4.90–5.32 FPS`) at `Thermal Status: 1`** with **`100.0%` Med recall, `100.0%` Small `38-45px` recall, and `91.7%` All-Small `28-45px` recall**.
+   - **`S-03` (`RF-DETR 256 B=5 W8-DYN`, All 5 Tiles Every Sweep Apache-2.0):** **`158.0 ms` (`6.33 FPS`) cold** and **`206.0 ms` (`4.85 FPS` across all 5 tiles simultaneously) at `t = 150..180s`** (`3.2x` faster than the `577 ms` baseline).
+   - **`S-04` (`YOLO26-S 384 B=5 GPU`, AGPL-3.0 Reference):** **`76.1 ms` (`13.15 FPS`) cold** and **`128.3 ms` (`7.80 FPS` across all 5 tiles) at `t = 150..180s`**.
+
+---
+
 ## 4. Current Android Architecture & Interfaces for Milestone 3 / 4 Coordination
 
 > [!TIP]
@@ -216,7 +237,7 @@ When planning or modifying upcoming milestones in `docs/ROADMAP.md` or `ml-pipel
 - **Detector Interface (`com.gneissfind.app.inference.StoneDetector`):**
   - `fun detectSweep(sweepBuffers: PushBroomSweepBuffers): SweepInferenceResult`
   - Implementations:
-    - `RfDetrTwoGraphGpuDetector` *(Default active backend)*: LiteRT 2.x (`com.google.ai.edge.litert:litert:2.1.3`) GPU FP16 runner executing `rf_detr_nano_part1_backbone_encoder.tflite` (`B=5`) + zero-allocation Kotlin `selectTopKProposalsFromMaxScores` (`K=300` of `576` tokens) + `rf_detr_nano_part2_decoder_head.tflite` (`B=5`), driven by `assets/rf_detr_coco_metadata.json` (`O(1)` lookup table routing `cup=47 -> 0`, `apple=53 -> 1`, `toothbrush=90 -> 2`, `remote=75 -> 3`, and all other confident classes `-> 4 HARD_CONFUSER`). Supports hot-swapping 1-Graph/2-Graph and `B=1`/`B=5` models via `benchmark_override.json` (`scripts/benchmark_pixel10.sh`).
+    - `RfDetrTwoGraphGpuDetector` *(Default active backend)*: LiteRT `2.3.2` (`com.google.ai.edge.litert:litert:2.3.2`) self-configuring 1-Graph/2-Graph GPU FP16 + `W8-Dyn` (`allowSrcQuantizedFcConvOps = true`) runner supporting `LiveModelProfile` hot-swapping from `LcarsSourceDrawerOverlay` (`RFDETR_NANO_256_B3_INTERLEAVED`, `RFDETR_NANO_320_B3_INTERLEAVED`, `RFDETR_NANO_256_B5_K100`, `YOLO26S_384_B5_GPU`, `RFDETR_NANO_384_BASELINE`), zero-copy `part1Outputs[0]` (`encMemory`) passthrough, 1D precomputed bilinear resampling (`384 -> 320/256`), `80`-class contiguous & `91`-class sparse COCO LUTs, intra-tile greedy NMS (`IoU >= 0.45`), and Priority-Aware `B=3` Even/Odd Sub-Swath Interleaving.
     - `SyntheticStoneDetector`: deterministic moving-gravel simulator (`MIXED_GRAVEL_WALK`, `AGATE_PEBBLE_20MM`, `JASPER_COBBLE_55MM`) selectable from `SourceSelectionDrawer`.
 - **Field Data Logger (`com.gneissfind.app.logging.FieldDataLogger`):**
   - When `MOD` is toggled to `LOG` (`OperatingMode.LOG_DATA`), saves lossless `1792 x 384` (or `1088 x 384`) PNG strips at `4.0 Hz` alongside `metadata.jsonl` (`FieldStripMetadata`: timestamp, strip dimensions, tile count, zoom ratio, exposure ns, ISO, shutter clamp state, EV bias, IMU pitch, reference pitch, stabilized `cropY`, slant range `R`, GSD `mm/px`, and horizontal walk speed `m/s`) for Milestone 3 `SAM 2` auto-labeling on the Dell T7920.

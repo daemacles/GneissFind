@@ -36,6 +36,11 @@ OUT_FILE="${1:-/tmp/gneissfind-sync.md}"
   done
   echo "## Engineering Ledger (docs/ENGINEERING_LEDGER.md)"
   cat "$REPO_ROOT/docs/ENGINEERING_LEDGER.md"
+  if [[ -f "$REPO_ROOT/docs/M2B_OVERNIGHT_REPORT.md" ]]; then
+    echo ""
+    echo "## Milestone 2B Overnight Report (docs/M2B_OVERNIGHT_REPORT.md)"
+    cat "$REPO_ROOT/docs/M2B_OVERNIGHT_REPORT.md"
+  fi
 } > "$OUT_FILE"
 
 echo "Wrote sync bundle to $OUT_FILE ($(wc -c < "$OUT_FILE") bytes)"
