@@ -23,6 +23,7 @@ import com.gneissfind.app.model.StripDetection
 import com.gneissfind.app.model.StripRoiGeometry
 import com.gneissfind.app.model.SwathTileMode
 import com.gneissfind.app.model.WorldPoint3D
+import com.gneissfind.app.model.WorldRay3D
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -312,5 +313,129 @@ class TemporalTargetTrackerTest {
 
         // Target is marked not visible in strip -> suppresses floating ghost reticles!
         assertThat(reprojectedOffScreen.isVisibleInStrip).isFalse()
+    }
+
+    @Test
+    fun trackLevelSpatialNms_mergesDuplicateSameClassTracksWithin3Point2DegOr75Mm_andKeepsDistinctStones() {
+        val tracker = TemporalTargetTracker()
+        val rayCenter = WorldRay3D(eastX = 0.0f, northY = 0.70710677f, upZ = -0.70710677f).normalized()
+        // ~2.3 deg East offset (< 3.2 deg NMS gate) and 60 mm ground separation (< 75 mm NMS gate)
+        val rayDuplicate = WorldRay3D(eastX = 0.040f, northY = 0.70710677f, upZ = -0.70710677f).normalized()
+        // ~18 deg East offset (> 3.2 deg) and 0.48 m ground separation -> genuinely separate stone
+        val raySeparate = WorldRay3D(eastX = 0.320f, northY = 0.70710677f, upZ = -0.70710677f).normalized()
+
+        val primaryCand = ProjectedCandidate(
+            stripDetection = StripDetection(
+                stoneClass = StoneClass.CHALCEDONY_AGATE,
+                confidence = 0.91f,
+                leftPx = 700f,
+                topPx = 160f,
+                rightPx = 760f,
+                bottomPx = 220f,
+                estimatedDiameterMm = 35f,
+                sourceTileIndex = 1
+            ),
+            worldPosition = WorldPoint3D(xMeters = 0.00f, yMeters = 0f, zMeters = 1.06f),
+            slantRangeMeters = 1.50f,
+            refinedDiameterMm = 35f,
+            worldRay = rayCenter,
+            angularWidthRad = 0.020f,
+            angularHeightRad = 0.020f
+        )
+        val seamDuplicateCand = ProjectedCandidate(
+            stripDetection = StripDetection(
+                stoneClass = StoneClass.CHALCEDONY_AGATE,
+                confidence = 0.78f,
+                leftPx = 810f,
+                topPx = 162f,
+                rightPx = 865f,
+                bottomPx = 218f,
+                estimatedDiameterMm = 34f,
+                sourceTileIndex = 2
+            ),
+            worldPosition = WorldPoint3D(xMeters = 0.060f, yMeters = 0f, zMeters = 1.06f),
+            slantRangeMeters = 1.50f,
+            refinedDiameterMm = 34f,
+            worldRay = rayDuplicate,
+            angularWidthRad = 0.019f,
+            angularHeightRad = 0.019f
+        )
+        val separateAgateCand = ProjectedCandidate(
+            stripDetection = StripDetection(
+                stoneClass = StoneClass.CHALCEDONY_AGATE,
+                confidence = 0.86f,
+                leftPx = 1320f,
+                topPx = 160f,
+                rightPx = 1380f,
+                bottomPx = 220f,
+                estimatedDiameterMm = 38f,
+                sourceTileIndex = 3
+            ),
+            worldPosition = WorldPoint3D(xMeters = 0.48f, yMeters = 0f, zMeters = 1.06f),
+            slantRangeMeters = 1.55f,
+            refinedDiameterMm = 38f,
+            worldRay = raySeparate,
+            angularWidthRad = 0.020f,
+            angularHeightRad = 0.020f
+        )
+        val adjacentJasperCand = primaryCand.copy(
+            stripDetection = primaryCand.stripDetection.copy(stoneClass = StoneClass.JASPER_RED_YELLOW)
+        )
+
+        val sweepCandidates = listOf(primaryCand, seamDuplicateCand, separateAgateCand, adjacentJasperCand)
+        tracker.updateSweep(sweepCandidates, timestampNs = 1_000_000_000L)
+        val out2 = tracker.updateSweep(sweepCandidates, timestampNs = 1_150_000_000L)
+
+        // Expect exactly 2 Agates (duplicate merged!) and 1 Jasper = 3 confirmed targets total
+        val confirmedAgates = out2.confirmedTargets.filter { it.stoneClass == StoneClass.CHALCEDONY_AGATE }
+        val confirmedJaspers = out2.confirmedTargets.filter { it.stoneClass == StoneClass.JASPER_RED_YELLOW }
+        assertThat(confirmedAgates).hasSize(2)
+        assertThat(confirmedJaspers).hasSize(1)
+        assertThat(out2.totalCandidateTracks).isEqualTo(3)
+    }
+
+    @Test
+    fun trackLevelSpatialNms_mergesOverlappingStripBoxesByIomEvenBeyond75Mm() {
+        val tracker = TemporalTargetTracker()
+        val outerBox = ProjectedCandidate(
+            stripDetection = StripDetection(
+                stoneClass = StoneClass.GREEN_GEM_ROCK,
+                confidence = 0.89f,
+                leftPx = 600f,
+                topPx = 140f,
+                rightPx = 700f,
+                bottomPx = 240f,
+                estimatedDiameterMm = 58f,
+                sourceTileIndex = 1
+            ),
+            worldPosition = WorldPoint3D(xMeters = 0.00f, yMeters = 0f, zMeters = 1.00f),
+            slantRangeMeters = 1.45f,
+            refinedDiameterMm = 58f
+        )
+        // Nested 40x40 box inside the 100x100 box: IoU = 1600/10000 = 0.16 (< 0.35),
+        // but IoM = 1600/1600 = 1.00 (>= 0.60), and 3D distance = 110 mm (> 75 mm).
+        val nestedFragmentBox = ProjectedCandidate(
+            stripDetection = StripDetection(
+                stoneClass = StoneClass.GREEN_GEM_ROCK,
+                confidence = 0.76f,
+                leftPx = 630f,
+                topPx = 170f,
+                rightPx = 670f,
+                bottomPx = 210f,
+                estimatedDiameterMm = 24f,
+                sourceTileIndex = 2
+            ),
+            worldPosition = WorldPoint3D(xMeters = 0.11f, yMeters = 0f, zMeters = 1.00f),
+            slantRangeMeters = 1.45f,
+            refinedDiameterMm = 24f
+        )
+
+        val both = listOf(outerBox, nestedFragmentBox)
+        tracker.updateSweep(both, timestampNs = 1_000_000_000L)
+        tracker.updateSweep(both, timestampNs = 1_100_000_000L)
+        val out3 = tracker.updateSweep(both, timestampNs = 1_200_000_000L)
+
+        assertThat(out3.confirmedTargets).hasSize(1)
+        assertThat(out3.confirmedTargets.single().smoothedConfidence).isGreaterThan(0.85f)
     }
 }

@@ -307,21 +307,14 @@ class TemporalTargetTracker(
         //      missed sweep during camera motion does not drop an active lock.
         val minVotesToMaintain = min(DEFAULT_MIN_VOTES_TO_MAINTAIN, minVotesToConfirm)
         for (track in activeTracks) {
-            val hits = track.hitSweepIds.size
-            if (hits >= minVotesToConfirm) {
-                track.isConfirmedLatch = true
-            } else if (
-                enableFastConsecutiveLock &&
-                track.worldRay != null &&
-                hits >= FAST_LOCK_CONSECUTIVE_HITS &&
-                track.smoothedConfidence >= FAST_LOCK_MIN_CONFIDENCE &&
-                hasTwoConsecutiveRecentHits(track.hitSweepIds, sweepId)
-            ) {
-                track.isConfirmedLatch = true
-            } else if (track.isConfirmedLatch && hits < minVotesToMaintain) {
-                track.isConfirmedLatch = false
-            }
+            updateTrackConfirmationLatch(track, sweepId, minVotesToMaintain)
         }
+
+        // 6. Track-Level Spatial NMS (.agents/rules/android-camera-ar.md §3):
+        //    Merge/suppress duplicate tracks of the same StoneClass when within <= 3.2 deg world-ray
+        //    separation, <= 75 mm 3D ground distance, or strip box IoU >= 0.35 / IoM >= 0.60 so a
+        //    single physical target never spawns overlapping reticles.
+        suppressAndMergeDuplicateTracks(sweepId, minVotesToMaintain)
 
         val confirmed = activeTracks
             .filter { it.isConfirmedLatch }
@@ -349,6 +342,7 @@ class TemporalTargetTracker(
             .sortedWith(
                 compareByDescending<ConfirmedTarget> { it.hitCountInWindow }
                     .thenByDescending { it.smoothedConfidence }
+                    .thenBy { it.trackId }
             )
 
         return TrackerSweepOutput(
@@ -356,6 +350,160 @@ class TemporalTargetTracker(
             speedState = speedState,
             totalCandidateTracks = activeTracks.size
         )
+    }
+
+    /** Updates [TrackEntry.isConfirmedLatch] according to N-of-M voting, fast 2-hit lock, and hysteresis. */
+    private fun updateTrackConfirmationLatch(
+        track: TrackEntry,
+        sweepId: Long,
+        minVotesToMaintain: Int
+    ) {
+        val hits = track.hitSweepIds.size
+        if (hits >= minVotesToConfirm) {
+            track.isConfirmedLatch = true
+        } else if (
+            enableFastConsecutiveLock &&
+            track.worldRay != null &&
+            hits >= FAST_LOCK_CONSECUTIVE_HITS &&
+            track.smoothedConfidence >= FAST_LOCK_MIN_CONFIDENCE &&
+            hasTwoConsecutiveRecentHits(track.hitSweepIds, sweepId)
+        ) {
+            track.isConfirmedLatch = true
+        } else if (track.isConfirmedLatch && hits < minVotesToMaintain) {
+            track.isConfirmedLatch = false
+        }
+    }
+
+    /**
+     * Runs greedy Track-Level Spatial NMS across [activeTracks], keeping confirmed, higher-vote,
+     * higher-confidence, older-ID tracks and absorbing duplicate same-class tracks within
+     * [TRACK_NMS_MAX_ANGULAR_DEG], [TRACK_NMS_MAX_DISTANCE_METERS], or same-pose strip
+     * [TRACK_NMS_MIN_IOU] / [TRACK_NMS_MIN_IOM].
+     */
+    private fun suppressAndMergeDuplicateTracks(
+        sweepId: Long,
+        minVotesToMaintain: Int
+    ) {
+        if (activeTracks.size <= 1) return
+
+        activeTracks.sortWith(
+            compareByDescending<TrackEntry> { it.isConfirmedLatch }
+                .thenByDescending { it.hitSweepIds.size }
+                .thenByDescending { it.smoothedConfidence }
+                .thenBy { it.trackId }
+        )
+
+        val survivors = ArrayList<TrackEntry>(activeTracks.size)
+        for (candidate in activeTracks) {
+            var mergedInto: TrackEntry? = null
+            for (winner in survivors) {
+                if (winner.stoneClass != candidate.stoneClass) continue
+                if (areTracksSpatialDuplicates(winner, candidate)) {
+                    mergedInto = winner
+                    break
+                }
+            }
+            if (mergedInto != null) {
+                mergeDuplicateIntoWinner(mergedInto, candidate, sweepId, minVotesToMaintain)
+            } else {
+                survivors.add(candidate)
+            }
+        }
+
+        if (survivors.size != activeTracks.size) {
+            activeTracks.clear()
+            activeTracks.addAll(survivors)
+        }
+    }
+
+    /**
+     * Returns `true` when [a] and [b] represent the same physical target under any of the three
+     * Milestone 2C Track-Level Spatial NMS criteria:
+     * 1. World-ray angular separation `<= 3.2 deg`,
+     * 2. 3D ground-plane distance `<= 75 mm` (`0.075 m`), or
+     * 3. Strip bounding-box overlap `IoU >= 0.35` or `IoM >= 0.60` (evaluated when at least one
+     *    track lacks a 3D world ray or when both strip boxes come from the same sweep / nearby
+     *    world bearing so camera rotation across sweeps cannot falsely merge far-apart stones).
+     */
+    private fun areTracksSpatialDuplicates(a: TrackEntry, b: TrackEntry): Boolean {
+        val rayA = a.worldRay
+        val rayB = b.worldRay
+        if (rayA != null && rayB != null) {
+            if (rayA.angularDistanceDegTo(rayB) <= TRACK_NMS_MAX_ANGULAR_DEG) {
+                return true
+            }
+        }
+        if (a.worldPosition.distanceMetersTo(b.worldPosition) <= TRACK_NMS_MAX_DISTANCE_METERS) {
+            return true
+        }
+
+        val allowStripBoxCheck = rayA == null ||
+            rayB == null ||
+            a.lastTimestampNs == b.lastTimestampNs ||
+            rayA.angularDistanceDegTo(rayB) <= DEFAULT_MAX_ANGULAR_DISTANCE_DEG * 1.5f
+        if (allowStripBoxCheck) {
+            val (iou, iom) = computeTrackBoxIouAndIom(a, b)
+            if (iou >= TRACK_NMS_MIN_IOU || iom >= TRACK_NMS_MIN_IOM) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Computes `(IoU, IoM)` between the strip-space bounding boxes of [a] and [b]. */
+    private fun computeTrackBoxIouAndIom(a: TrackEntry, b: TrackEntry): Pair<Float, Float> {
+        val interL = max(a.stripLeftPx, b.stripLeftPx)
+        val interT = max(a.stripTopPx, b.stripTopPx)
+        val interR = min(a.stripRightPx, b.stripRightPx)
+        val interB = min(a.stripBottomPx, b.stripBottomPx)
+        val interW = (interR - interL).coerceAtLeast(0f)
+        val interH = (interB - interT).coerceAtLeast(0f)
+        val interArea = interW * interH
+        if (interArea <= 0f) return 0f to 0f
+
+        val areaA = (a.stripRightPx - a.stripLeftPx).coerceAtLeast(0f) *
+            (a.stripBottomPx - a.stripTopPx).coerceAtLeast(0f)
+        val areaB = (b.stripRightPx - b.stripLeftPx).coerceAtLeast(0f) *
+            (b.stripBottomPx - b.stripTopPx).coerceAtLeast(0f)
+        val union = areaA + areaB - interArea
+        val minArea = min(areaA, areaB)
+        val iou = if (union > 0f) (interArea / union).coerceIn(0f, 1f) else 0f
+        val iom = if (minArea > 0f) (interArea / minArea).coerceIn(0f, 1f) else 0f
+        return iou to iom
+    }
+
+    /** Absorbs [duplicate]'s unique sweep votes and fresher pose/confidence into [winner]. */
+    private fun mergeDuplicateIntoWinner(
+        winner: TrackEntry,
+        duplicate: TrackEntry,
+        sweepId: Long,
+        minVotesToMaintain: Int
+    ) {
+        if (duplicate.hitSweepIds.isNotEmpty()) {
+            val mergedSweeps = ArrayList<Long>(winner.hitSweepIds.size + duplicate.hitSweepIds.size)
+            mergedSweeps.addAll(winner.hitSweepIds)
+            for (s in duplicate.hitSweepIds) {
+                if (s !in mergedSweeps) {
+                    mergedSweeps.add(s)
+                }
+            }
+            mergedSweeps.sort()
+            winner.hitSweepIds.clear()
+            val startIdx = (mergedSweeps.size - rollingWindowSweeps).coerceAtLeast(0)
+            for (i in startIdx until mergedSweeps.size) {
+                winner.hitSweepIds.addLast(mergedSweeps[i])
+            }
+        }
+        winner.smoothedConfidence = max(winner.smoothedConfidence, duplicate.smoothedConfidence)
+        if (duplicate.lastTimestampNs > winner.lastTimestampNs) {
+            winner.stripLeftPx = duplicate.stripLeftPx
+            winner.stripTopPx = duplicate.stripTopPx
+            winner.stripRightPx = duplicate.stripRightPx
+            winner.stripBottomPx = duplicate.stripBottomPx
+            winner.lastTimestampNs = duplicate.lastTimestampNs
+        }
+        winner.isConfirmedLatch = winner.isConfirmedLatch || duplicate.isConfirmedLatch
+        updateTrackConfirmationLatch(winner, sweepId, minVotesToMaintain)
     }
 
     /** Returns `true` when the two most recent sweep IDs in [hitSweepIds] are `currentSweepId - 1` and [currentSweepId]. */
@@ -442,5 +590,17 @@ class TemporalTargetTracker(
 
         /** Walking speed (m/s) above which the "SLOW SWEEP" warning is raised (`AGENTS.md` §5). */
         const val MAX_SWEEP_SPEED_MPS = 1.10f
+
+        /** Maximum world-ray separation (degrees) at which two same-class tracks merge in Track-Level Spatial NMS. */
+        const val TRACK_NMS_MAX_ANGULAR_DEG = 3.2f
+
+        /** Maximum 3D ground distance (meters, `75 mm`) at which two same-class tracks merge in Track-Level Spatial NMS. */
+        const val TRACK_NMS_MAX_DISTANCE_METERS = 0.075f
+
+        /** Minimum strip bounding-box Intersection-over-Union at which two same-class tracks merge. */
+        const val TRACK_NMS_MIN_IOU = 0.35f
+
+        /** Minimum strip bounding-box Intersection-over-Minimum-Area at which two same-class tracks merge. */
+        const val TRACK_NMS_MIN_IOM = 0.60f
     }
 }

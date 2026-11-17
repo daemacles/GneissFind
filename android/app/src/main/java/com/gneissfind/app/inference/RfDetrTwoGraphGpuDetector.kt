@@ -41,6 +41,7 @@ import kotlin.math.sqrt
 /**
  * Selectable live hardware detector profiles exposed in the LCARS `SOURCE` drawer and benchmark harness.
  *
+ * @property id Deterministic short token used for per-profile LiteRT OpenCL shader disk cache keys.
  * @property modelName Canonical profile identifier logged in telemetry.
  * @property statusBadge Human-readable status string shown in the LCARS `SOURCE` drawer.
  * @property topology Execution topology (`"two_graph"` or `"single_graph"`).
@@ -55,6 +56,7 @@ import kotlin.math.sqrt
  *   tiles across consecutive sweeps while caching opposite-parity detections for 1 sweep.
  */
 enum class LiveModelProfile(
+    val id: String,
     val modelName: String,
     val statusBadge: String,
     val topology: String,
@@ -73,6 +75,7 @@ enum class LiveModelProfile(
      * queries (`100%` Small `38-45px` recall, `141.5 ms` / `7.07 FPS` cold, `-60.1%` FLOPs/sweep).
      */
     RFDETR_NANO_320_B3_INTERLEAVED(
+        id = "rfdetr_320_b3_w8dyn",
         modelName = "rf_detr_nano_b3_320_k100_w8dyn_interleaved",
         statusBadge = "RF-DETR 320 B=3 W8-DYN • GPU FP16",
         topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
@@ -92,6 +95,7 @@ enum class LiveModelProfile(
      * cold, `206 ms` / `4.85 FPS` 180s soaked, `87.5%` Small `38-45px` recall).
      */
     RFDETR_NANO_256_B5_K100(
+        id = "rfdetr_256_b5_w8dyn",
         modelName = "rf_detr_nano_b5_256_k100_w8dyn",
         statusBadge = "RF-DETR 256 B=5 W8-DYN • GPU FP16",
         topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
@@ -111,6 +115,7 @@ enum class LiveModelProfile(
      * `9.24 FPS` cold, `152.2 ms` / `6.57 FPS` sustained after 180s thermal soak).
      */
     RFDETR_NANO_256_B3_INTERLEAVED(
+        id = "rfdetr_256_b3_w8dyn",
         modelName = "rf_detr_nano_b3_256_k100_w8dyn_interleaved",
         statusBadge = "RF-DETR 256 B=3 W8-DYN • GPU FP16",
         topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
@@ -129,6 +134,7 @@ enum class LiveModelProfile(
      * across all 5 tiles every sweep (`-33.4%` FLOPs/sweep).
      */
     RFDETR_NANO_320_B5_K100(
+        id = "rfdetr_320_b5_k100",
         modelName = "rf_detr_nano_b5_320_k100",
         statusBadge = "RF-DETR 320 B=5 K100 • GPU FP16",
         topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
@@ -147,6 +153,7 @@ enum class LiveModelProfile(
      * on GPU FP16 (`41.15 GFLOPs` per 5-tile sweep).
      */
     YOLO26S_384_B5_GPU(
+        id = "yolo26s_384_b5",
         modelName = "yolo26s_b5_384",
         statusBadge = "YOLO26-S 384 B=5 • GPU FP16 [AGPL]",
         topology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH,
@@ -164,6 +171,7 @@ enum class LiveModelProfile(
      * Milestone 2 Baseline Reference: `RF-DETR-Nano` at `5x384x384` (`K=300` queries, `148.55 GFLOPs`).
      */
     RFDETR_NANO_384_BASELINE(
+        id = "rfdetr_384_b5_k300",
         modelName = "rf_detr_nano_b5_384_k300",
         statusBadge = "RF-DETR 384 B=5 K300 • BASELINE",
         topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
@@ -225,6 +233,7 @@ data class CocoStandInMetadata(
 ) {
     companion object {
         const val METADATA_ASSET_NAME = "rf_detr_coco_metadata.json"
+        const val LOCK_ON_METADATA_ASSET_NAME = "rf_detr_320_b1_metadata.json"
         const val BENCHMARK_OVERRIDE_FILE_NAME = "benchmark_override.json"
         const val TOPOLOGY_TWO_GRAPH = "two_graph"
         const val TOPOLOGY_SINGLE_GRAPH = "single_graph"
@@ -232,6 +241,10 @@ data class CocoStandInMetadata(
         const val SINGLE_GRAPH_ASSET_NAME = "rf_detr_nano_coco.tflite"
         const val PART1_ASSET_NAME = "rf_detr_nano_part1_backbone_encoder.tflite"
         const val PART2_ASSET_NAME = "rf_detr_nano_part2_decoder_head.tflite"
+        const val LOCK_ON_PART1_ASSET_NAME = "rf_detr_nano_part1_b1_320_w8dyn.tflite"
+        const val LOCK_ON_PART2_ASSET_NAME = "rf_detr_nano_part2_b1_320_k100_w8dyn.tflite"
+        const val LOCK_ON_CROP_RESOLUTION_PX = 320
+        const val LOCK_ON_TOP_K_QUERIES = 100
 
         const val DEFAULT_ENCODER_GRID_SIZE = 24
         const val DEFAULT_ENCODER_TOKENS = 576
@@ -305,6 +318,17 @@ class RfDetrTwoGraphGpuDetector(
     private var desiredLiveProfile: LiveModelProfile = initialProfile
     private var activeLiveProfile: LiveModelProfile = initialProfile
 
+    /**
+     * Optional listener invoked on the inference worker thread when asynchronous GPU shader
+     * compilation/deserialization + 1-pass warmup starts (`isCompiling = true`) and finishes (`false`).
+     */
+    @Volatile
+    var onCompilationStateChanged: ((isCompiling: Boolean, statusMessage: String) -> Unit)? = null
+
+    private val gpuShaderCacheDir: String by lazy {
+        File(appContext.codeCacheDir, GPU_SHADER_CACHE_SUBDIR).apply { mkdirs() }.absolutePath
+    }
+
     private var environment: Environment? = null
     private var singleModel: CompiledModel? = null
     private var part1Model: CompiledModel? = null
@@ -316,6 +340,51 @@ class RfDetrTwoGraphGpuDetector(
     private var part2Inputs: List<TensorBuffer> = emptyList()
     private var part2Outputs: List<TensorBuffer> = emptyList()
     private var part2ZeroCopyInputs: List<TensorBuffer> = emptyList()
+
+    // Dedicated pre-warmed B=1 320x320 W8-Dyn Lock-On models kept warm alongside Patrol models
+    private var lockOnInitializedOnThread: Boolean = false
+    private var lockOnHardwareLoaded: Boolean = false
+    private var lockOnPart1Model: CompiledModel? = null
+    private var lockOnPart2Model: CompiledModel? = null
+    private var lockOnPart1Inputs: List<TensorBuffer> = emptyList()
+    private var lockOnPart1Outputs: List<TensorBuffer> = emptyList()
+    private var lockOnPart2Inputs: List<TensorBuffer> = emptyList()
+    private var lockOnPart2Outputs: List<TensorBuffer> = emptyList()
+    private var lockOnPart2ZeroCopyInputs: List<TensorBuffer> = emptyList()
+    private var lockOnMetadata: CocoStandInMetadata = CocoStandInMetadata(
+        modelName = "rf_detr_nano_320_b1_w8dyn",
+        inputResolution = CocoStandInMetadata.LOCK_ON_CROP_RESOLUTION_PX,
+        batchSize = 1,
+        encoderGridH = 20,
+        encoderGridW = 20,
+        numEncoderTokens = 400,
+        numQueries = CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES,
+        numClasses = CocoStandInMetadata.DEFAULT_COCO_NUM_CLASSES,
+        scoreThreshold = LOCK_ON_DEFAULT_SCORE_THRESHOLD
+    )
+    private var lockOnBoxesOutputIdx: Int = 0
+    private var lockOnScoresOutputIdx: Int = 1
+    private var lockOnUseZeroCopyEncMemory: Boolean = true
+    private var lockOnBaseProposals: FloatArray = buildNormalizedProposalGrid(
+        gridH = 20,
+        gridW = 20,
+        defaultWh = CocoStandInMetadata.DEFAULT_PROPOSAL_WH
+    )
+    private val lockOnSelectedPrenormFloats = FloatArray(
+        CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES * CocoStandInMetadata.DEFAULT_QUERY_HIDDEN_DIM
+    )
+    private val lockOnSelectedProposalsFloats = FloatArray(
+        CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES * 4
+    )
+    private val lockOnTopIndices = IntArray(CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES)
+    private val lockOnScratchHeapScores = FloatArray(CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES)
+    private val lockOnScratchHeapIndices = IntArray(CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES)
+    private val lockOnDummyInputFloats = FloatArray(
+        CocoStandInMetadata.LOCK_ON_CROP_RESOLUTION_PX *
+            CocoStandInMetadata.LOCK_ON_CROP_RESOLUTION_PX * 3
+    )
+    private var lockOnRollingLatencyMs: Float = 0f
+    private var lockOnSweepCount: Long = 0L
 
     private var metadata: CocoStandInMetadata = CocoStandInMetadata(scoreThreshold = confidenceThreshold)
     private var activeTopology: String = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH
@@ -421,6 +490,14 @@ class RfDetrTwoGraphGpuDetector(
     override val isHardwareReady: Boolean
         get() = hardwareGraphsLoaded
 
+    /** True when the dedicated `B=1` `320x320` `W8-Dyn` Lock-On graphs are compiled and warm on GPU. */
+    val isLockOnHardwareReady: Boolean
+        get() = lockOnHardwareLoaded
+
+    /** True when [desiredLiveProfile] is already compiled and warm on the inference thread. */
+    val isDesiredProfileCompiled: Boolean
+        get() = initializedOnThread && activeLiveProfile == desiredLiveProfile
+
     override val statusSummary: String
         get() = initMessage
 
@@ -430,12 +507,22 @@ class RfDetrTwoGraphGpuDetector(
 
     /**
      * Switches the active [LiveModelProfile] from the LCARS `SOURCE` drawer. The new LiteRT graphs
-     * are hot-swapped on the inference worker thread at the start of the next sweep.
+     * are hot-swapped asynchronously on the inference worker thread.
      */
     fun setLiveModelProfile(profile: LiveModelProfile) {
         if (desiredLiveProfile != profile) {
             desiredLiveProfile = profile
         }
+    }
+
+    /**
+     * Eagerly compiles/deserializes and runs a 1-pass GPU warmup for both the active Patrol
+     * [LiveModelProfile] and the `B=1` `320x320` Lock-On graphs on `GneissFind-Inference` so
+     * profile switches and Lock-On transitions never block UI or stall on first frame.
+     */
+    fun ensureCompiledAndWarmOnInferenceThread() {
+        ensureInitializedOnAnalyzerThread()
+        ensureLockOn320ModelWarmOnAnalyzerThread()
     }
 
     /**
@@ -641,8 +728,9 @@ class RfDetrTwoGraphGpuDetector(
             interleaveEvenOdd = overrideJson?.optBoolean("interleave_even_odd", profile.interleaveEvenOdd)
                 ?: profile.interleaveEvenOdd
 
-            val env = Environment.create(appContext, enableCompilerCache = true)
-            environment = env
+            val env = environment ?: Environment.create(appContext, enableCompilerCache = true).also {
+                environment = it
+            }
 
             val hasTwoGraphOverride = part1FileOverride != null && part2FileOverride != null &&
                 File(part1FileOverride).exists() && File(part2FileOverride).exists()
@@ -661,185 +749,523 @@ class RfDetrTwoGraphGpuDetector(
                 else -> false
             }
 
-            val compileStartNs = System.nanoTime()
-            if (useTwoGraph && (hasTwoGraphOverride || hasTwoGraphAssets)) {
-                val (m1, m2, accelLabel) = loadTwoGraphModels(
-                    env = env,
-                    part1FilePath = part1FileOverride.takeIf { hasTwoGraphOverride },
-                    part2FilePath = part2FileOverride.takeIf { hasTwoGraphOverride },
-                    part1AssetName = baseMeta.part1Asset,
-                    part2AssetName = baseMeta.part2Asset
-                )
-                val compileMs = (System.nanoTime() - compileStartNs) / 1_000_000.0
-                part1Model = m1
-                part2Model = m2
-                part1Inputs = m1.createInputBuffers()
-                part1Outputs = m1.createOutputBuffers()
-                part2Inputs = m2.createInputBuffers()
-                part2Outputs = m2.createOutputBuffers()
-                part2ZeroCopyInputs = listOf(part1Outputs[0], part2Inputs[1], part2Inputs[2])
-
-                // Auto-detect exact dimensions from compiled TensorBuffers
-                val p1InFloats = part1Inputs[0].readFloat().size
-                val p1MemFloats = part1Outputs[0].readFloat().size
-                val p1ScoresFloats = part1Outputs[2].readFloat().size
-                val p2PropFloats = part2Inputs[2].readFloat().size
-                val p2Out0Floats = part2Outputs[0].readFloat().size
-                val p2Out1Floats = part2Outputs[1].readFloat().size
-
-                activeInputResolution = requestedRes
-                activeTileFloatCount = activeInputResolution * activeInputResolution * 3
-                compiledBatchSize = if (activeTileFloatCount > 0 && p1InFloats >= activeTileFloatCount) {
-                    (p1InFloats / activeTileFloatCount).coerceIn(1, MAX_SUPPORTED_BATCH)
-                } else {
-                    requestedBatch.coerceIn(1, MAX_SUPPORTED_BATCH)
-                }
-
-                val detectedTokens = if (compiledBatchSize > 0 && p1ScoresFloats >= compiledBatchSize) {
-                    p1ScoresFloats / compiledBatchSize
-                } else {
-                    (activeInputResolution / 16) * (activeInputResolution / 16)
-                }
-                val detectedHiddenDim = if (p1ScoresFloats > 0 && p1MemFloats >= p1ScoresFloats) {
-                    p1MemFloats / p1ScoresFloats
-                } else {
-                    CocoStandInMetadata.DEFAULT_QUERY_HIDDEN_DIM
-                }
-                val detectedTopK = if (compiledBatchSize > 0 && p2PropFloats >= compiledBatchSize * 4) {
-                    p2PropFloats / (compiledBatchSize * 4)
-                } else {
-                    requestedQueries
-                }
-
-                part2BoxesOutputIdx = if (p2Out0Floats <= p2Out1Floats) 0 else 1
-                part2ScoresOutputIdx = 1 - part2BoxesOutputIdx
-                val scoresFloats = maxOf(p2Out0Floats, p2Out1Floats)
-                val detectedClasses = if (compiledBatchSize * detectedTopK > 0) {
-                    scoresFloats / (compiledBatchSize * detectedTopK)
-                } else {
-                    requestedClasses
-                }
-
-                val gridSide = sqrt(detectedTokens.toDouble()).roundToInt().coerceAtLeast(1)
-                metadata = baseMeta.copy(
-                    inputResolution = activeInputResolution,
-                    batchSize = compiledBatchSize,
-                    topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
-                    encoderGridH = gridSide,
-                    encoderGridW = detectedTokens / gridSide,
-                    numEncoderTokens = detectedTokens,
-                    hiddenDim = detectedHiddenDim,
-                    numQueries = detectedTopK,
-                    numClasses = detectedClasses,
-                    cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(detectedClasses)
-                )
-
-                allocateStagingBuffersForMetadata()
-                activeTopology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH
-                activeAcceleratorLabel = accelLabel
-                hardwareGraphsLoaded = true
-                val intlvTag = if (interleaveEvenOdd && compiledBatchSize == 3) " INTLV" else ""
-                initMessage = if (overrideFile != null) {
-                    "RF-DETR 2G ${activeInputResolution} B=${compiledBatchSize}${intlvTag} K=${metadata.numQueries} • $accelLabel"
-                } else {
-                    profile.statusBadge
-                }
-                Log.i(
-                    TAG,
-                    String.format(
-                        Locale.US,
-                        "Initialized %s compile_ms=%.1f res=%d batch=%d tokens=%d topK=%d classes=%d zeroCopy=%b interleave=%b",
-                        initMessage,
-                        compileMs,
-                        activeInputResolution,
-                        compiledBatchSize,
-                        metadata.numEncoderTokens,
-                        metadata.numQueries,
-                        metadata.numClasses,
-                        useZeroCopyEncMemory,
-                        interleaveEvenOdd
+            onCompilationStateChanged?.invoke(true, profile.statusBadge)
+            try {
+                val compileStartNs = System.nanoTime()
+                if (useTwoGraph && (hasTwoGraphOverride || hasTwoGraphAssets)) {
+                    val p1CacheToken = if (hasTwoGraphOverride) null else "${profile.id}_p1_v1"
+                    val p2CacheToken = if (hasTwoGraphOverride) null else "${profile.id}_p2_v1"
+                    val (m1, m2, accelLabel) = loadTwoGraphModels(
+                        env = env,
+                        part1FilePath = part1FileOverride.takeIf { hasTwoGraphOverride },
+                        part2FilePath = part2FileOverride.takeIf { hasTwoGraphOverride },
+                        part1AssetName = baseMeta.part1Asset,
+                        part2AssetName = baseMeta.part2Asset,
+                        part1CacheKeyOverride = p1CacheToken,
+                        part2CacheKeyOverride = p2CacheToken
                     )
-                )
-            } else if (hasSingleGraphOverride || hasSingleGraphAsset) {
-                val (sModel, accelLabel) = loadSingleGraphModel(
-                    env = env,
-                    singleFilePath = singleFileOverride.takeIf { hasSingleGraphOverride },
-                    singleAssetName = baseMeta.singleGraphAsset
-                )
-                val compileMs = (System.nanoTime() - compileStartNs) / 1_000_000.0
-                singleModel = sModel
-                singleInputs = sModel.createInputBuffers()
-                singleOutputs = sModel.createOutputBuffers()
+                    val compileMs = (System.nanoTime() - compileStartNs) / 1_000_000.0
+                    part1Model = m1
+                    part2Model = m2
+                    part1Inputs = m1.createInputBuffers()
+                    part1Outputs = m1.createOutputBuffers()
+                    part2Inputs = m2.createInputBuffers()
+                    part2Outputs = m2.createOutputBuffers()
+                    part2ZeroCopyInputs = listOf(part1Outputs[0], part2Inputs[1], part2Inputs[2])
 
-                val sInFloats = singleInputs[0].readFloat().size
-                val sOut0Floats = singleOutputs[0].readFloat().size
-                val sOut1Floats = singleOutputs[1].readFloat().size
+                    // Auto-detect exact dimensions from compiled TensorBuffers
+                    val p1InFloats = part1Inputs[0].readFloat().size
+                    val p1MemFloats = part1Outputs[0].readFloat().size
+                    val p1ScoresFloats = part1Outputs[2].readFloat().size
+                    val p2PropFloats = part2Inputs[2].readFloat().size
+                    val p2Out0Floats = part2Outputs[0].readFloat().size
+                    val p2Out1Floats = part2Outputs[1].readFloat().size
 
-                activeInputResolution = requestedRes
-                activeTileFloatCount = activeInputResolution * activeInputResolution * 3
-                compiledBatchSize = if (activeTileFloatCount > 0 && sInFloats >= activeTileFloatCount) {
-                    (sInFloats / activeTileFloatCount).coerceIn(1, MAX_SUPPORTED_BATCH)
-                } else {
-                    requestedBatch.coerceIn(1, MAX_SUPPORTED_BATCH)
-                }
+                    activeInputResolution = requestedRes
+                    activeTileFloatCount = activeInputResolution * activeInputResolution * 3
+                    compiledBatchSize = if (activeTileFloatCount > 0 && p1InFloats >= activeTileFloatCount) {
+                        (p1InFloats / activeTileFloatCount).coerceIn(1, MAX_SUPPORTED_BATCH)
+                    } else {
+                        requestedBatch.coerceIn(1, MAX_SUPPORTED_BATCH)
+                    }
 
-                singleBoxesOutputIdx = if (sOut0Floats <= sOut1Floats) 0 else 1
-                singleScoresOutputIdx = 1 - singleBoxesOutputIdx
-                val boxesFloats = minOf(sOut0Floats, sOut1Floats)
-                val scoresFloats = maxOf(sOut0Floats, sOut1Floats)
+                    val detectedTokens = if (compiledBatchSize > 0 && p1ScoresFloats >= compiledBatchSize) {
+                        p1ScoresFloats / compiledBatchSize
+                    } else {
+                        (activeInputResolution / 16) * (activeInputResolution / 16)
+                    }
+                    val detectedHiddenDim = if (p1ScoresFloats > 0 && p1MemFloats >= p1ScoresFloats) {
+                        p1MemFloats / p1ScoresFloats
+                    } else {
+                        CocoStandInMetadata.DEFAULT_QUERY_HIDDEN_DIM
+                    }
+                    val detectedTopK = if (compiledBatchSize > 0 && p2PropFloats >= compiledBatchSize * 4) {
+                        p2PropFloats / (compiledBatchSize * 4)
+                    } else {
+                        requestedQueries
+                    }
 
-                val detectedQueries = if (compiledBatchSize > 0 && boxesFloats >= compiledBatchSize * 4) {
-                    boxesFloats / (compiledBatchSize * 4)
-                } else {
-                    requestedQueries
-                }
-                val detectedClasses = if (compiledBatchSize * detectedQueries > 0) {
-                    scoresFloats / (compiledBatchSize * detectedQueries)
-                } else {
-                    requestedClasses
-                }
+                    part2BoxesOutputIdx = if (p2Out0Floats <= p2Out1Floats) 0 else 1
+                    part2ScoresOutputIdx = 1 - part2BoxesOutputIdx
+                    val scoresFloats = maxOf(p2Out0Floats, p2Out1Floats)
+                    val detectedClasses = if (compiledBatchSize * detectedTopK > 0) {
+                        scoresFloats / (compiledBatchSize * detectedTopK)
+                    } else {
+                        requestedClasses
+                    }
 
-                metadata = baseMeta.copy(
-                    inputResolution = activeInputResolution,
-                    batchSize = compiledBatchSize,
-                    topology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH,
-                    numQueries = detectedQueries,
-                    numClasses = detectedClasses,
-                    cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(detectedClasses)
-                )
-
-                allocateStagingBuffersForMetadata()
-                activeTopology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH
-                activeAcceleratorLabel = accelLabel
-                hardwareGraphsLoaded = true
-                initMessage = if (overrideFile != null) {
-                    "1G ${activeInputResolution} B=${compiledBatchSize} Q=${metadata.numQueries} C=${metadata.numClasses} • $accelLabel"
-                } else {
-                    profile.statusBadge
-                }
-                Log.i(
-                    TAG,
-                    String.format(
-                        Locale.US,
-                        "Initialized %s compile_ms=%.1f res=%d batch=%d queries=%d classes=%d",
-                        initMessage,
-                        compileMs,
-                        activeInputResolution,
-                        compiledBatchSize,
-                        metadata.numQueries,
-                        metadata.numClasses
+                    val gridSide = sqrt(detectedTokens.toDouble()).roundToInt().coerceAtLeast(1)
+                    metadata = baseMeta.copy(
+                        inputResolution = activeInputResolution,
+                        batchSize = compiledBatchSize,
+                        topology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH,
+                        encoderGridH = gridSide,
+                        encoderGridW = detectedTokens / gridSide,
+                        numEncoderTokens = detectedTokens,
+                        hiddenDim = detectedHiddenDim,
+                        numQueries = detectedTopK,
+                        numClasses = detectedClasses,
+                        cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(detectedClasses)
                     )
-                )
-            } else {
-                hardwareGraphsLoaded = false
-                initMessage = "LiteRT GPU Stub (missing .tflite in assets/)"
-                Log.w(TAG, "$initMessage — falling back to host bridge profiler")
+
+                    allocateStagingBuffersForMetadata()
+                    val warmupStartNs = System.nanoTime()
+                    runTwoGraphDummyWarmupPass(m1, m2)
+                    val warmupMs = (System.nanoTime() - warmupStartNs) / 1_000_000.0
+
+                    activeTopology = CocoStandInMetadata.TOPOLOGY_TWO_GRAPH
+                    activeAcceleratorLabel = accelLabel
+                    hardwareGraphsLoaded = true
+                    val intlvTag = if (interleaveEvenOdd && compiledBatchSize == 3) " INTLV" else ""
+                    initMessage = if (overrideFile != null) {
+                        "RF-DETR 2G ${activeInputResolution} B=${compiledBatchSize}${intlvTag} K=${metadata.numQueries} • $accelLabel"
+                    } else {
+                        profile.statusBadge
+                    }
+                    Log.i(
+                        TAG,
+                        String.format(
+                            Locale.US,
+                            "Initialized %s compile_ms=%.1f warmup_ms=%.1f total_init_ms=%.1f res=%d batch=%d tokens=%d topK=%d classes=%d zeroCopy=%b interleave=%b cacheDir=%s",
+                            initMessage,
+                            compileMs,
+                            warmupMs,
+                            compileMs + warmupMs,
+                            activeInputResolution,
+                            compiledBatchSize,
+                            metadata.numEncoderTokens,
+                            metadata.numQueries,
+                            metadata.numClasses,
+                            useZeroCopyEncMemory,
+                            interleaveEvenOdd,
+                            gpuShaderCacheDir
+                        )
+                    )
+                } else if (hasSingleGraphOverride || hasSingleGraphAsset) {
+                    val singleCacheToken = if (hasSingleGraphOverride) null else "${profile.id}_1g_v1"
+                    val (sModel, accelLabel) = loadSingleGraphModel(
+                        env = env,
+                        singleFilePath = singleFileOverride.takeIf { hasSingleGraphOverride },
+                        singleAssetName = baseMeta.singleGraphAsset,
+                        singleCacheKeyOverride = singleCacheToken
+                    )
+                    val compileMs = (System.nanoTime() - compileStartNs) / 1_000_000.0
+                    singleModel = sModel
+                    singleInputs = sModel.createInputBuffers()
+                    singleOutputs = sModel.createOutputBuffers()
+
+                    val sInFloats = singleInputs[0].readFloat().size
+                    val sOut0Floats = singleOutputs[0].readFloat().size
+                    val sOut1Floats = singleOutputs[1].readFloat().size
+
+                    activeInputResolution = requestedRes
+                    activeTileFloatCount = activeInputResolution * activeInputResolution * 3
+                    compiledBatchSize = if (activeTileFloatCount > 0 && sInFloats >= activeTileFloatCount) {
+                        (sInFloats / activeTileFloatCount).coerceIn(1, MAX_SUPPORTED_BATCH)
+                    } else {
+                        requestedBatch.coerceIn(1, MAX_SUPPORTED_BATCH)
+                    }
+
+                    singleBoxesOutputIdx = if (sOut0Floats <= sOut1Floats) 0 else 1
+                    singleScoresOutputIdx = 1 - singleBoxesOutputIdx
+                    val boxesFloats = minOf(sOut0Floats, sOut1Floats)
+                    val scoresFloats = maxOf(sOut0Floats, sOut1Floats)
+
+                    val detectedQueries = if (compiledBatchSize > 0 && boxesFloats >= compiledBatchSize * 4) {
+                        boxesFloats / (compiledBatchSize * 4)
+                    } else {
+                        requestedQueries
+                    }
+                    val detectedClasses = if (compiledBatchSize * detectedQueries > 0) {
+                        scoresFloats / (compiledBatchSize * detectedQueries)
+                    } else {
+                        requestedClasses
+                    }
+
+                    metadata = baseMeta.copy(
+                        inputResolution = activeInputResolution,
+                        batchSize = compiledBatchSize,
+                        topology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH,
+                        numQueries = detectedQueries,
+                        numClasses = detectedClasses,
+                        cocoClassIdToStoneClassId = CocoStandInMetadata.buildDefaultCocoToStoneClassLut(detectedClasses)
+                    )
+
+                    allocateStagingBuffersForMetadata()
+                    val warmupStartNs = System.nanoTime()
+                    singleInputs[0].writeFloat(batchedInputFloats)
+                    sModel.run(singleInputs, singleOutputs)
+                    val warmupMs = (System.nanoTime() - warmupStartNs) / 1_000_000.0
+
+                    activeTopology = CocoStandInMetadata.TOPOLOGY_SINGLE_GRAPH
+                    activeAcceleratorLabel = accelLabel
+                    hardwareGraphsLoaded = true
+                    initMessage = if (overrideFile != null) {
+                        "1G ${activeInputResolution} B=${compiledBatchSize} Q=${metadata.numQueries} C=${metadata.numClasses} • $accelLabel"
+                    } else {
+                        profile.statusBadge
+                    }
+                    Log.i(
+                        TAG,
+                        String.format(
+                            Locale.US,
+                            "Initialized %s compile_ms=%.1f warmup_ms=%.1f total_init_ms=%.1f res=%d batch=%d queries=%d classes=%d",
+                            initMessage,
+                            compileMs,
+                            warmupMs,
+                            compileMs + warmupMs,
+                            activeInputResolution,
+                            compiledBatchSize,
+                            metadata.numQueries,
+                            metadata.numClasses
+                        )
+                    )
+                } else {
+                    hardwareGraphsLoaded = false
+                    initMessage = "LiteRT GPU Stub (missing .tflite in assets/)"
+                    Log.w(TAG, "$initMessage — falling back to host bridge profiler")
+                }
+            } finally {
+                onCompilationStateChanged?.invoke(false, initMessage)
             }
         } catch (t: Throwable) {
             hardwareGraphsLoaded = false
             initMessage = "LiteRT GPU Stub (${t.javaClass.simpleName})"
+            onCompilationStateChanged?.invoke(false, initMessage)
             Log.w(TAG, "LiteRT initialization fell back to stub profiler: ${t.message}", t)
         }
+    }
+
+    /** Executes one silent zero-input warmup sweep on [m1] + [m2] so GPU OpenCL kernels bind eagerly. */
+    private fun runTwoGraphDummyWarmupPass(m1: CompiledModel, m2: CompiledModel) {
+        if (compiledBatchSize > 1) {
+            Arrays.fill(batchedInputFloats, 0f)
+            part1Inputs[0].writeFloat(batchedInputFloats)
+            m1.run(part1Inputs, part1Outputs)
+            selectTopKProposalsFromMaxScores(
+                encMaxScores = part1Outputs[2].readFloat(),
+                outputMemoryPrenorm = part1Outputs[1].readFloat(),
+                baseProposals = baseProposalsTable,
+                batchSize = compiledBatchSize,
+                activeBatchItems = compiledBatchSize,
+                numTokens = metadata.numEncoderTokens,
+                hiddenDim = metadata.hiddenDim,
+                topK = metadata.numQueries,
+                outSelectedPrenorm = batchedSelectedPrenormFloats,
+                outSelectedProposals = batchedSelectedProposalsFloats,
+                outSelectedIndices = batchedTopIndices,
+                scratchHeapScores = scratchHeapScores,
+                scratchHeapIndices = scratchHeapIndices
+            )
+            part2Inputs[1].writeFloat(batchedSelectedPrenormFloats)
+            part2Inputs[2].writeFloat(batchedSelectedProposalsFloats)
+            if (useZeroCopyEncMemory) {
+                try {
+                    m2.run(part2ZeroCopyInputs, part2Outputs)
+                } catch (_: Throwable) {
+                    useZeroCopyEncMemory = false
+                    part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                    m2.run(part2Inputs, part2Outputs)
+                }
+            } else {
+                part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                m2.run(part2Inputs, part2Outputs)
+            }
+        } else {
+            Arrays.fill(singleTileInputFloats, 0f)
+            part1Inputs[0].writeFloat(singleTileInputFloats)
+            m1.run(part1Inputs, part1Outputs)
+            selectTopKProposalsFromMaxScores(
+                encMaxScores = part1Outputs[2].readFloat(),
+                outputMemoryPrenorm = part1Outputs[1].readFloat(),
+                baseProposals = baseProposalsTable,
+                batchSize = 1,
+                activeBatchItems = 1,
+                numTokens = metadata.numEncoderTokens,
+                hiddenDim = metadata.hiddenDim,
+                topK = metadata.numQueries,
+                outSelectedPrenorm = singleSelectedPrenormFloats,
+                outSelectedProposals = singleSelectedProposalsFloats,
+                outSelectedIndices = batchedTopIndices,
+                scratchHeapScores = scratchHeapScores,
+                scratchHeapIndices = scratchHeapIndices
+            )
+            part2Inputs[1].writeFloat(singleSelectedPrenormFloats)
+            part2Inputs[2].writeFloat(singleSelectedProposalsFloats)
+            if (useZeroCopyEncMemory) {
+                try {
+                    m2.run(part2ZeroCopyInputs, part2Outputs)
+                } catch (_: Throwable) {
+                    useZeroCopyEncMemory = false
+                    part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                    m2.run(part2Inputs, part2Outputs)
+                }
+            } else {
+                part2Inputs[0].writeFloat(part1Outputs[0].readFloat())
+                m2.run(part2Inputs, part2Outputs)
+            }
+        }
+    }
+
+    /**
+     * Pre-warms the dedicated `B=1` `320x320` `W8-Dyn` Lock-On 2-Graph models (`Part 1` + `Part 2`)
+     * on `GneissFind-Inference` once per session and keeps them resident across `PATROL` profile
+     * switches so tapping a target enters `LOCK-ON` in `< 50 ms` with zero shader pause.
+     */
+    private fun ensureLockOn320ModelWarmOnAnalyzerThread() {
+        if (lockOnInitializedOnThread) return
+        lockOnInitializedOnThread = true
+
+        try {
+            val assetList = appContext.assets.list("")?.toSet().orEmpty()
+            val meta = if (CocoStandInMetadata.LOCK_ON_METADATA_ASSET_NAME in assetList) {
+                val jsonText = appContext.assets.open(CocoStandInMetadata.LOCK_ON_METADATA_ASSET_NAME)
+                    .bufferedReader()
+                    .use { it.readText() }
+                parseCocoMetadataJson(jsonText, LOCK_ON_DEFAULT_SCORE_THRESHOLD)
+            } else {
+                CocoStandInMetadata(
+                    modelName = "rf_detr_nano_320_b1_w8dyn",
+                    inputResolution = CocoStandInMetadata.LOCK_ON_CROP_RESOLUTION_PX,
+                    batchSize = 1,
+                    part1Asset = CocoStandInMetadata.LOCK_ON_PART1_ASSET_NAME,
+                    part2Asset = CocoStandInMetadata.LOCK_ON_PART2_ASSET_NAME,
+                    encoderGridH = 20,
+                    encoderGridW = 20,
+                    numEncoderTokens = 400,
+                    numQueries = CocoStandInMetadata.LOCK_ON_TOP_K_QUERIES,
+                    numClasses = CocoStandInMetadata.DEFAULT_COCO_NUM_CLASSES,
+                    scoreThreshold = LOCK_ON_DEFAULT_SCORE_THRESHOLD
+                )
+            }
+
+            if (meta.part1Asset !in assetList || meta.part2Asset !in assetList) {
+                lockOnHardwareLoaded = false
+                Log.i(TAG, "Lock-On B=1 320 assets (${meta.part1Asset}) not yet bundled; skipping pre-warm")
+                return
+            }
+
+            val env = environment ?: Environment.create(appContext, enableCompilerCache = true).also {
+                environment = it
+            }
+            val startNs = System.nanoTime()
+            val (m1, m2, accelLabel) = loadTwoGraphModels(
+                env = env,
+                part1FilePath = null,
+                part2FilePath = null,
+                part1AssetName = meta.part1Asset,
+                part2AssetName = meta.part2Asset,
+                part1CacheKeyOverride = LOCK_ON_P1_CACHE_TOKEN,
+                part2CacheKeyOverride = LOCK_ON_P2_CACHE_TOKEN
+            )
+            val compileMs = (System.nanoTime() - startNs) / 1_000_000.0
+
+            lockOnPart1Model = m1
+            lockOnPart2Model = m2
+            lockOnPart1Inputs = m1.createInputBuffers()
+            lockOnPart1Outputs = m1.createOutputBuffers()
+            lockOnPart2Inputs = m2.createInputBuffers()
+            lockOnPart2Outputs = m2.createOutputBuffers()
+            lockOnPart2ZeroCopyInputs = listOf(lockOnPart1Outputs[0], lockOnPart2Inputs[1], lockOnPart2Inputs[2])
+
+            val p2Out0 = lockOnPart2Outputs[0].readFloat().size
+            val p2Out1 = lockOnPart2Outputs[1].readFloat().size
+            lockOnBoxesOutputIdx = if (p2Out0 <= p2Out1) 0 else 1
+            lockOnScoresOutputIdx = 1 - lockOnBoxesOutputIdx
+
+            lockOnMetadata = meta
+            lockOnBaseProposals = buildNormalizedProposalGrid(
+                gridH = meta.encoderGridH,
+                gridW = meta.encoderGridW,
+                defaultWh = meta.proposalDefaultWh
+            )
+
+            // 1-pass warmup so OpenCL command buffers are hot before the user ever taps a target
+            val warmStartNs = System.nanoTime()
+            lockOnPart1Inputs[0].writeFloat(lockOnDummyInputFloats)
+            m1.run(lockOnPart1Inputs, lockOnPart1Outputs)
+            selectTopKProposalsFromMaxScores(
+                encMaxScores = lockOnPart1Outputs[2].readFloat(),
+                outputMemoryPrenorm = lockOnPart1Outputs[1].readFloat(),
+                baseProposals = lockOnBaseProposals,
+                batchSize = 1,
+                activeBatchItems = 1,
+                numTokens = meta.numEncoderTokens,
+                hiddenDim = meta.hiddenDim,
+                topK = meta.numQueries,
+                outSelectedPrenorm = lockOnSelectedPrenormFloats,
+                outSelectedProposals = lockOnSelectedProposalsFloats,
+                outSelectedIndices = lockOnTopIndices,
+                scratchHeapScores = lockOnScratchHeapScores,
+                scratchHeapIndices = lockOnScratchHeapIndices
+            )
+            lockOnPart2Inputs[1].writeFloat(lockOnSelectedPrenormFloats)
+            lockOnPart2Inputs[2].writeFloat(lockOnSelectedProposalsFloats)
+            try {
+                m2.run(lockOnPart2ZeroCopyInputs, lockOnPart2Outputs)
+            } catch (_: Throwable) {
+                lockOnUseZeroCopyEncMemory = false
+                lockOnPart2Inputs[0].writeFloat(lockOnPart1Outputs[0].readFloat())
+                m2.run(lockOnPart2Inputs, lockOnPart2Outputs)
+            }
+            val warmMs = (System.nanoTime() - warmStartNs) / 1_000_000.0
+            lockOnHardwareLoaded = true
+            Log.i(
+                TAG,
+                String.format(
+                    Locale.US,
+                    "Pre-warmed Lock-On B=1 320 (%s) compile_ms=%.1f warmup_ms=%.1f total_init_ms=%.1f",
+                    accelLabel,
+                    compileMs,
+                    warmMs,
+                    compileMs + warmMs
+                )
+            )
+        } catch (t: Throwable) {
+            lockOnHardwareLoaded = false
+            Log.w(TAG, "Lock-On B=1 320 pre-warm failed: ${t.message}", t)
+        }
+    }
+
+    /**
+     * Runs foveated `B=1` `320x320` `W8-Dyn` `RF-DETR-Nano` inference on a single `320x320x3` RGB
+     * `[0..1]` crop on `GneissFind-Inference` (`~16-22 FPS` on Tensor G5 GPU), returning detections
+     * with coordinates in `[0.0, 320.0]` crop-local pixels (`tileIndex = 0`).
+     *
+     * @param cropRgb320Floats Flat `320 * 320 * 3` RGB `[0..1]` float array.
+     * @param scoreThresholdOverride Minimum confidence score (`0.28f` default during Lock-On).
+     * @return [SweepInferenceResult] containing crop-local [TileDetection] boxes in `[0..320]`.
+     */
+    fun detectLockOnCrop320(
+        cropRgb320Floats: FloatArray,
+        scoreThresholdOverride: Float = LOCK_ON_DEFAULT_SCORE_THRESHOLD
+    ): SweepInferenceResult {
+        ensureLockOn320ModelWarmOnAnalyzerThread()
+        val m1 = lockOnPart1Model
+        val m2 = lockOnPart2Model
+        val detections = ArrayList<TileDetection>(8)
+        if (!lockOnHardwareLoaded || m1 == null || m2 == null) {
+            return SweepInferenceResult(
+                tileDetections = detections,
+                part1LatencyMs = 0f,
+                hostTopKBridgeLatencyMs = 0f,
+                part2LatencyMs = 0f,
+                totalSweepLatencyMs = 0f,
+                rollingAvgLatencyMs = lockOnRollingLatencyMs,
+                isHardwareGraphActive = false
+            )
+        }
+
+        val t0 = System.nanoTime()
+        lockOnPart1Inputs[0].writeFloat(cropRgb320Floats)
+        m1.run(lockOnPart1Inputs, lockOnPart1Outputs)
+        val encPrenorm = lockOnPart1Outputs[1].readFloat()
+        val encMaxScores = lockOnPart1Outputs[2].readFloat()
+        val t1 = System.nanoTime()
+
+        selectTopKProposalsFromMaxScores(
+            encMaxScores = encMaxScores,
+            outputMemoryPrenorm = encPrenorm,
+            baseProposals = lockOnBaseProposals,
+            batchSize = 1,
+            activeBatchItems = 1,
+            numTokens = lockOnMetadata.numEncoderTokens,
+            hiddenDim = lockOnMetadata.hiddenDim,
+            topK = lockOnMetadata.numQueries,
+            outSelectedPrenorm = lockOnSelectedPrenormFloats,
+            outSelectedProposals = lockOnSelectedProposalsFloats,
+            outSelectedIndices = lockOnTopIndices,
+            scratchHeapScores = lockOnScratchHeapScores,
+            scratchHeapIndices = lockOnScratchHeapIndices
+        )
+        val t2 = System.nanoTime()
+
+        lockOnPart2Inputs[1].writeFloat(lockOnSelectedPrenormFloats)
+        lockOnPart2Inputs[2].writeFloat(lockOnSelectedProposalsFloats)
+        if (lockOnUseZeroCopyEncMemory) {
+            try {
+                m2.run(lockOnPart2ZeroCopyInputs, lockOnPart2Outputs)
+            } catch (_: Throwable) {
+                lockOnUseZeroCopyEncMemory = false
+                lockOnPart2Inputs[0].writeFloat(lockOnPart1Outputs[0].readFloat())
+                m2.run(lockOnPart2Inputs, lockOnPart2Outputs)
+            }
+        } else {
+            lockOnPart2Inputs[0].writeFloat(lockOnPart1Outputs[0].readFloat())
+            m2.run(lockOnPart2Inputs, lockOnPart2Outputs)
+        }
+        val predBoxes = lockOnPart2Outputs[lockOnBoxesOutputIdx].readFloat()
+        val predScores = lockOnPart2Outputs[lockOnScoresOutputIdx].readFloat()
+        val t3 = System.nanoTime()
+
+        decodeCocoSingleTilePredictions(
+            tileIndex = 0,
+            batchElementIndex = 0,
+            boxesCxCyWhNorm = predBoxes,
+            classScores = predScores,
+            metadata = lockOnMetadata,
+            confidenceThreshold = scoreThresholdOverride,
+            outDetections = detections,
+            targetBoxScalePx = CocoStandInMetadata.LOCK_ON_CROP_RESOLUTION_PX.toFloat()
+        )
+
+        val p1Ms = ((t1 - t0) / 1_000_000.0).toFloat()
+        val bridgeMs = ((t2 - t1) / 1_000_000.0).toFloat()
+        val p2Ms = ((t3 - t2) / 1_000_000.0).toFloat()
+        val totalMs = ((t3 - t0) / 1_000_000.0).toFloat()
+        lockOnSweepCount++
+        lockOnRollingLatencyMs = if (lockOnSweepCount == 1L) {
+            totalMs
+        } else {
+            lockOnRollingLatencyMs * 0.80f + totalMs * 0.20f
+        }
+
+        if (lockOnSweepCount <= 30L || lockOnSweepCount % 15L == 0L) {
+            Log.i(
+                TAG,
+                String.format(
+                    Locale.US,
+                    "RFDETR_LOCKON_B1 sweep=%d total_ms=%.2f p1_ms=%.2f topk_ms=%.2f p2_ms=%.2f rolling_ms=%.2f dets=%d",
+                    lockOnSweepCount,
+                    totalMs,
+                    p1Ms,
+                    bridgeMs,
+                    p2Ms,
+                    lockOnRollingLatencyMs,
+                    detections.size
+                )
+            )
+        }
+
+        return SweepInferenceResult(
+            tileDetections = detections,
+            part1LatencyMs = p1Ms,
+            hostTopKBridgeLatencyMs = bridgeMs,
+            part2LatencyMs = p2Ms,
+            totalSweepLatencyMs = totalMs,
+            rollingAvgLatencyMs = lockOnRollingLatencyMs,
+            isHardwareGraphActive = true
+        )
     }
 
     /**
@@ -873,11 +1299,11 @@ class RfDetrTwoGraphGpuDetector(
 
     /**
      * Builds LiteRT [CompiledModel.Options] targeting `Accelerator.GPU` (FP16 precision, serialized
-     * OpenCL shader cache under `codeCacheDir`, optional quantized FC/Conv support) with CPU fallback.
+     * OpenCL shader cache under `codeCacheDir/litert_gpu_cache`, optional quantized FC/Conv support)
+     * with CPU fallback.
      */
     private fun buildGpuOptions(cacheKey: String): CompiledModel.Options {
-        val cacheDir = appContext.codeCacheDir.absolutePath
-        val xnnCache = File(appContext.codeCacheDir, "xnnpack_${cacheKey}.cache").absolutePath
+        val xnnCache = File(gpuShaderCacheDir, "xnnpack_${cacheKey}.cache").absolutePath
         return CompiledModel.Options(Accelerator.GPU, Accelerator.CPU).apply {
             gpuOptions = CompiledModel.GpuOptions(
                 constantTensorSharing = overrideConstantTensorSharing ?: true,
@@ -885,7 +1311,7 @@ class RfDetrTwoGraphGpuDetector(
                 precision = CompiledModel.GpuOptions.Precision.FP16,
                 bufferStorageType = overrideBufferStorageType,
                 preferTextureWeights = overridePreferTextureWeights,
-                serializationDir = cacheDir,
+                serializationDir = gpuShaderCacheDir,
                 modelCacheKey = cacheKey,
                 serializeProgramCache = true,
                 priority = CompiledModel.GpuOptions.Priority.HIGH,
@@ -903,8 +1329,7 @@ class RfDetrTwoGraphGpuDetector(
      * (either strict NPU+CPU or heterogeneous NPU+GPU+CPU).
      */
     private fun buildNpuOptions(cacheKey: String, allowGpuFallback: Boolean): CompiledModel.Options {
-        val cacheDir = appContext.codeCacheDir.absolutePath
-        val xnnCache = File(appContext.codeCacheDir, "xnnpack_npu_${cacheKey}.cache").absolutePath
+        val xnnCache = File(gpuShaderCacheDir, "xnnpack_npu_${cacheKey}.cache").absolutePath
         val accels = if (allowGpuFallback) {
             arrayOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
         } else {
@@ -915,7 +1340,7 @@ class RfDetrTwoGraphGpuDetector(
                 constantTensorSharing = true,
                 allowSrcQuantizedFcConvOps = true,
                 precision = CompiledModel.GpuOptions.Precision.FP16,
-                serializationDir = cacheDir,
+                serializationDir = gpuShaderCacheDir,
                 modelCacheKey = "npu_${cacheKey}",
                 serializeProgramCache = true,
                 priority = CompiledModel.GpuOptions.Priority.HIGH
@@ -929,7 +1354,7 @@ class RfDetrTwoGraphGpuDetector(
 
     /** Builds 4-thread XNNPACK CPU fallback [CompiledModel.Options] when GPU/NPU compilation fails. */
     private fun buildCpuFallbackOptions(): CompiledModel.Options {
-        val cacheFile = File(appContext.codeCacheDir, "xnnpack_weights.cache").absolutePath
+        val cacheFile = File(gpuShaderCacheDir, "xnnpack_weights.cache").absolutePath
         return CompiledModel.Options(Accelerator.CPU).apply {
             cpuOptions = CompiledModel.CpuOptions(
                 numThreads = 4,
@@ -947,10 +1372,14 @@ class RfDetrTwoGraphGpuDetector(
         part1FilePath: String?,
         part2FilePath: String?,
         part1AssetName: String,
-        part2AssetName: String
+        part2AssetName: String,
+        part1CacheKeyOverride: String? = null,
+        part2CacheKeyOverride: String? = null
     ): Triple<CompiledModel, CompiledModel, String> {
-        val p1Tag = (part1FilePath ?: part1AssetName).substringAfterLast('/').substringBeforeLast('.')
-        val p2Tag = (part2FilePath ?: part2AssetName).substringAfterLast('/').substringBeforeLast('.')
+        val p1Tag = part1CacheKeyOverride
+            ?: (part1FilePath ?: part1AssetName).substringAfterLast('/').substringBeforeLast('.')
+        val p2Tag = part2CacheKeyOverride
+            ?: (part2FilePath ?: part2AssetName).substringAfterLast('/').substringBeforeLast('.')
         return try {
             val (opt1, opt2, label) = when (overrideAcceleratorMode) {
                 "npu_strict" -> Triple(
@@ -1035,9 +1464,11 @@ class RfDetrTwoGraphGpuDetector(
     private fun loadSingleGraphModel(
         env: Environment,
         singleFilePath: String?,
-        singleAssetName: String
+        singleAssetName: String,
+        singleCacheKeyOverride: String? = null
     ): Pair<CompiledModel, String> {
-        val tag = (singleFilePath ?: singleAssetName).substringAfterLast('/').substringBeforeLast('.')
+        val tag = singleCacheKeyOverride
+            ?: (singleFilePath ?: singleAssetName).substringAfterLast('/').substringBeforeLast('.')
         return try {
             val (opt, label) = when (overrideAcceleratorMode) {
                 "npu_strict" -> buildNpuOptions(tag, allowGpuFallback = false) to "NPU STRICT"
@@ -1594,7 +2025,10 @@ class RfDetrTwoGraphGpuDetector(
         )
     }
 
-    /** Closes all native LiteRT [TensorBuffer], [CompiledModel], and [Environment] handles. */
+    /**
+     * Closes the active Patrol [TensorBuffer] and [CompiledModel] handles during hot-swaps while
+     * keeping [environment] and the pre-warmed `B=1` `320` Lock-On models resident.
+     */
     private fun releaseModelsOnly() {
         singleInputs.forEach { runCatching { it.close() } }
         singleOutputs.forEach { runCatching { it.close() } }
@@ -1605,7 +2039,6 @@ class RfDetrTwoGraphGpuDetector(
         runCatching { singleModel?.close() }
         runCatching { part1Model?.close() }
         runCatching { part2Model?.close() }
-        runCatching { environment?.close() }
         singleInputs = emptyList()
         singleOutputs = emptyList()
         part1Inputs = emptyList()
@@ -1616,16 +2049,41 @@ class RfDetrTwoGraphGpuDetector(
         singleModel = null
         part1Model = null
         part2Model = null
-        environment = null
         hardwareGraphsLoaded = false
+    }
+
+    /** Closes the pre-warmed `B=1` `320x320` Lock-On [TensorBuffer] and [CompiledModel] handles. */
+    private fun releaseLockOnModels() {
+        lockOnPart1Inputs.forEach { runCatching { it.close() } }
+        lockOnPart1Outputs.forEach { runCatching { it.close() } }
+        lockOnPart2Inputs.forEach { runCatching { it.close() } }
+        lockOnPart2Outputs.forEach { runCatching { it.close() } }
+        runCatching { lockOnPart1Model?.close() }
+        runCatching { lockOnPart2Model?.close() }
+        lockOnPart1Inputs = emptyList()
+        lockOnPart1Outputs = emptyList()
+        lockOnPart2Inputs = emptyList()
+        lockOnPart2Outputs = emptyList()
+        lockOnPart2ZeroCopyInputs = emptyList()
+        lockOnPart1Model = null
+        lockOnPart2Model = null
+        lockOnHardwareLoaded = false
+        lockOnInitializedOnThread = false
     }
 
     override fun close() {
         releaseModelsOnly()
+        releaseLockOnModels()
+        runCatching { environment?.close() }
+        environment = null
     }
 
     companion object {
         private const val TAG = "RfDetrTwoGraphGpu"
+        private const val GPU_SHADER_CACHE_SUBDIR = "litert_gpu_cache"
+        private const val LOCK_ON_P1_CACHE_TOKEN = "lockon_320_b1_p1_v1"
+        private const val LOCK_ON_P2_CACHE_TOKEN = "lockon_320_b1_p2_v1"
+        const val LOCK_ON_DEFAULT_SCORE_THRESHOLD = 0.28f
         const val PART1_ASSET_NAME = CocoStandInMetadata.PART1_ASSET_NAME
         const val PART2_ASSET_NAME = CocoStandInMetadata.PART2_ASSET_NAME
         const val SINGLE_GRAPH_ASSET_NAME = CocoStandInMetadata.SINGLE_GRAPH_ASSET_NAME
@@ -1952,11 +2410,12 @@ class RfDetrTwoGraphGpuDetector(
             classScores: FloatArray,
             metadata: CocoStandInMetadata,
             confidenceThreshold: Float = metadata.scoreThreshold,
-            outDetections: MutableList<TileDetection>
+            outDetections: MutableList<TileDetection>,
+            targetBoxScalePx: Float = StripRoiGeometry.TILE_SIZE_PX.toFloat()
         ) {
             val numQueries = metadata.numQueries
             val numClasses = metadata.numClasses
-            val tileSize = StripRoiGeometry.TILE_SIZE_PX.toFloat()
+            val tileSize = targetBoxScalePx
             val lut = metadata.cocoClassIdToStoneClassId
             val scoresAreProbs = metadata.scoresAreProbabilities
 

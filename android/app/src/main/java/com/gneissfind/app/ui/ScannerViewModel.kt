@@ -147,6 +147,7 @@ data class ScannerUiState(
     val liveModelProfile: LiveModelProfile = LiveModelProfile.RFDETR_NANO_256_B3_INTERLEAVED,
     val syntheticProfile: SyntheticTargetProfile = SyntheticTargetProfile.MIXED_GRAVEL_WALK,
     val detectorStatus: String = LiveModelProfile.RFDETR_NANO_256_B3_INTERLEAVED.statusBadge,
+    val isCompilingModel: Boolean = false,
     val enabledClasses: Set<StoneClass> = StoneClass.alertableClasses.toSet(),
     val swathTileMode: SwathTileMode = SwathTileMode.FIVE_TILE,
     val shutterClampEnabled: Boolean = true,
@@ -274,6 +275,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
 
     init {
+        rfDetrGpuDetector.onCompilationStateChanged = { isCompiling, statusBadge ->
+            _uiState.update { prev ->
+                prev.copy(
+                    isCompilingModel = isCompiling,
+                    detectorStatus = statusBadge.ifEmpty { prev.detectorStatus }
+                )
+            }
+        }
         raycaster.onRealtimeImuPitchListener = { smoothedPitchDeg, rollDeg, refPitchDeg ->
             var updatedVisibleTargetsForAudio: List<ConfirmedTarget>? = null
             var currentSpeedForAudio: ScanSpeedState = ScanSpeedState.Normal(0f)
@@ -328,6 +337,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 sonifier.updateTargets(visibleTargets, currentSpeedForAudio)
             }
         }
+        scheduleInferenceDrainIfNeeded()
     }
 
     /** Binds the CameraX preview and `YUV_420_888` analyzer stream to [lifecycleOwner] and [previewView]. */
@@ -433,13 +443,19 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         option.syntheticProfile?.let { profile ->
             syntheticDetector.profile = profile
         }
+        val needsAsyncCompile = option.backend == DetectorBackend.RF_DETR_NANO_GPU &&
+            !rfDetrGpuDetector.isDesiredProfileCompiled
         _uiState.update { prev ->
             prev.copy(
                 detectorBackend = option.backend,
                 liveModelProfile = option.liveProfile ?: prev.liveModelProfile,
                 syntheticProfile = option.syntheticProfile ?: prev.syntheticProfile,
-                detectorStatus = option.liveProfile?.statusBadge ?: prev.detectorStatus
+                detectorStatus = option.liveProfile?.statusBadge ?: prev.detectorStatus,
+                isCompilingModel = needsAsyncCompile
             )
+        }
+        if (option.backend == DetectorBackend.RF_DETR_NANO_GPU) {
+            scheduleInferenceDrainIfNeeded()
         }
     }
 
@@ -690,7 +706,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
      */
     private fun drainLatestSweepOnInferenceThread() {
         try {
+            if (!isShuttingDown.get() &&
+                _uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
+                (!rfDetrGpuDetector.isDesiredProfileCompiled || !rfDetrGpuDetector.isLockOnHardwareReady)
+            ) {
+                rfDetrGpuDetector.ensureCompiledAndWarmOnInferenceThread()
+            }
             while (!isShuttingDown.get()) {
+                if (_uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
+                    !rfDetrGpuDetector.isDesiredProfileCompiled
+                ) {
+                    rfDetrGpuDetector.ensureCompiledAndWarmOnInferenceThread()
+                }
                 val slot = latestReadySlot.getAndSet(null) ?: break
                 slot.inUseByConsumer.set(true)
                 try {
@@ -701,7 +728,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             }
         } finally {
             inferenceRunning.set(false)
-            if (!isShuttingDown.get() && latestReadySlot.get() != null) {
+            val needsFollowUpCompile = _uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
+                !rfDetrGpuDetector.isDesiredProfileCompiled
+            if (!isShuttingDown.get() && (latestReadySlot.get() != null || needsFollowUpCompile)) {
                 scheduleInferenceDrainIfNeeded()
             }
         }
