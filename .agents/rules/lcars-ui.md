@@ -1,46 +1,38 @@
 ---
 trigger: glob
 globs: "android/**"
-description: Classic 2360s TNG LCARS 6-role color taxonomy, GneissFind + git-hash/date shoulders, central LOCK NEAREST / BREAK LOCK actuator, and full-screen Lock-On HUD symbology.
+description: Standing Classic 2360s TNG LCARS design language, semantic color roles, tabular stability, ambidextrous ergonomics, and outdoor AR overlay principles.
 ---
 
-# GneissFind Classic 2360s TNG LCARS UI Rules (Milestone 2C)
+# Classic 2360s TNG LCARS UI & Field UX Principles
 
-## 1. Preserved Visual & Semantic Invariants (`8707282`)
-1. **Pure `#000000` OLED Canvas & `4.dp` Gutters:** Zero translucent cards, drop shadows, or modal popups over the camera viewport.
-2. **Silent UI Chrome:** `isSoundEffectsEnabled = false` on all LCARS controls (`80 ms` `#FFFFFF` tap flash only).
-3. **Preserved 6-Role `LcarsSemanticColors` (`valueStepDelta = 0.05f`):**
-   - **On/Off Toggles (`#FF9900` Golden Amber; `#596480` Slate Blue when OFF):** `OPT` (`2.0X CROP`), `EXP` (`1/500S`), `EIS` (`EIS LOCK`), `EYE` (`EYES-UP` idle patrol OLED dim toggle), and the 4 `PROSPECT MATRIX` mineral pills.
-   - **Multi-State Mode Toggles (`#9999FF` Periwinkle):** `MOD` (`SCAN / LOG`), `SND` (`AUDIO / MUTE`), `SW` (`5-TILE / 3-TILE`).
-   - **Action / Drawer Triggers (`#FFCC66` TNG Gold):** `CAL` (`SYNC PITCH`), **`LOCK NEAREST`** (when active target available), `SRC` (`MODEL SELECTOR`), and `-` / `+` EV steppers.
-   - **Realtime Telemetry (`#99CCFF` Ice Blue):** `PITCH`, `VEL`, `FPS`, `Y-PX`, and `SWEEP` (`MS` + mode badge).
-   - **Static / Config State (`#FFCC99` Peach):** `RANGE • RESOLUTION`, `OPTICS • SHUTTER • ISO`, `REC` counter, swath/lock status code, and build provenance shoulder.
-   - **Critical / Limit / Break Alerts (`#CC4444` Mars Red):** **`BREAK LOCK`** (active Lock-On release), `PITCH LIMIT`, `SLOW SWEEP`, and active `LOG`.
+## 1. Framing, Geometry & OLED Discipline
+- **Pure `#000000` Canvas & Crisp Gutters:** Anchor all layouts on true `#000000` black with uniform `4.dp` black gutters between bars, elbows, and pills. Never use drop shadows, gradients, blurs, translucent cards, or modal dialogs over the camera viewport.
+- **Architectural Framing:** Frame viewports and control decks with swept LCARS elbows, slim telemetry rails, and capsule/flat-ended pills. Reserve outer shoulders for permanent app identity and compile-time build provenance.
+- **OLED Longevity:** Support low-luminance viewport dimming during prolonged idle Eyes-Up operation, waking immediately on touch or target activity.
 
-## 2. Mandatory LCARS Shoulder Updates (Build Provenance & Identity)
-1. **Top-Left Shoulder (`TopLeft` `LcarsElbow`):**
-   - Replace the `"GEO-47"` shoulder label with **`GNEISSFIND`** (rendered cleanly in bundled `Antonio` bold uppercase).
-2. **Bottom-Left Shoulder (`BottomLeft` `LcarsElbow`):**
-   - Display the **6-character Git commit hash** AND **ISO build date** injected via Gradle `BuildConfig` (`BuildConfig.GIT_COMMIT_HASH_6` + `BuildConfig.BUILD_DATE_ISO`), formatted compactly with tabular numerals so it fits the shoulder bar/stem cleanly without clipping (e.g., `A0FE74 • 2026-11-16` along the bottom-left elbow rail or stacked `A0FE74` / `26-11-16` if placed in the narrow `68.dp` vertical stem—pick whichever renders at crisp legible `>= 11.sp` without truncation!).
+## 2. Semantic Color Roles
+Color communicates **control behavior and system state**, never arbitrary decoration (use subtle value steps to separate adjacent blocks of the same role):
+- **Binary Toggles:** `#FF9900` Golden Amber when active; `#596480` Slate Blue when inactive/disabled.
+- **Multi-State Selectors:** `#9999FF` Periwinkle for cycling between discrete operating modes.
+- **Actions & Drawers:** `#FFCC66` TNG Gold for one-shot triggers, steppers, and expandable selectors.
+- **Live Telemetry:** `#99CCFF` Ice Blue for continuously updating sensor and timing readouts.
+- **Configuration & Identity:** `#FFCC99` Peach for static state, optics configuration, and provenance Chrome.
+- **Alerts & Release Actions:** `#CC4444` Mars Red for critical limits, active data capture, and immediate lock-release / abort controls.
+- **1:1 Gauge Correlation:** Any bar or meter must share the exact semantic color of its label and numeric value so the relationship is unmistakable at a glance.
 
-## 3. Central Ambidextrous `LOCK NEAREST` / `BREAK LOCK` Button & `SRC` Swap
-- **Remove `SPEED SIM` (`SIM`)** from the main tactical control deck (synthetic overspeed tests remain accessible via unit tests or `SRC` synthetic profiles).
-- **Single Stateful Lock Button (`LOCK NEAREST` <-> `BREAK LOCK`):**
-  - Occupies the former `SRC` slot **immediately adjacent to the horizontal center divider** of the landscape control deck so it is centrally reachable by either left or right thumb!
-  - Move **`SRC` (`MODEL SELECTOR`)** to the outer right slot formerly occupied by `SPEED SIM`.
-  - **Visual States of the Central Lock Button:**
-    1. `PATROL` with `0` visible confirmed targets: `#596480` Slate Blue, label **`LOCK NEAREST`** (tapping does nothing or flashes subtle standby).
-    2. `PATROL` with `>= 1` visible confirmed target: `#FFCC66` TNG Gold, label **`LOCK NEAREST`** (tapping locks onto the nearest visible target).
-    3. `LOCK-ON` or `PINPOINT` active (including during the `15s` lost-track grace countdown): `#CC4444` Mars Red, label **`BREAK LOCK`** (or `BREAK LOCK [12S]` when counting down lost track; tapping immediately returns to `PATROL`).
+## 3. Typography, Layout Stability & Non-Redundancy
+- **Tabular Uppercase Display:** Use condensed uppercase `Antonio` typography with tabular numerals (`tnum`) on all counters, timers, angles, and rates.
+- **Zero-Jitter Readouts:** Live numbers and HUD badges must never resize their containers or shift neighboring elements as digit counts change (use fixed-width slots or monotonic high-water-mark widths).
+- **Single Source of Truth:** Display each metric in one canonical location. Avoid repeating the same range, accuracy, or size readout across headers, side panels, and viewport overlays.
 
-## 4. Full-Screen `16:9` Homing Layout & Symbology (`LOCK-ON` & `PINPOINT`)
-- **Tap-to-Lock Hit Target:** In `PATROL` mode, tapping any visible `ConfirmedTarget` reticle in the top viewport (`>= 48.dp` minimum touch target around reticle center) immediately enters `LOCK-ON` on that target.
-- **Full-Screen `16:9` Video Expansion (Persistent `PreviewView`):**
-  - When `acquisitionStage != AcquisitionStage.PATROL`, hide the lower `TacticalControlDeckZone` and all parameter/toggle buttons (`OPT`, `EXP`, `EYE`, `EIS`, `CAL`, `SW`, `MOD`, `SND`, `PROSPECT MATRIX`, `SRC`) while keeping `GeologicalViewportZone` and `PanoramicCameraViewport` mounted at the exact same Compose call-site (zero `PreviewView` teardown/rebind).
-  - The uncropped `16:9` camera feed expands to fill the entire vertical height between the slim `22.dp` top and bottom LCARS telemetry rails (`GNEISSFIND` top-left elbow + left passive telemetry stem + bottom-left build-provenance elbow).
-  - Alongside the `16:9` video feed in the right-hand `168.dp` `LockOnSideConsole` pillarbox, render non-redundant, explicitly labeled 1:1 color-correlated LCARS sensor gauges (`MODEL CONF`, `3D ANGLES`, and `TEXTURE PTS` / `HOLD TIMER`), the mineral signature + physical diameter card (`EST. SIZE`), and the **sole interactive button on screen**: the `#CC4444` Mars Red **`BREAK LOCK`** (`BREAK [12S]` during grace countdown) actuator. Do not duplicate `RANGE` or `±MM` from the top bar in the side console or left stem.
-  - Hide the `384 px` horizontal push-broom strip lines and tile seam ticks while locked on.
-  - Render the high-visibility `#000000`-keylined `IceBlue` dashed `320x320` neural detector crop square (`B=1 320` / `1HZ 320`) in **both** `LOCK_ON_NEURAL` and `1 Hz` `PINPOINT_CONSTELLATION`, plus the world-locked `1 Hz` neural detector stone box inside the `320x320` window when `PINPOINT_CONSTELLATION` is active.
-  - Draw a high-contrast mineral-colored target bracket + **shrinking dashed uncertainty circle** representing `sigma3dMm` projected into pixels (`solid double-ring crosshair` once `PINPOINT` `AKAZE` constellation guidance engages at `sigma3dMm < 0.5 * D`), with **no floating text badge** over the target reticle.
-  - **Off-Screen Re-Acquisition Chevron:** If camera motion moves the 3D target outside the `16:9` viewport during the `15s` grace period, hold Lock Mode for the full `15.0 s` window and draw a pulsing `GoldenAmber` / mineral-colored directional chevron clamped to the nearest viewport edge pointing directly toward the 3D anchor with fixed-width angular offset + countdown (`e.g., <- 18° [14S]`).
-- **Async Model Compilation Banner:** When switching models in `SRC`, never freeze the UI thread; keep preview live and show a clean inline LCARS banner `COMPILING GPU SHADERS...` (`< 0.5 s` on cached warm loads).
+## 4. Ambidextrous Ergonomics & Silent Chrome
+- **Two-Handed Landscape Reach:** Place high-frequency field actions near the horizontal center of landscape layouts so they are equally reachable by either left or right thumb.
+- **Field Touch Targets:** Maintain `>= 48.dp` effective hit bounds on interactive controls and tap-selectable viewport reticles for outdoor, walking, or gloved use.
+- **Acoustic Exclusivity:** Keep all UI touches silent (`isSoundEffectsEnabled = false`, using brief `#FFFFFF` tap-flash feedback instead) so interface chrome never competes with audio sonification.
+
+## 5. Viewport Continuity & Anti-Camouflage Symbology
+- **Persistent Camera Surface:** Transitions between scanning and target-inspection modes must re-frame the existing camera view in place without tearing down or rebinding the underlying preview surface.
+- **Task-Focused Chrome:** Collapse non-essential configuration controls during focused inspection/homing modes to maximize live video area while retaining LCARS structural framing and an unmistakable exit action.
+- **High-Contrast Keylined Overlays:** Every reticle, bracket, crosshair, directional indicator, and ROI boundary drawn over live video must carry a `#000000` outer keyline halo for legibility against bright or wet gravel.
+- **Honest Visual Lock & Uncluttered Targets:** Reticle geometry (e.g., solid vs. dashed crosshair) must reflect actual live tracking lock rather than nominal mode. Keep tracked subjects free of floating text labels that flicker or occlude the target, and keep background work (such as shader compilation) non-blocking via compact inline status banners.
