@@ -22,6 +22,8 @@
 - **Immediate Atomic Commit:** Stage relevant files and commit with a **single-sentence imperative summary**.
 - **Compile-Time Build Provenance:** `android/app/build.gradle.kts` injects `BuildConfig.GIT_COMMIT_HASH_6` (`git rev-parse --short=6 HEAD`) and `BuildConfig.BUILD_DATE_ISO` (`YYYY-MM-DD`), displayed in the bottom-left LCARS shoulder (`BottomLeft` elbow); top-left shoulder (`TopLeft` elbow) displays `GNEISSFIND`.
 - **Ledger Sync:** Append crash postmortems, benchmark tables, hardware discoveries, and commit hashes to `docs/ENGINEERING_LEDGER.md` and run `./scripts/pack_context.sh` at milestone completion.
+- **`N - 1` Ledger Compaction Rule:** Keep `docs/ENGINEERING_LEDGER.md` capped at `<= 16 KB` (`< 14 KB` target) with distilled invariants, dead-end tombstones, and full write-ups for only the rolling `N - 1` and `N` milestones.
+  - At milestone `N` close, move verbatim `M_{N-2}` write-ups into `docs/archive/` (excluded from `scripts/pack_context.sh`) and distill any new durable invariants or dead-ends into `§2–§3`.
 - **Never Commit:** `build/`, `.gradle/`, `.venv/`, `local.properties`, raw `.mp4` field captures (`> 10 MB`), or un-LFS'd large model binaries.
 
 ---
