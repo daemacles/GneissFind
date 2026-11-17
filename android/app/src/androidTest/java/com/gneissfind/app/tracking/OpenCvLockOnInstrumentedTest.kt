@@ -371,6 +371,116 @@ class OpenCvLockOnInstrumentedTest {
         }
     }
 
+    @Test
+    fun fullFrame640x360KltVoUnder2MsAnd480x270RelocalizationRecoversLargeDrift() {
+        assertThat(OpenCvConstellationTracker.ensureOpenCvInitialized()).isTrue()
+        val width = 1920
+        val height = 1080
+        val baseMat = synthesizeGravelBedWithSmoothAgate(width, height)
+        val baseBytes = ByteArray(width * height)
+        baseMat.get(0, 0, baseBytes)
+
+        // Shift scene by +136 px X, -64 px Y (large post-occlusion / off-screen VO drift!)
+        val shiftedMat = Mat(height, width, CvType.CV_8UC1)
+        val warpLarge = Imgproc.getRotationMatrix2D(Point(960.0, 540.0), -3.2, 1.04)
+        warpLarge.put(0, 2, warpLarge.get(0, 2)[0] + 136.0)
+        warpLarge.put(1, 2, warpLarge.get(1, 2)[0] - 64.0)
+        Imgproc.warpAffine(baseMat, shiftedMat, warpLarge, Size(width.toDouble(), height.toDouble()))
+
+        // Also create a realistic inter-frame VO step (+14 px X, -6 px Y) to benchmark 640x360 PyrLK latency
+        val stepMat = Mat(height, width, CvType.CV_8UC1)
+        val warpStep = Imgproc.getRotationMatrix2D(Point(960.0, 540.0), 0.25, 1.0)
+        warpStep.put(0, 2, warpStep.get(0, 2)[0] + 14.0)
+        warpStep.put(1, 2, warpStep.get(1, 2)[0] - 6.0)
+        Imgproc.warpAffine(baseMat, stepMat, warpStep, Size(width.toDouble(), height.toDouble()))
+        warpStep.release()
+
+        val stepBytes = ByteArray(width * height)
+        stepMat.get(0, 0, stepBytes)
+        val shiftedBytes = ByteArray(width * height)
+        shiftedMat.get(0, 0, shiftedBytes)
+
+        val tracker = OpenCvConstellationTracker()
+        try {
+            // 1. Benchmark 640x360 full-frame PyrLK + RANSAC VO (< 2.0 ms warm median budget on Tensor G5)
+            tracker.trackGravelFlowCorrespondences(
+                lumaBytes = baseBytes,
+                widthPx = width,
+                heightPx = height,
+                excludeLeftPx = 924f,
+                excludeTopPx = 504f,
+                excludeRightPx = 996f,
+                excludeBottomPx = 576f,
+                excludeTargetRegion = false
+            )
+            // Warmup x2
+            tracker.trackGravelFlowCorrespondences(stepBytes, width, height, 0f, 0f, 0f, 0f, false)
+            tracker.trackGravelFlowCorrespondences(baseBytes, width, height, 0f, 0f, 0f, 0f, false)
+
+            val voLatenciesMs = FloatArray(15)
+            var lastInliers = 0
+            for (i in voLatenciesMs.indices) {
+                val frame = if (i % 2 == 0) stepBytes else baseBytes
+                val flow = tracker.trackGravelFlowCorrespondences(
+                    lumaBytes = frame,
+                    widthPx = width,
+                    heightPx = height,
+                    excludeLeftPx = 924f,
+                    excludeTopPx = 504f,
+                    excludeRightPx = 996f,
+                    excludeBottomPx = 576f,
+                    excludeTargetRegion = false
+                )
+                assertThat(flow).isNotNull()
+                lastInliers = flow!!.inlierCount
+                voLatenciesMs[i] = flow.latencyMs
+            }
+            voLatenciesMs.sort()
+            val medianVoMs = voLatenciesMs[voLatenciesMs.size / 2]
+            Log.i(
+                TAG,
+                "M2D_BENCH 640x360 PyrLK VO warm median=${String.format("%.2f", medianVoMs)}ms, inliers=$lastInliers"
+            )
+            assertThat(lastInliers).isAtLeast(30)
+            assertThat(medianVoMs).isLessThan(2.0f)
+
+            // 2. Verify 480x270 full-frame AKAZE relocalization recovers exact stone center after +136px/-64px drift!
+            val seededReloc = tracker.seedFullFrameRelocalizationSnapshot(
+                lumaBytes = baseBytes,
+                widthPx = width,
+                heightPx = height,
+                stoneCenterXPx = 960f,
+                stoneCenterYPx = 540f
+            )
+            assertThat(seededReloc).isTrue()
+
+            val m = DoubleArray(6)
+            warpLarge.get(0, 0, m)
+            val expectedX = (m[0] * 960.0 + m[1] * 540.0 + m[2]).toFloat()
+            val expectedY = (m[3] * 960.0 + m[4] * 540.0 + m[5]).toFloat()
+
+            val reloc = tracker.matchFullFrameRelocalization(
+                lumaBytes = shiftedBytes,
+                widthPx = width,
+                heightPx = height
+            )
+            Log.i(
+                TAG,
+                "M2D_BENCH 480x270 AKAZE reloc matched=${reloc.matched}, inliers=${reloc.inliers}, latency=${String.format("%.2f", reloc.latencyMs)}ms"
+            )
+            assertThat(reloc.matched).isTrue()
+            assertThat(reloc.inliers).isAtLeast(OpenCvConstellationTracker.MIN_RELOC_INLIERS)
+            assertThat(reloc.stoneCenterXPx).isWithin(8.0f).of(expectedX)
+            assertThat(reloc.stoneCenterYPx).isWithin(8.0f).of(expectedY)
+        } finally {
+            warpLarge.release()
+            baseMat.release()
+            shiftedMat.release()
+            stepMat.release()
+            tracker.close()
+        }
+    }
+
     private fun synthesizeGravelBedWithSmoothAgate(width: Int, height: Int): Mat {
         val mat = Mat(height, width, CvType.CV_8UC1, Scalar(96.0))
         val rng = Random(424242L)

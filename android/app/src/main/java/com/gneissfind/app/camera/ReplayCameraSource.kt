@@ -70,6 +70,7 @@ data class ReplayRunSummary(
     val handovers: Int,
     val lostLocks: Int,
     val distractorJumps: Int,
+    val distractorsRejected: Int = 0,
     val exceptions: Int
 ) {
     /** Formats the structured Logcat line parsed by `adb logcat -d -s GneissFindReplay:I`. */
@@ -82,6 +83,7 @@ data class ReplayRunSummary(
             "\"handovers\":$handovers," +
             "\"lost_locks\":$lostLocks," +
             "\"distractor_jumps\":$distractorJumps," +
+            "\"distractors_rejected\":$distractorsRejected," +
             "\"exceptions\":$exceptions}"
     }
 }

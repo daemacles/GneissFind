@@ -332,6 +332,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 handovers = replayHandoversCount.get(),
                 lostLocks = replayLostLocksCount.get(),
                 distractorJumps = replayDistractorJumpsCount.get(),
+                distractorsRejected = lockOnController.rejectedDistractorCount,
                 exceptions = caughtExceptions
             )
         }

@@ -40,16 +40,39 @@ import kotlin.math.sqrt
 
 /**
  * RANSAC-filtered inter-frame gravel correspondences on the `1920x1080` frame used to solve
- * metric 3D camera translation (`(dEast, dNorth, dUp)`) during Stage 2 (`LOCK_ON_NEURAL`).
+ * metric 3D camera translation (`(dEast, dNorth, dUp)`) across Stage 2 (`LOCK_ON_NEURAL`) and
+ * Stage 3 (`PINPOINT_CONSTELLATION`), including during target occlusion and off-screen pans.
  *
  * @property prevFramePointsXY Flat `[u0, v0, u1, v1, ...]` coordinates in the previous `1920x1080` frame.
  * @property currFramePointsXY Flat `[u0, v0, u1, v1, ...]` coordinates in the current `1920x1080` frame.
  * @property inlierCount Number of RANSAC planar-gravel inlier correspondences (`prevFramePointsXY.size / 2`).
+ * @property latencyMs Wall-clock OpenCV CPU execution latency in milliseconds (`< 2 ms` budget on `640x360`).
  */
 class GravelFlowCorrespondences(
     val prevFramePointsXY: FloatArray,
     val currFramePointsXY: FloatArray,
-    val inlierCount: Int
+    val inlierCount: Int,
+    val latencyMs: Float = 0f
+)
+
+/**
+ * Result of matching a `480x270` (`1/4`-scale) full-frame `AKAZE` relocalization snapshot
+ * against a live `1920x1080` luminance frame (`~5 Hz` during post-occlusion / off-screen re-entry)
+ * to snap out accumulated KLT visual odometry drift.
+ *
+ * @property matched True when `USAC_MAGSAC` homography succeeded with `inliers >= MIN_RELOC_INLIERS`
+ *   and physically valid planar scale bounds.
+ * @property inliers Number of `USAC_MAGSAC` homography inlier keypoint matches.
+ * @property stoneCenterXPx Homography-projected stone horizontal center in `1920x1080` pixels.
+ * @property stoneCenterYPx Homography-projected stone vertical center in `1920x1080` pixels.
+ * @property latencyMs Wall-clock OpenCV CPU execution latency in milliseconds.
+ */
+data class RelocalizationMatchResult(
+    val matched: Boolean,
+    val inliers: Int,
+    val stoneCenterXPx: Float = 0f,
+    val stoneCenterYPx: Float = 0f,
+    val latencyMs: Float = 0f
 )
 
 /**
@@ -78,27 +101,30 @@ data class ConstellationMatchResult(
 )
 
 /**
- * Stateful OpenCV C++ JNI tracker managing both:
- * 1. **Stage 2 Ground-Plane KLT + RANSAC (`trackGravelFlowCorrespondences`)** and **`Calib3d.triangulatePoints`**.
- * 2. **Stage 3 `AKAZE` Gravel-Constellation Homography (`seedConstellationCollar` / `matchConstellationFrame`)**
- *    with automatic rolling scale re-keyframing every `1.8x` scale change (`1.5m -> 0.25m`).
+ * Stateful OpenCV C++ JNI tracker managing:
+ * 1. **Full-Frame `640x360` Ego-Motion Ground-Plane KLT + RANSAC (`trackGravelFlowCorrespondences`, `< 2 ms` CPU)**
+ *    and **`Calib3d.triangulatePoints`**.
+ * 2. **Stage 3 `192x192` (`3.0x` target-diameter) `AKAZE` Gravel-Constellation Homography (`seedConstellationCollar` /
+ *    `matchConstellationFrame`, `< 5 ms` CPU)** with rolling scale re-keyframing.
+ * 3. **Stage 3 `480x270` (`1/4`-scale) Full-Frame `AKAZE` Relocalization Snapshot (`seedFullFrameRelocalizationSnapshot` /
+ *    `matchFullFrameRelocalization`)** matched at `~5 Hz` on post-occlusion re-entry to reset VO drift.
  *
  * Threading: Confined to a single sequential tracking worker (`LockOnPinpointController` lock).
  */
-class OpenCvConstellationTracker : AutoCloseable {
+open class OpenCvConstellationTracker : AutoCloseable {
 
     private var fullGrayMat: Mat? = null
-    private var prevHalfGrayMat: Mat? = null
-    private var currHalfGrayMat: Mat? = null
-    private var halfMaskMat: Mat? = null
-    private var hasPrevHalfFrame: Boolean = false
+    private var prevVoGrayMat: Mat? = null
+    private var currVoGrayMat: Mat? = null
+    private var voMaskMat: Mat? = null
+    private var hasPrevVoFrame: Boolean = false
 
     private var akaze: AKAZE? = null
     private var bfMatcher: BFMatcher? = null
     private var canonicalPatchMat: Mat? = null
     private var emptyMaskMat: Mat? = null
 
-    // Active reference constellation keyframe (updated on rolling 1.8x scale transitions)
+    // Active reference constellation collar keyframe (updated on rolling scale transitions)
     private var refDescriptors: Mat? = null
     private var refKeypointCoords: Array<Point> = emptyArray()
     private var refCollarWidthPx: Int = 320
@@ -110,24 +136,39 @@ class OpenCvConstellationTracker : AutoCloseable {
     private var keyframeBaseScale: Float = 1.0f
     private var latestRelativeScale: Float = 1.0f
 
-    /** True when a valid `AKAZE` reference constellation collar is currently seeded. */
-    var hasSeededConstellation: Boolean = false
-        private set
+    // 480x270 (1/4-scale) full-frame AKAZE relocalization snapshot (<= 220 keypoints)
+    private var relocGrayMat: Mat? = null
+    private var relocRefDescriptors: Mat? = null
+    private var relocRefKeypointCoordsFull: Array<Point> = emptyArray()
+    private var relocRefStoneCenterFull: Point = Point(960.0, 540.0)
 
-    /** Resets all KLT history and active `AKAZE` constellation keyframes when exiting Lock-On. */
-    fun resetSession() {
-        hasPrevHalfFrame = false
+    /** True when a valid `AKAZE` reference constellation collar is currently seeded. */
+    open var hasSeededConstellation: Boolean = false
+        protected set
+
+    /** True when a `480x270` full-frame `AKAZE` relocalization snapshot is currently seeded. */
+    open var hasRelocalizationSnapshot: Boolean = false
+        protected set
+
+    /** Resets all KLT history, active `AKAZE` collar keyframes, and relocalization snapshots when exiting Lock-On. */
+    open fun resetSession() {
+        hasPrevVoFrame = false
         hasSeededConstellation = false
+        hasRelocalizationSnapshot = false
         refKeypointCoords = emptyArray()
+        relocRefKeypointCoordsFull = emptyArray()
         keyframeBaseScale = 1.0f
         latestRelativeScale = 1.0f
         refDescriptors?.release()
         refDescriptors = null
+        relocRefDescriptors?.release()
+        relocRefDescriptors = null
     }
 
     /**
      * Uploads an upright `1920x1080` luminance byte array into the reusable `CV_8UC1` [fullGrayMat]
-     * and computes RANSAC-filtered inter-frame KLT gravel correspondences outside the target stone box.
+     * and computes RANSAC-filtered inter-frame KLT correspondences on a `640x360` (`1/3`-scale)
+     * frame across `80–120` corners (`< 2 ms` CPU).
      *
      * @param lumaBytes Upright single-channel luminance buffer (`widthPx * heightPx` bytes).
      * @param widthPx Upright frame width in pixels (`1920`).
@@ -136,61 +177,72 @@ class OpenCvConstellationTracker : AutoCloseable {
      * @param excludeTopPx Top Y of target stone exclusion region in `1920x1080` pixels.
      * @param excludeRightPx Right X of target stone exclusion region in `1920x1080` pixels.
      * @param excludeBottomPx Bottom Y of target stone exclusion region in `1920x1080` pixels.
+     * @param excludeTargetRegion When `true`, masks out the target stone + specular halo; when `false`
+     *   (target occluded or off-screen), tracks corners across the entire `16:9` frame.
      * @return [GravelFlowCorrespondences], or `null` on the first frame or when native OpenCV is unavailable.
      */
-    fun trackGravelFlowCorrespondences(
+    open fun trackGravelFlowCorrespondences(
         lumaBytes: ByteArray,
         widthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
         heightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX,
         excludeLeftPx: Float,
         excludeTopPx: Float,
         excludeRightPx: Float,
-        excludeBottomPx: Float
+        excludeBottomPx: Float,
+        excludeTargetRegion: Boolean = true
     ): GravelFlowCorrespondences? {
+        val startNs = SystemClock.elapsedRealtimeNanos()
         if (!ensureOpenCvInitialized()) return null
-        if (lumaBytes.size < widthPx * heightPx) return null
+        if (widthPx < 64 || heightPx < 36 || lumaBytes.size < widthPx * heightPx) return null
 
         val fullMat = ensureFullGrayMat(widthPx, heightPx)
         fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
 
-        val halfW = widthPx / 2
-        val halfH = heightPx / 2
-        val currHalf = prevOrAllocMat(currHalfGrayMat, halfH, halfW, CvType.CV_8UC1).also {
-            currHalfGrayMat = it
-        }
-        val prevHalf = prevOrAllocMat(prevHalfGrayMat, halfH, halfW, CvType.CV_8UC1).also {
-            prevHalfGrayMat = it
-        }
-        Imgproc.resize(fullMat, currHalf, Size(halfW.toDouble(), halfH.toDouble()))
+        // 1/3-scale (640x360 on 1920x1080) keeps full-frame ego-motion KLT + RANSAC well below 2.0 ms CPU
+        val voW = max(64, widthPx / VO_DOWNSCALE_DIVISOR)
+        val voH = max(36, heightPx / VO_DOWNSCALE_DIVISOR)
+        val scaleToVoX = voW.toFloat() / widthPx.toFloat()
+        val scaleToVoY = voH.toFloat() / heightPx.toFloat()
+        val scaleFromVoX = widthPx.toDouble() / voW.toDouble()
+        val scaleFromVoY = heightPx.toDouble() / voH.toDouble()
 
-        if (!hasPrevHalfFrame) {
-            currHalf.copyTo(prevHalf)
-            hasPrevHalfFrame = true
+        val currVo = prevOrAllocMat(currVoGrayMat, voH, voW, CvType.CV_8UC1).also {
+            currVoGrayMat = it
+        }
+        val prevVo = prevOrAllocMat(prevVoGrayMat, voH, voW, CvType.CV_8UC1).also {
+            prevVoGrayMat = it
+        }
+        Imgproc.resize(fullMat, currVo, Size(voW.toDouble(), voH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+
+        if (!hasPrevVoFrame) {
+            currVo.copyTo(prevVo)
+            hasPrevVoFrame = true
             return null
         }
 
-        val mask = prevOrAllocMat(halfMaskMat, halfH, halfW, CvType.CV_8UC1).also {
-            halfMaskMat = it
+        val mask = prevOrAllocMat(voMaskMat, voH, voW, CvType.CV_8UC1).also {
+            voMaskMat = it
         }
         mask.setTo(Scalar(255.0))
-        // Mask out the stone + 24 px specular halo on the half-res frame when inside viewport bounds
-        if (excludeLeftPx.isFinite() && excludeTopPx.isFinite() &&
+        // Mask out the stone + 8 px (24 px full-res) specular halo when visible and unoccluded
+        if (excludeTargetRegion &&
+            excludeLeftPx.isFinite() && excludeTopPx.isFinite() &&
             excludeRightPx.isFinite() && excludeBottomPx.isFinite() &&
             excludeRightPx > 0f && excludeBottomPx > 0f &&
             excludeLeftPx < widthPx.toFloat() && excludeTopPx < heightPx.toFloat()
         ) {
-            val rawExL = (excludeLeftPx.finiteOr(0f) * 0.5f).roundToInt() - 12
-            val rawExT = (excludeTopPx.finiteOr(0f) * 0.5f).roundToInt() - 12
-            val rawExR = (excludeRightPx.finiteOr(0f) * 0.5f).roundToInt() + 12
-            val rawExB = (excludeBottomPx.finiteOr(0f) * 0.5f).roundToInt() + 12
-            val clampedL = rawExL.coerceIn(0, (halfW - 2).coerceAtLeast(0))
-            val clampedT = rawExT.coerceIn(0, (halfH - 2).coerceAtLeast(0))
-            val clampedR = rawExR.coerceIn(clampedL, halfW)
-            val clampedB = rawExB.coerceIn(clampedT, halfH)
+            val rawExL = (excludeLeftPx.finiteOr(0f) * scaleToVoX).roundToInt() - 8
+            val rawExT = (excludeTopPx.finiteOr(0f) * scaleToVoY).roundToInt() - 8
+            val rawExR = (excludeRightPx.finiteOr(0f) * scaleToVoX).roundToInt() + 8
+            val rawExB = (excludeBottomPx.finiteOr(0f) * scaleToVoY).roundToInt() + 8
+            val clampedL = rawExL.coerceIn(0, (voW - 2).coerceAtLeast(0))
+            val clampedT = rawExT.coerceIn(0, (voH - 2).coerceAtLeast(0))
+            val clampedR = rawExR.coerceIn(clampedL, voW)
+            val clampedB = rawExB.coerceIn(clampedT, voH)
             if (clampedR - clampedL >= 2 && clampedB - clampedT >= 2) {
                 val safeRect = computeSafeSubmatRect(
-                    cols = halfW,
-                    rows = halfH,
+                    cols = voW,
+                    rows = voH,
                     rawX = clampedL,
                     rawY = clampedT,
                     rawW = clampedR - clampedL,
@@ -214,29 +266,29 @@ class OpenCvConstellationTracker : AutoCloseable {
 
         try {
             Imgproc.goodFeaturesToTrack(
-                prevHalf,
+                prevVo,
                 corners,
                 MAX_VO_GRAVEL_CORNERS,
                 0.02,
-                14.0,
+                11.0,
                 mask,
                 3
             )
             val cornerArr = corners.toArray()
             if (cornerArr.size < MIN_VO_INLIERS) {
-                currHalf.copyTo(prevHalf)
+                currVo.copyTo(prevVo)
                 return null
             }
             prevPts2f.fromArray(*cornerArr)
             Video.calcOpticalFlowPyrLK(
-                prevHalf,
-                currHalf,
+                prevVo,
+                currVo,
                 prevPts2f,
                 nextPts2f,
                 status,
                 err,
-                Size(21.0, 21.0),
-                3
+                Size(17.0, 17.0),
+                2
             )
 
             val nextArr = nextPts2f.toArray()
@@ -246,16 +298,16 @@ class OpenCvConstellationTracker : AutoCloseable {
             val trackedCurr = ArrayList<Point>(cornerArr.size)
             for (i in cornerArr.indices) {
                 if (i < statusArr.size && statusArr[i].toInt() == 1 &&
-                    (i >= errArr.size || errArr[i] < 24.0f)
+                    (i >= errArr.size || errArr[i] < 22.0f)
                 ) {
                     val p = nextArr[i]
-                    if (p.x in 2.0..(halfW - 3.0) && p.y in 2.0..(halfH - 3.0)) {
+                    if (p.x in 2.0..(voW - 3.0) && p.y in 2.0..(voH - 3.0)) {
                         trackedPrev.add(cornerArr[i])
                         trackedCurr.add(p)
                     }
                 }
             }
-            currHalf.copyTo(prevHalf)
+            currVo.copyTo(prevVo)
 
             if (trackedPrev.size < MIN_VO_INLIERS) return null
 
@@ -266,7 +318,7 @@ class OpenCvConstellationTracker : AutoCloseable {
                     srcMat,
                     dstMat,
                     Calib3d.RANSAC,
-                    3.0,
+                    2.5,
                     inlierMask
                 )
                 if (homography == null || homography.empty() || inlierMask.empty()) {
@@ -285,18 +337,20 @@ class OpenCvConstellationTracker : AutoCloseable {
                 var outIdx = 0
                 for (i in maskBytes.indices) {
                     if (maskBytes[i].toInt() != 0) {
-                        // Scale 2x from half-res back to canonical 1920x1080 pixel coordinates
-                        prevXY[outIdx] = (trackedPrev[i].x * 2.0).toFloat()
-                        prevXY[outIdx + 1] = (trackedPrev[i].y * 2.0).toFloat()
-                        currXY[outIdx] = (trackedCurr[i].x * 2.0).toFloat()
-                        currXY[outIdx + 1] = (trackedCurr[i].y * 2.0).toFloat()
+                        // Scale 3x from 640x360 back to canonical 1920x1080 pixel coordinates
+                        prevXY[outIdx] = (trackedPrev[i].x * scaleFromVoX).toFloat()
+                        prevXY[outIdx + 1] = (trackedPrev[i].y * scaleFromVoY).toFloat()
+                        currXY[outIdx] = (trackedCurr[i].x * scaleFromVoX).toFloat()
+                        currXY[outIdx + 1] = (trackedCurr[i].y * scaleFromVoY).toFloat()
                         outIdx += 2
                     }
                 }
+                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
                 return GravelFlowCorrespondences(
                     prevFramePointsXY = prevXY,
                     currFramePointsXY = currXY,
-                    inlierCount = count
+                    inlierCount = count,
+                    latencyMs = elapsedMs
                 )
             } finally {
                 srcMat.release()
@@ -393,7 +447,7 @@ class OpenCvConstellationTracker : AutoCloseable {
      * @param baseScale Cumulative scale factor of this keyframe (`1.0f` on initial Stage 2 -> Stage 3 handover).
      * @return True when `>= MIN_SEED_KEYPOINTS` `AKAZE` descriptors were extracted on the collar.
      */
-    fun seedConstellationCollar(
+    open fun seedConstellationCollar(
         lumaBytes: ByteArray?,
         widthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
         heightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX,
@@ -507,7 +561,7 @@ class OpenCvConstellationTracker : AutoCloseable {
      * @param predictedCenterYPx Predicted stone vertical center in `1920x1080` pixels.
      * @return [ConstellationMatchResult] with projected stone bounds, `USAC_MAGSAC` inlier count, and CPU latency.
      */
-    fun matchConstellationFrame(
+    open fun matchConstellationFrame(
         lumaBytes: ByteArray?,
         widthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
         heightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX,
@@ -740,16 +794,263 @@ class OpenCvConstellationTracker : AutoCloseable {
         }
     }
 
+    /**
+     * Captures a `480x270` (`1/4`-scale) full-frame `AKAZE` relocalization snapshot (`<= 220`
+     * strongest keypoints) anchored to `(stoneCenterXPx, stoneCenterYPx)` so post-occlusion or
+     * off-screen re-entry can snap out accumulated KLT visual odometry drift in a single `~5 Hz` check.
+     *
+     * @param lumaBytes Upright `1920x1080` luminance byte array (`null` reuses the already-uploaded [fullGrayMat]).
+     * @param widthPx Upright frame width in pixels (`1920`).
+     * @param heightPx Upright frame height in pixels (`1080`).
+     * @param stoneCenterXPx Locked stone horizontal center in `1920x1080` pixels.
+     * @param stoneCenterYPx Locked stone vertical center in `1920x1080` pixels.
+     * @return True when `>= MIN_RELOC_SEED_KEYPOINTS` descriptors were stored.
+     */
+    open fun seedFullFrameRelocalizationSnapshot(
+        lumaBytes: ByteArray?,
+        widthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
+        heightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX,
+        stoneCenterXPx: Float,
+        stoneCenterYPx: Float
+    ): Boolean {
+        if (!ensureOpenCvInitialized()) return false
+        if (widthPx < 64 || heightPx < 36) return false
+        val fullMat = ensureFullGrayMat(widthPx, heightPx)
+        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
+            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
+        }
+
+        val relocW = max(64, widthPx / RELOC_DOWNSCALE_DIVISOR)
+        val relocH = max(36, heightPx / RELOC_DOWNSCALE_DIVISOR)
+        val rMat = prevOrAllocMat(relocGrayMat, relocH, relocW, CvType.CV_8UC1).also {
+            relocGrayMat = it
+        }
+        val maskMat = ensureEmptyMaskMat()
+        val detector = ensureAkaze()
+        val keypoints = MatOfKeyPoint()
+        val descriptors = Mat()
+
+        try {
+            Imgproc.resize(fullMat, rMat, Size(relocW.toDouble(), relocH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            detector.detectAndCompute(rMat, maskMat, keypoints, descriptors)
+            val kpArray = keypoints.toArray()
+            if (kpArray.size < MIN_RELOC_SEED_KEYPOINTS || descriptors.empty()) {
+                descriptors.release()
+                return false
+            }
+
+            val scaleFromRelocX = widthPx.toDouble() / relocW.toDouble()
+            val scaleFromRelocY = heightPx.toDouble() / relocH.toDouble()
+
+            if (kpArray.size <= MAX_RELOC_KEYPOINTS) {
+                relocRefDescriptors?.release()
+                relocRefDescriptors = descriptors
+                relocRefKeypointCoordsFull = Array(kpArray.size) { idx ->
+                    val p = kpArray[idx].pt
+                    Point(p.x * scaleFromRelocX, p.y * scaleFromRelocY)
+                }
+            } else {
+                // Retain the strongest MAX_RELOC_KEYPOINTS (220) by AKAZE response to bound 5 Hz matching latency
+                val topIndices = kpArray.indices
+                    .sortedByDescending { kpArray[it].response }
+                    .take(MAX_RELOC_KEYPOINTS)
+                val trimmedDesc = Mat(MAX_RELOC_KEYPOINTS, descriptors.cols(), descriptors.type())
+                val rowBytes = ByteArray(descriptors.cols() * descriptors.elemSize().toInt())
+                val coords = Array(MAX_RELOC_KEYPOINTS) { outRow ->
+                    val srcIdx = topIndices[outRow]
+                    descriptors.get(srcIdx, 0, rowBytes)
+                    trimmedDesc.put(outRow, 0, rowBytes)
+                    val p = kpArray[srcIdx].pt
+                    Point(p.x * scaleFromRelocX, p.y * scaleFromRelocY)
+                }
+                descriptors.release()
+                relocRefDescriptors?.release()
+                relocRefDescriptors = trimmedDesc
+                relocRefKeypointCoordsFull = coords
+            }
+
+            relocRefStoneCenterFull = Point(
+                stoneCenterXPx.finiteOr(widthPx * 0.5f).toDouble(),
+                stoneCenterYPx.finiteOr(heightPx * 0.5f).toDouble()
+            )
+            hasRelocalizationSnapshot = true
+            return true
+        } finally {
+            keypoints.release()
+        }
+    }
+
+    /**
+     * Matches the live `1920x1080` frame (downsampled to `480x270`) against the stored full-frame
+     * `AKAZE` relocalization snapshot via `BFMatcher(NORM_HAMMING)` + Lowe `0.78` + `USAC_MAGSAC`
+     * homography to recover the exact stone pixel center even after `100+ px` VO drift.
+     *
+     * @param lumaBytes Upright `1920x1080` luminance byte array (`null` reuses the already-uploaded [fullGrayMat]).
+     * @param widthPx Upright frame width in pixels (`1920`).
+     * @param heightPx Upright frame height in pixels (`1080`).
+     * @return [RelocalizationMatchResult] with projected stone coordinates and CPU latency.
+     */
+    open fun matchFullFrameRelocalization(
+        lumaBytes: ByteArray?,
+        widthPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_WIDTH_PX,
+        heightPx: Int = StripRoiGeometry.LANDSCAPE_FRAME_HEIGHT_PX
+    ): RelocalizationMatchResult {
+        val startNs = SystemClock.elapsedRealtimeNanos()
+        if (!hasRelocalizationSnapshot || !ensureOpenCvInitialized()) {
+            return RelocalizationMatchResult(matched = false, inliers = 0)
+        }
+        val activeRefDesc = relocRefDescriptors
+            ?: return RelocalizationMatchResult(matched = false, inliers = 0)
+        if (activeRefDesc.empty() || relocRefKeypointCoordsFull.size < MIN_RELOC_SEED_KEYPOINTS ||
+            widthPx < 64 || heightPx < 36
+        ) {
+            return RelocalizationMatchResult(matched = false, inliers = 0)
+        }
+
+        val fullMat = ensureFullGrayMat(widthPx, heightPx)
+        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
+            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
+        }
+
+        val relocW = max(64, widthPx / RELOC_DOWNSCALE_DIVISOR)
+        val relocH = max(36, heightPx / RELOC_DOWNSCALE_DIVISOR)
+        val rMat = prevOrAllocMat(relocGrayMat, relocH, relocW, CvType.CV_8UC1).also {
+            relocGrayMat = it
+        }
+        val maskMat = ensureEmptyMaskMat()
+        val detector = ensureAkaze()
+        val matcher = ensureBfMatcher()
+        val liveKeypoints = MatOfKeyPoint()
+        val liveDescriptors = Mat()
+        val knnMatches = ArrayList<MatOfDMatch>()
+        var homography: Mat? = null
+        val inlierMask = Mat()
+
+        try {
+            Imgproc.resize(fullMat, rMat, Size(relocW.toDouble(), relocH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            detector.detectAndCompute(rMat, maskMat, liveKeypoints, liveDescriptors)
+            val liveKpArr = liveKeypoints.toArray()
+            if (liveKpArr.size < MIN_RELOC_INLIERS || liveDescriptors.empty()) {
+                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+            }
+
+            matcher.knnMatch(activeRefDesc, liveDescriptors, knnMatches, 2)
+            val scaleFromRelocX = widthPx.toDouble() / relocW.toDouble()
+            val scaleFromRelocY = heightPx.toDouble() / relocH.toDouble()
+            val goodSrc = ArrayList<Point>(knnMatches.size)
+            val goodDst = ArrayList<Point>(knnMatches.size)
+            for (pairMat in knnMatches) {
+                val arr = pairMat.toArray()
+                if (arr.size >= 2 && arr[0].distance < LOWE_RATIO_THRESHOLD * arr[1].distance) {
+                    val qIdx = arr[0].queryIdx
+                    val tIdx = arr[0].trainIdx
+                    if (qIdx in relocRefKeypointCoordsFull.indices && tIdx in liveKpArr.indices) {
+                        goodSrc.add(relocRefKeypointCoordsFull[qIdx])
+                        val dstPt = liveKpArr[tIdx].pt
+                        goodDst.add(Point(dstPt.x * scaleFromRelocX, dstPt.y * scaleFromRelocY))
+                    }
+                }
+            }
+
+            if (goodSrc.size < MIN_RELOC_INLIERS) {
+                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+            }
+
+            val srcPtsMat = MatOfPoint2f(*goodSrc.toTypedArray())
+            val dstPtsMat = MatOfPoint2f(*goodDst.toTypedArray())
+            val srcCenterMat = MatOfPoint2f(relocRefStoneCenterFull)
+            val dstCenterMat = MatOfPoint2f()
+            try {
+                homography = Calib3d.findHomography(
+                    srcPtsMat,
+                    dstPtsMat,
+                    Calib3d.USAC_MAGSAC,
+                    RELOC_MAGSAC_REPROJ_THRESHOLD_PX,
+                    inlierMask
+                )
+                if (homography == null || homography.empty() ||
+                    homography.rows() < 3 || homography.cols() < 3 || inlierMask.empty()
+                ) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+
+                val maskBytes = ByteArray(inlierMask.rows() * inlierMask.cols())
+                inlierMask.get(0, 0, maskBytes)
+                var inliers = 0
+                for (b in maskBytes) {
+                    if (b.toInt() != 0) inliers++
+                }
+                if (inliers < MIN_RELOC_INLIERS) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return RelocalizationMatchResult(matched = false, inliers = inliers, latencyMs = elapsedMs)
+                }
+
+                // Reject degenerate / flipped homographies via upper-left 2x2 Jacobian determinant
+                val hVals = DoubleArray(9)
+                homography.get(0, 0, hVals)
+                val h22 = hVals[8]
+                if (abs(h22) < 1e-6) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+                val det2x2 = (hVals[0] * hVals[4] - hVals[1] * hVals[3]) / (h22 * h22)
+                if (!det2x2.isFinite() || det2x2 !in 0.12..8.50) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+
+                Core.perspectiveTransform(srcCenterMat, dstCenterMat, homography)
+                val projPts = dstCenterMat.toArray()
+                if (projPts.isEmpty()) {
+                    val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                    return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+                val projX = projPts[0].x.toFloat()
+                val projY = projPts[0].y.toFloat()
+                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
+                if (!projX.isFinite() || !projY.isFinite() ||
+                    projX !in -320f..(widthPx + 320f) ||
+                    projY !in -240f..(heightPx + 240f)
+                ) {
+                    return RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = elapsedMs)
+                }
+                return RelocalizationMatchResult(
+                    matched = true,
+                    inliers = inliers,
+                    stoneCenterXPx = projX,
+                    stoneCenterYPx = projY,
+                    latencyMs = elapsedMs
+                )
+            } finally {
+                srcPtsMat.release()
+                dstPtsMat.release()
+                srcCenterMat.release()
+                dstCenterMat.release()
+            }
+        } finally {
+            for (m in knnMatches) m.release()
+            liveKeypoints.release()
+            liveDescriptors.release()
+            homography?.release()
+            inlierMask.release()
+        }
+    }
+
     override fun close() {
         resetSession()
         fullGrayMat?.release()
         fullGrayMat = null
-        prevHalfGrayMat?.release()
-        prevHalfGrayMat = null
-        currHalfGrayMat?.release()
-        currHalfGrayMat = null
-        halfMaskMat?.release()
-        halfMaskMat = null
+        prevVoGrayMat?.release()
+        prevVoGrayMat = null
+        currVoGrayMat?.release()
+        currVoGrayMat = null
+        voMaskMat?.release()
+        voMaskMat = null
+        relocGrayMat?.release()
+        relocGrayMat = null
         canonicalPatchMat?.release()
         canonicalPatchMat = null
         emptyMaskMat?.release()
@@ -849,8 +1150,15 @@ class OpenCvConstellationTracker : AutoCloseable {
         private const val MIN_RELATIVE_SCALE = 0.35f
         private const val MAX_RELATIVE_SCALE = 3.50f
 
-        private const val MAX_VO_GRAVEL_CORNERS = 140
+        private const val VO_DOWNSCALE_DIVISOR = 3 // 1920x1080 -> 640x360 (< 2 ms CPU)
+        private const val MAX_VO_GRAVEL_CORNERS = 108 // 80..120 corner target budget
         private const val MIN_VO_INLIERS = 10
+
+        private const val RELOC_DOWNSCALE_DIVISOR = 4 // 1920x1080 -> 480x270 (~5 Hz relocalization)
+        const val MAX_RELOC_KEYPOINTS = 220
+        const val MIN_RELOC_SEED_KEYPOINTS = 18
+        const val MIN_RELOC_INLIERS = 14
+        private const val RELOC_MAGSAC_REPROJ_THRESHOLD_PX = 6.0 // Full-res equivalent of 1.5 px on 480x270
 
         private val openCvLoadAttempted = AtomicBoolean(false)
 

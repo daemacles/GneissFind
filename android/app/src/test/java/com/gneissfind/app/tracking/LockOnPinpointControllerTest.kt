@@ -961,6 +961,500 @@ class LockOnPinpointControllerTest {
         controller.close()
     }
 
+    @Test
+    fun `innovation gate rejects far-bearing wrong-class and oversized distractors with zero target jump`() {
+        val controller = LockOnPinpointController()
+        val geom = StripRoiGeometry()
+        val focalPx = 1900f
+        val rot45 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+
+        val trueStoneEnu = floatArrayOf(0f, 1.06f, 0f)
+        val camEnu = floatArrayOf(0f, 0f, 1.06f)
+        val (u0, v0) = projectGroundPoint(trueStoneEnu, camEnu, rot45, focalPx)
+        val initRange = distance3d(camEnu, trueStoneEnu)
+        val initRay = GroundPlaneRaycaster.pixelToWorldRay(u0, v0, focalPx, rot45)
+
+        val target = ConfirmedTarget(
+            trackId = 301L,
+            stoneClass = StoneClass.CHALCEDONY_AGATE,
+            worldPosition = WorldPoint3D(0f, 0f, 1.06f),
+            stripLeftPx = u0 - geom.stripLeftPx - 32f,
+            stripTopPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX - 32f,
+            stripRightPx = u0 - geom.stripLeftPx + 32f,
+            stripBottomPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX + 32f,
+            smoothedConfidence = 0.88f,
+            estimatedDiameterMm = 46f,
+            slantRangeMeters = initRange,
+            hitCountInWindow = 3,
+            windowSize = 4,
+            lastUpdatedTimestampNs = 40_000_000_000L,
+            worldRay = initRay,
+            isVisibleInStrip = true
+        )
+
+        val t0Ns = 40_000_000_000L
+        val lockedHud = controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rot45,
+            timestampNs = t0Ns
+        )
+        val initCenterX = (lockedHud.frameLeftPx + lockedHud.frameRightPx) * 0.5f
+        val initCenterY = (lockedHud.frameTopPx + lockedHud.frameBottomPx) * 0.5f
+
+        val (wideLeft, wideTop) = PushBroomCropper.computeClampedSquareCropOrigin(
+            centerXPx = initCenterX,
+            centerYPx = initCenterY,
+            cropSizePx = 640
+        )
+        val pose = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(0f, 1.06f, 0f),
+            forwardPitchDeg = 45f,
+            rawPitchDeg = 45f,
+            rollDeg = 0f,
+            referencePitchDeg = 45f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = initRange,
+            horizontalSpeedMps = 0f,
+            arPlaneLocked = false,
+            timestampNs = t0Ns + 60_000_000L,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rot45
+        )
+
+        // Feed 3 high-confidence distractors in a 640x640 wide crop (cropScale = 2.0):
+        // 1) Far bearing: +290 px offset at f=1900 -> ~8.7 deg (> 4.5 deg on-screen innovation gate)
+        // 2) Wrong class: JASPER_CHERT right at predicted center (0 deg)
+        // 3) Oversized object (e.g. teapot / monitor): 3.2x apparent diameter right near center
+        val farTensorCx = (initCenterX + 290f - wideLeft) / 2.0f
+        val centerTensorCx = (initCenterX - wideLeft) / 2.0f
+        val centerTensorCy = (initCenterY - wideTop) / 2.0f
+
+        val hudAfterDistractors = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.CHALCEDONY_AGATE.id,
+                    confidence = 0.96f,
+                    leftPx = farTensorCx - 16f,
+                    topPx = centerTensorCy - 16f,
+                    rightPx = farTensorCx + 16f,
+                    bottomPx = centerTensorCy + 16f
+                ),
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.PETRIFIED_WOOD.id,
+                    confidence = 0.97f,
+                    leftPx = centerTensorCx - 16f,
+                    topPx = centerTensorCy - 16f,
+                    rightPx = centerTensorCx + 16f,
+                    bottomPx = centerTensorCy + 16f
+                ),
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.CHALCEDONY_AGATE.id,
+                    confidence = 0.95f,
+                    leftPx = centerTensorCx - 58f,
+                    topPx = centerTensorCy - 58f,
+                    rightPx = centerTensorCx + 58f,
+                    bottomPx = centerTensorCy + 58f
+                )
+            ),
+            cropLeftPx = wideLeft,
+            cropTopPx = wideTop,
+            poseSnapshot = pose,
+            timestampNs = t0Ns + 60_000_000L,
+            cropSizePx = 640
+        )
+
+        assertEquals("All 3 distractors must be rejected", 3, controller.rejectedDistractorCount)
+        assertEquals(StoneClass.CHALCEDONY_AGATE, hudAfterDistractors.stoneClass)
+        val postDistractorX = (hudAfterDistractors.frameLeftPx + hudAfterDistractors.frameRightPx) * 0.5f
+        val postDistractorY = (hudAfterDistractors.frameTopPx + hudAfterDistractors.frameBottomPx) * 0.5f
+        assertEquals("Target reticle must not jump onto distractors", initCenterX, postDistractorX, 1.0f)
+        assertEquals("Target reticle must not jump onto distractors", initCenterY, postDistractorY, 1.0f)
+
+        // True matching-class, matching-scale stone within 1.8 deg (+60 px) IS cleanly accepted
+        val validTensorCx = (initCenterX + 60f - wideLeft) / 2.0f
+        val hudAccepted = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(
+                    tileIndex = 0,
+                    classId = StoneClass.CHALCEDONY_AGATE.id,
+                    confidence = 0.90f,
+                    leftPx = validTensorCx - 16f,
+                    topPx = centerTensorCy - 16f,
+                    rightPx = validTensorCx + 16f,
+                    bottomPx = centerTensorCy + 16f
+                )
+            ),
+            cropLeftPx = wideLeft,
+            cropTopPx = wideTop,
+            poseSnapshot = pose.copy(timestampNs = t0Ns + 120_000_000L),
+            timestampNs = t0Ns + 120_000_000L,
+            cropSizePx = 640
+        )
+        assertTrue(hudAccepted.hasNeuralDetectorBox)
+        assertEquals(3, controller.rejectedDistractorCount)
+        controller.close()
+    }
+
+    @Test
+    fun `300ms 9-frame AKAZE coasting hysteresis prevents glint thrash to B1 then falls back on frame 10`() {
+        var simulateAkazeHit = true
+        val fakeTracker = object : OpenCvConstellationTracker() {
+            override fun seedConstellationCollar(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int,
+                stoneLeftPx: Float,
+                stoneTopPx: Float,
+                stoneRightPx: Float,
+                stoneBottomPx: Float,
+                baseScale: Float
+            ): Boolean {
+                hasSeededConstellation = true
+                return true
+            }
+
+            override fun seedFullFrameRelocalizationSnapshot(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int,
+                stoneCenterXPx: Float,
+                stoneCenterYPx: Float
+            ): Boolean {
+                hasRelocalizationSnapshot = true
+                return true
+            }
+
+            override fun trackGravelFlowCorrespondences(
+                lumaBytes: ByteArray,
+                widthPx: Int,
+                heightPx: Int,
+                excludeLeftPx: Float,
+                excludeTopPx: Float,
+                excludeRightPx: Float,
+                excludeBottomPx: Float,
+                excludeTargetRegion: Boolean
+            ): GravelFlowCorrespondences? = null
+
+            override fun matchConstellationFrame(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int,
+                predictedCenterXPx: Float,
+                predictedCenterYPx: Float
+            ): ConstellationMatchResult {
+                return if (simulateAkazeHit) {
+                    ConstellationMatchResult(
+                        matched = true,
+                        inliers = 26,
+                        frameLeftPx = predictedCenterXPx - 32f,
+                        frameTopPx = predictedCenterYPx - 32f,
+                        frameRightPx = predictedCenterXPx + 32f,
+                        frameBottomPx = predictedCenterYPx + 32f,
+                        cumulativeScale = 1.0f,
+                        latencyMs = 2.4f
+                    )
+                } else {
+                    ConstellationMatchResult(matched = false, inliers = 4, latencyMs = 1.8f)
+                }
+            }
+
+            override fun matchFullFrameRelocalization(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int
+            ): RelocalizationMatchResult = RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = 2.0f)
+        }
+
+        val controller = LockOnPinpointController(openCvTracker = fakeTracker)
+        val geom = StripRoiGeometry()
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val rot45 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        val trueStoneEnu = floatArrayOf(0.05f, 1.06f, 0.0f)
+        val initCamEnu = floatArrayOf(0f, 0f, 1.06f)
+        val (u0, v0) = projectGroundPoint(trueStoneEnu, initCamEnu, rot45, focalPx)
+        val initRay = GroundPlaneRaycaster.pixelToWorldRay(u0, v0, focalPx, rot45)
+        val initRange = distance3d(initCamEnu, trueStoneEnu)
+
+        val target = ConfirmedTarget(
+            trackId = 302L,
+            stoneClass = StoneClass.CHALCEDONY_AGATE,
+            worldPosition = WorldPoint3D(trueStoneEnu[0], 0f, trueStoneEnu[1]),
+            stripLeftPx = u0 - geom.stripLeftPx - 36f,
+            stripTopPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX - 36f,
+            stripRightPx = u0 - geom.stripLeftPx + 36f,
+            stripBottomPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX + 36f,
+            smoothedConfidence = 0.90f,
+            estimatedDiameterMm = 46f,
+            slantRangeMeters = initRange,
+            hitCountInWindow = 4,
+            windowSize = 4,
+            lastUpdatedTimestampNs = 50_000_000_000L,
+            worldRay = initRay,
+            isVisibleInStrip = true
+        )
+
+        var tNs = 50_000_000_000L
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rot45,
+            timestampNs = tNs
+        )
+
+        // Converge to PINPOINT_CONSTELLATION
+        val steps = listOf(
+            floatArrayOf(0.08f, 0.08f, 0.96f),
+            floatArrayOf(0.16f, 0.18f, 0.85f),
+            floatArrayOf(0.24f, 0.28f, 0.74f),
+            floatArrayOf(0.30f, 0.36f, 0.65f)
+        )
+        var lastCam = initCamEnu
+        for (cam in steps) {
+            tNs += 80_000_000L
+            lastCam = cam
+            val (u, v) = projectGroundPoint(trueStoneEnu, cam, rot45, focalPx)
+            val (cL, cT) = PushBroomCropper.computeClampedSquareCropOrigin(u, v)
+            val pose = MotionPoseSnapshot(
+                cameraWorldPosition = WorldPoint3D(cam[0], cam[2], cam[1]),
+                forwardPitchDeg = 45f,
+                rawPitchDeg = 45f,
+                rollDeg = 0f,
+                referencePitchDeg = 45f,
+                cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = false,
+                centerSlantRangeMeters = distance3d(cam, trueStoneEnu),
+                horizontalSpeedMps = 0.2f,
+                arPlaneLocked = false,
+                timestampNs = tNs,
+                verticalFocalLengthPx = focalPx,
+                rotationMatrix = rot45
+            )
+            controller.onNeuralB1Detections(
+                cropDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = StoneClass.CHALCEDONY_AGATE.id,
+                        confidence = 0.93f,
+                        leftPx = (u - cL) - 34f,
+                        topPx = (v - cT) - 34f,
+                        rightPx = (u - cL) + 34f,
+                        bottomPx = (v - cT) + 34f
+                    )
+                ),
+                cropLeftPx = cL,
+                cropTopPx = cT,
+                poseSnapshot = pose,
+                timestampNs = tNs,
+                syntheticCameraStepEnu = cam
+            )
+        }
+        assertEquals(AcquisitionStage.PINPOINT_CONSTELLATION, controller.currentStage)
+
+        val luma = ByteArray(1920 * 1080)
+        val basePose = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(lastCam[0], lastCam[2], lastCam[1]),
+            forwardPitchDeg = 45f,
+            rawPitchDeg = 45f,
+            rollDeg = 0f,
+            referencePitchDeg = 45f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = distance3d(lastCam, trueStoneEnu),
+            horizontalSpeedMps = 0f,
+            arPlaneLocked = false,
+            timestampNs = tNs,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rot45
+        )
+
+        // Initial solid AKAZE frame establishes 26 inliers and resets 1 Hz refresh timer
+        tNs += 30_000_000L
+        val lockedDir = controller.onCameraLumaFrame(luma, 1920, 1080, basePose.copy(timestampNs = tNs), tNs)
+        assertEquals(26, lockedDir.hudState.akazeInliers)
+        assertEquals("AKAZE", lockedDir.hudState.trackingSourceBadge)
+
+        // Simulate 9 consecutive missed AKAZE frames (9 * 30ms = 270ms <= 300ms): MUST coast without B=1 thrash!
+        simulateAkazeHit = false
+        for (missIdx in 1..9) {
+            val missTs = tNs + missIdx * 30_000_000L
+            val coastDir = controller.onCameraLumaFrame(luma, 1920, 1080, basePose.copy(timestampNs = missTs), missTs)
+            assertTrue("Frame $missIdx must hold akazeInliers >= 12 during 300ms coast", coastDir.hudState.akazeInliers >= 12)
+            assertEquals("AKAZE", coastDir.hudState.trackingSourceBadge)
+            assertFalse("Frame $missIdx must NOT thrash B=1 GPU inference", coastDir.shouldRunNeuralB1)
+            assertTrue("Frame $missIdx must NOT widen crop to 640px", coastDir.desiredCropSizePx < 640)
+        }
+
+        // Frame 10 (> 9 frames and 330ms > 300ms): hysteresis expires -> drops to 640x640 B=1 re-acquisition!
+        val expireTs = tNs + 11 * 30_000_000L
+        val fallbackDir = controller.onCameraLumaFrame(luma, 1920, 1080, basePose.copy(timestampNs = expireTs), expireTs)
+        assertTrue("Frame 10+ must drop akazeInliers below 12", fallbackDir.hudState.akazeInliers < 12)
+        assertTrue("Frame 10+ must schedule B=1 re-acquisition", fallbackDir.shouldRunNeuralB1)
+        assertEquals(PushBroomCropper.LOCK_ON_WIDE_SEARCH_CROP_SIZE_PX, fallbackDir.desiredCropSizePx)
+        controller.close()
+    }
+
+    @Test
+    fun `ego-motion VO tracks camera translation while target is off-screen and deadbands pure rotation`() {
+        val focalPx = PushBroomCameraController.DEFAULT_FY_2X_1080P_PX
+        val rot0 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        val rotPurePan = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 1.8f)
+
+        // 1. Verify IMU-derotated pure-rotation deadband (< 0.65 px residual) produces ZERO false translation
+        val camFixed = floatArrayOf(0f, 0f, 1.06f)
+        val rotPrevPts = FloatArray(32)
+        val rotCurrPts = FloatArray(32)
+        var ptIdx = 0
+        for (gx in listOf(-0.30f, -0.10f, 0.10f, 0.30f)) {
+            for (gy in listOf(0.85f, 1.05f, 1.25f, 1.45f)) {
+                val g = floatArrayOf(gx, gy, 0f)
+                val (u0, v0) = projectGroundPoint(g, camFixed, rot0, focalPx)
+                val (u1, v1) = projectGroundPoint(g, camFixed, rotPurePan, focalPx)
+                rotPrevPts[ptIdx * 2] = u0
+                rotPrevPts[ptIdx * 2 + 1] = v0
+                // Add realistic +/- 0.25 px sub-pixel KLT noise
+                rotCurrPts[ptIdx * 2] = u1 + if (ptIdx % 2 == 0) 0.25f else -0.25f
+                rotCurrPts[ptIdx * 2 + 1] = v1 + if (ptIdx % 3 == 0) -0.20f else 0.20f
+                ptIdx++
+            }
+        }
+        val pureRotSolved = LockOnPinpointController.solveCameraPositionFromGravelFlow(
+            prevCamPosEnu = camFixed,
+            prevRotationScr = rot0,
+            currRotationScr = rotPurePan,
+            prevPointsXY = rotPrevPts,
+            currPointsXY = rotCurrPts,
+            count = 16,
+            focalLengthPx = focalPx
+        )
+        assertNotNull(pureRotSolved)
+        assertEquals(0f, pureRotSolved!![0], 1e-4f)
+        assertEquals(0f, pureRotSolved[1], 1e-4f)
+        assertEquals(1.06f, pureRotSolved[2], 1e-4f)
+
+        // 2. Verify full-frame VO continues tracking sideways translation (+0.20m East) while target is OFF-SCREEN!
+        var latestSynthFlow: GravelFlowCorrespondences? = null
+        val voTracker = object : OpenCvConstellationTracker() {
+            override fun trackGravelFlowCorrespondences(
+                lumaBytes: ByteArray,
+                widthPx: Int,
+                heightPx: Int,
+                excludeLeftPx: Float,
+                excludeTopPx: Float,
+                excludeRightPx: Float,
+                excludeBottomPx: Float,
+                excludeTargetRegion: Boolean
+            ): GravelFlowCorrespondences? = latestSynthFlow
+        }
+
+        val controller = LockOnPinpointController(openCvTracker = voTracker)
+        val geom = StripRoiGeometry()
+        val trueStoneEnu = floatArrayOf(0f, 1.06f, 0f)
+        val (uInit, vInit) = projectGroundPoint(trueStoneEnu, camFixed, rot0, focalPx)
+        val initRange = distance3d(camFixed, trueStoneEnu)
+        val initRay = GroundPlaneRaycaster.pixelToWorldRay(uInit, vInit, focalPx, rot0)
+
+        val target = ConfirmedTarget(
+            trackId = 303L,
+            stoneClass = StoneClass.CHALCEDONY_AGATE,
+            worldPosition = WorldPoint3D(0f, 0f, 1.06f),
+            stripLeftPx = uInit - geom.stripLeftPx - 32f,
+            stripTopPx = vInit - StripRoiGeometry.NOMINAL_CROP_Y_PX - 32f,
+            stripRightPx = uInit - geom.stripLeftPx + 32f,
+            stripBottomPx = vInit - StripRoiGeometry.NOMINAL_CROP_Y_PX + 32f,
+            smoothedConfidence = 0.88f,
+            estimatedDiameterMm = 44f,
+            slantRangeMeters = initRange,
+            hitCountInWindow = 3,
+            windowSize = 4,
+            lastUpdatedTimestampNs = 60_000_000_000L,
+            worldRay = initRay,
+            isVisibleInStrip = true
+        )
+
+        var tNs = 60_000_000_000L
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rot0,
+            timestampNs = tNs
+        )
+
+        // Pan camera +50 deg right so target at (0, 1.06, 0) goes completely off-screen left!
+        val rotOffScreen = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 50f)
+        val luma = ByteArray(1920 * 1080)
+        tNs += 33_333_333L
+        val offHud0 = controller.reprojectForDisplay120Hz(rotOffScreen, focalPx, tNs)
+        assertFalse(offHud0.isTargetInFrame)
+
+        // Seed initial analyzer pose at rotOffScreen before stepping East
+        val poseOff0 = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(0f, 1.06f, 0f),
+            forwardPitchDeg = 45f,
+            rawPitchDeg = 45f,
+            rollDeg = 0f,
+            referencePitchDeg = 45f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = initRange,
+            horizontalSpeedMps = 0.6f,
+            arPlaneLocked = false,
+            timestampNs = tNs,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rotOffScreen
+        )
+        latestSynthFlow = null
+        controller.onCameraLumaFrame(luma, 1920, 1080, poseOff0, tNs)
+
+        // Translate +0.20 m East over 10 frames (0.02 m/frame) WHILE target stays off-screen at yaw = +50 deg!
+        for (step in 1..10) {
+            val prevC = floatArrayOf((step - 1) * 0.02f, 0f, 1.06f)
+            val currC = floatArrayOf(step * 0.02f, 0f, 1.06f)
+            val pXY = FloatArray(32)
+            val cXY = FloatArray(32)
+            var k = 0
+            // Ground points visible in the +50 deg panned FOV (East ~ 0.9..1.3 m, North ~ 0.6..1.1 m)
+            for (gx in listOf(0.85f, 1.00f, 1.15f, 1.30f)) {
+                for (gy in listOf(0.65f, 0.80f, 0.95f, 1.10f)) {
+                    val g = floatArrayOf(gx, gy, 0f)
+                    val (uA, vA) = projectGroundPoint(g, prevC, rotOffScreen, focalPx)
+                    val (uB, vB) = projectGroundPoint(g, currC, rotOffScreen, focalPx)
+                    pXY[k * 2] = uA
+                    pXY[k * 2 + 1] = vA
+                    cXY[k * 2] = uB
+                    cXY[k * 2 + 1] = vB
+                    k++
+                }
+            }
+            latestSynthFlow = GravelFlowCorrespondences(pXY, cXY, 16, latencyMs = 1.1f)
+            tNs += 33_333_333L
+            controller.onCameraLumaFrame(luma, 1920, 1080, poseOff0.copy(timestampNs = tNs), tNs)
+        }
+
+        val trackedCamEnu = controller.copyCurrentCamPosEnu()
+        assertEquals("Off-screen VO must integrate +0.20m East camera translation", 0.20f, trackedCamEnu[0], 0.025f)
+
+        // Pan back to yaw = 0 deg: because camera moved +0.20m East, world-fixed stone at East=0 must project LEFT of 960!
+        tNs += 33_333_333L
+        val reenteredHud = controller.reprojectForDisplay120Hz(rot0, focalPx, tNs)
+        assertTrue(reenteredHud.isTargetInFrame)
+        val (expectedTranslatedU, _) = projectGroundPoint(trueStoneEnu, floatArrayOf(0.20f, 0f, 1.06f), rot0, focalPx)
+        val actualReenteredU = (reenteredHud.frameLeftPx + reenteredHud.frameRightPx) * 0.5f
+        assertTrue("Re-entered reticle must shift left of 960 after East translation (u=$actualReenteredU)", actualReenteredU < 760f)
+        assertEquals(expectedTranslatedU, actualReenteredU, 35.0f)
+        controller.close()
+    }
+
     private fun buildConfirmedTarget(
         trackId: Long,
         stripCenterX: Float,
