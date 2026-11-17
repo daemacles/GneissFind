@@ -93,9 +93,6 @@ class MainActivity : ComponentActivity() {
                     override fun onDisplayRemoved(displayId: Int) = Unit
                     override fun onDisplayChanged(displayId: Int) {
                         syncCurrentDisplayGeometry()
-        if (savedInstanceState == null) {
-            handleDebugReplayIntent(intent)
-        }
                     }
                 }
                 displayManager?.registerDisplayListener(listener, null)
@@ -132,9 +129,6 @@ class MainActivity : ComponentActivity() {
                         when (event) {
                             Lifecycle.Event.ON_RESUME -> {
                                 syncCurrentDisplayGeometry()
-        if (savedInstanceState == null) {
-            handleDebugReplayIntent(intent)
-        }
                                 viewModel.onResumeSensorsAndAudio()
                             }
                             Lifecycle.Event.ON_PAUSE -> viewModel.onPauseSensorsAndAudio()
@@ -200,6 +194,7 @@ class MainActivity : ComponentActivity() {
             ?: return
         val autoLockFrame = intent.getIntExtra(EXTRA_DEBUG_AUTO_LOCK_FRAME, -1)
         val loopReplay = intent.getBooleanExtra(EXTRA_DEBUG_LOOP_REPLAY, true)
+        intent.removeExtra(EXTRA_DEBUG_REPLAY_SESSION)
         viewModel.startDebugReplaySessionFromIntent(
             sessionNameOrPath = replaySession,
             autoLockFrameIdx = autoLockFrame,

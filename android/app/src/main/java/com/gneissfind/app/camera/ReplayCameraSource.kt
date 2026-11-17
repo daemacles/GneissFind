@@ -29,6 +29,7 @@ import com.gneissfind.app.logging.ReplayTraceHeader
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
 import com.gneissfind.app.vision.Yuv420Frame
 import java.io.File
+import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
@@ -291,7 +292,9 @@ class ReplayCameraSource(
 
             val mediaExtractor = MediaExtractor()
             extractor = mediaExtractor
-            mediaExtractor.setDataSource(clipFile.absolutePath)
+            FileInputStream(clipFile).use { fis ->
+                mediaExtractor.setDataSource(fis.fd)
+            }
 
             val videoTrackIdx = selectVideoTrack(mediaExtractor)
             if (videoTrackIdx < 0) {
@@ -623,9 +626,13 @@ class ReplayCameraSource(
             if (direct.isAbsolute && isValidReplayDir(direct)) {
                 return direct
             }
-            val extCandidate = File(FieldDataLogger.resolveBaseReplaysDir(context), trimmed)
-            if (isValidReplayDir(extCandidate)) {
-                return extCandidate
+            val extMediaCandidate = File(FieldDataLogger.resolveBaseReplaysDir(context), trimmed)
+            if (isValidReplayDir(extMediaCandidate)) {
+                return extMediaCandidate
+            }
+            val extDataCandidate = File(FieldDataLogger.resolveExternalSandboxReplaysDir(context), trimmed)
+            if (isValidReplayDir(extDataCandidate)) {
+                return extDataCandidate
             }
             val intCandidate = File(FieldDataLogger.resolveFallbackInternalReplaysDir(context), trimmed)
             if (isValidReplayDir(intCandidate)) {
@@ -639,7 +646,8 @@ class ReplayCameraSource(
             if (!dir.isDirectory) return false
             val clip = File(dir, FieldDataLogger.CLIP_FILE_NAME)
             val trace = File(dir, FieldDataLogger.TRACE_FILE_NAME)
-            return clip.isFile && clip.length() > 256L && trace.isFile && trace.length() > 16L
+            return FieldDataLogger.isReadableNonEmptyFile(clip, 256L) &&
+                FieldDataLogger.isReadableNonEmptyFile(trace, 16L)
         }
 
         private fun selectVideoTrack(extractor: MediaExtractor): Int {

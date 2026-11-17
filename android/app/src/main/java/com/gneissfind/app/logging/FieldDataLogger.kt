@@ -696,17 +696,24 @@ class FieldDataLogger(
         /** Alias retained for backward compatibility with existing callers. */
         fun resolveBaseSessionsDir(context: Context): File = resolveBaseReplaysDir(context)
 
+        /** External app-sandbox `Android/data/com.gneissfind.app/files/replays/` root (unrestricted for `adb push` on Android 17 Scoped Storage). */
+        fun resolveExternalSandboxReplaysDir(context: Context): File {
+            val extRoot = context.getExternalFilesDir(null) ?: context.filesDir
+            return File(extRoot, "replays").apply { mkdirs() }
+        }
+
         /** Fallback internal `filesDir/replays/` root scanned alongside external media for `adb` test pushes. */
         fun resolveFallbackInternalReplaysDir(context: Context): File =
             File(context.filesDir, "replays").apply { mkdirs() }
 
         /**
-         * Discovers all valid `<session>` directories containing non-empty `clip.mp4` and `trace.jsonl`
-         * across both `Android/media/com.gneissfind.app/replays/` and `filesDir/replays/`, sorted newest first.
+         * Discovers all valid, readable `<session>` directories containing non-empty `clip.mp4` and
+         * `trace.jsonl` across `Android/media/`, `Android/data/`, and `filesDir/`, sorted newest first.
          */
         fun discoverValidReplaySessionDirs(context: Context): List<File> {
             val roots = linkedSetOf(
                 resolveBaseReplaysDir(context).canonicalFile,
+                resolveExternalSandboxReplaysDir(context).canonicalFile,
                 resolveFallbackInternalReplaysDir(context).canonicalFile
             )
             val sessions = ArrayList<File>()
@@ -716,8 +723,8 @@ class FieldDataLogger(
                 for (dir in children.sortedByDescending { it.name }) {
                     val clip = File(dir, CLIP_FILE_NAME)
                     val trace = File(dir, TRACE_FILE_NAME)
-                    if (clip.isFile && clip.length() > 256L &&
-                        trace.isFile && trace.length() > 16L &&
+                    if (isReadableNonEmptyFile(clip, 256L) &&
+                        isReadableNonEmptyFile(trace, 16L) &&
                         seenNames.add(dir.name)
                     ) {
                         sessions.add(dir)
@@ -725,6 +732,14 @@ class FieldDataLogger(
                 }
             }
             return sessions.sortedByDescending { it.name }
+        }
+
+        internal fun isReadableNonEmptyFile(file: File, minBytes: Long): Boolean {
+            if (!file.isFile || file.length() <= minBytes) return false
+            return runCatching {
+                FileReader(file).use { it.read() }
+                true
+            }.getOrDefault(false)
         }
 
         private fun allocateUniqueSessionDir(context: Context): File {

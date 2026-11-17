@@ -114,9 +114,17 @@ data class ConstellationMatchResult(
 open class OpenCvConstellationTracker : AutoCloseable {
 
     private var fullGrayMat: Mat? = null
+    private var latestFullLumaRef: ByteArray? = null
+    private var latestFullWidthPx: Int = 0
+    private var latestFullHeightPx: Int = 0
+    private var fullMatDirty: Boolean = false
+
     private var prevVoGrayMat: Mat? = null
     private var currVoGrayMat: Mat? = null
+    private var prevVoDetectMat: Mat? = null
     private var voMaskMat: Mat? = null
+    private var voSubsampleBuffer: ByteArray? = null
+    private var cachedVoCorners: Array<Point> = emptyArray()
     private var hasPrevVoFrame: Boolean = false
 
     private var akaze: AKAZE? = null
@@ -155,6 +163,9 @@ open class OpenCvConstellationTracker : AutoCloseable {
         hasPrevVoFrame = false
         hasSeededConstellation = false
         hasRelocalizationSnapshot = false
+        latestFullLumaRef = null
+        fullMatDirty = false
+        cachedVoCorners = emptyArray()
         refKeypointCoords = emptyArray()
         relocRefKeypointCoordsFull = emptyArray()
         keyframeBaseScale = 1.0f
@@ -195,10 +206,13 @@ open class OpenCvConstellationTracker : AutoCloseable {
         if (!ensureOpenCvInitialized()) return null
         if (widthPx < 64 || heightPx < 36 || lumaBytes.size < widthPx * heightPx) return null
 
-        val fullMat = ensureFullGrayMat(widthPx, heightPx)
-        fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
+        // Defer full 2.07 MB JNI upload unless an AKAZE collar/relocalization call requests it
+        latestFullLumaRef = lumaBytes
+        latestFullWidthPx = widthPx
+        latestFullHeightPx = heightPx
+        fullMatDirty = true
 
-        // 1/3-scale (640x360 on 1920x1080) keeps full-frame ego-motion KLT + RANSAC well below 2.0 ms CPU
+        // 1/3-scale (640x360 on 1920x1080) keeps full-frame ego-motion KLT + RANSAC < 2.0 ms CPU
         val voW = max(64, widthPx / VO_DOWNSCALE_DIVISOR)
         val voH = max(36, heightPx / VO_DOWNSCALE_DIVISOR)
         val scaleToVoX = voW.toFloat() / widthPx.toFloat()
@@ -212,48 +226,56 @@ open class OpenCvConstellationTracker : AutoCloseable {
         val prevVo = prevOrAllocMat(prevVoGrayMat, voH, voW, CvType.CV_8UC1).also {
             prevVoGrayMat = it
         }
-        Imgproc.resize(fullMat, currVo, Size(voW.toDouble(), voH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+
+        if (widthPx == voW * VO_DOWNSCALE_DIVISOR && heightPx == voH * VO_DOWNSCALE_DIVISOR) {
+            val voSize = voW * voH
+            val subBuf = voSubsampleBuffer?.takeIf { it.size == voSize }
+                ?: ByteArray(voSize).also { voSubsampleBuffer = it }
+            var dstIdx = 0
+            var srcCenterRow = widthPx
+            val rowStep = widthPx * VO_DOWNSCALE_DIVISOR
+            repeat(voH) {
+                var sx = 1
+                repeat(voW) {
+                    subBuf[dstIdx++] = lumaBytes[srcCenterRow + sx]
+                    sx += VO_DOWNSCALE_DIVISOR
+                }
+                srcCenterRow += rowStep
+            }
+            currVo.put(0, 0, subBuf, 0, voSize)
+        } else {
+            val fullMat = prepareFullGrayMat(lumaBytes, widthPx, heightPx)
+            Imgproc.resize(fullMat, currVo, Size(voW.toDouble(), voH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        }
 
         if (!hasPrevVoFrame) {
             currVo.copyTo(prevVo)
+            cachedVoCorners = emptyArray()
             hasPrevVoFrame = true
             return null
         }
 
-        val mask = prevOrAllocMat(voMaskMat, voH, voW, CvType.CV_8UC1).also {
-            voMaskMat = it
-        }
-        mask.setTo(Scalar(255.0))
-        // Mask out the stone + 8 px (24 px full-res) specular halo when visible and unoccluded
-        if (excludeTargetRegion &&
+        val hasExclusionBox = excludeTargetRegion &&
             excludeLeftPx.isFinite() && excludeTopPx.isFinite() &&
             excludeRightPx.isFinite() && excludeBottomPx.isFinite() &&
             excludeRightPx > 0f && excludeBottomPx > 0f &&
             excludeLeftPx < widthPx.toFloat() && excludeTopPx < heightPx.toFloat()
-        ) {
-            val rawExL = (excludeLeftPx.finiteOr(0f) * scaleToVoX).roundToInt() - 8
-            val rawExT = (excludeTopPx.finiteOr(0f) * scaleToVoY).roundToInt() - 8
-            val rawExR = (excludeRightPx.finiteOr(0f) * scaleToVoX).roundToInt() + 8
-            val rawExB = (excludeBottomPx.finiteOr(0f) * scaleToVoY).roundToInt() + 8
-            val clampedL = rawExL.coerceIn(0, (voW - 2).coerceAtLeast(0))
-            val clampedT = rawExT.coerceIn(0, (voH - 2).coerceAtLeast(0))
-            val clampedR = rawExR.coerceIn(clampedL, voW)
-            val clampedB = rawExB.coerceIn(clampedT, voH)
-            if (clampedR - clampedL >= 2 && clampedB - clampedT >= 2) {
-                val safeRect = computeSafeSubmatRect(
-                    cols = voW,
-                    rows = voH,
-                    rawX = clampedL,
-                    rawY = clampedT,
-                    rawW = clampedR - clampedL,
-                    rawH = clampedB - clampedT
-                )
-                if (safeRect != null) {
-                    val sub = mask.submat(safeRect)
-                    sub.setTo(Scalar(0.0))
-                    sub.release()
+        val exVoL = if (hasExclusionBox) (excludeLeftPx.finiteOr(0f) * scaleToVoX - 6.0) else Double.NaN
+        val exVoT = if (hasExclusionBox) (excludeTopPx.finiteOr(0f) * scaleToVoY - 6.0) else Double.NaN
+        val exVoR = if (hasExclusionBox) (excludeRightPx.finiteOr(0f) * scaleToVoX + 6.0) else Double.NaN
+        val exVoB = if (hasExclusionBox) (excludeBottomPx.finiteOr(0f) * scaleToVoY + 6.0) else Double.NaN
+
+        val reusableCorners: Array<Point>? = if (cachedVoCorners.size >= MIN_CACHED_VO_CORNERS) {
+            if (!hasExclusionBox) {
+                cachedVoCorners
+            } else {
+                val filtered = cachedVoCorners.filter { p ->
+                    !(p.x in exVoL..exVoR && p.y in exVoT..exVoB)
                 }
+                if (filtered.size >= MIN_CACHED_VO_CORNERS) filtered.toTypedArray() else null
             }
+        } else {
+            null
         }
 
         val corners = MatOfPoint()
@@ -265,20 +287,71 @@ open class OpenCvConstellationTracker : AutoCloseable {
         val inlierMask = Mat()
 
         try {
-            Imgproc.goodFeaturesToTrack(
-                prevVo,
-                corners,
-                MAX_VO_GRAVEL_CORNERS,
-                0.02,
-                11.0,
-                mask,
-                3
-            )
-            val cornerArr = corners.toArray()
-            if (cornerArr.size < MIN_VO_INLIERS) {
-                currVo.copyTo(prevVo)
-                return null
+            val cornerArr: Array<Point> = if (reusableCorners != null) {
+                reusableCorners
+            } else {
+                val detW = max(32, voW / 2)
+                val detH = max(18, voH / 2)
+                val scaleToDetX = detW.toFloat() / widthPx.toFloat()
+                val scaleToDetY = detH.toFloat() / heightPx.toFloat()
+                val detPrev = prevOrAllocMat(prevVoDetectMat, detH, detW, CvType.CV_8UC1).also {
+                    prevVoDetectMat = it
+                }
+                Imgproc.resize(prevVo, detPrev, Size(detW.toDouble(), detH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+
+                val mask = prevOrAllocMat(voMaskMat, detH, detW, CvType.CV_8UC1).also {
+                    voMaskMat = it
+                }
+                mask.setTo(Scalar(255.0))
+                if (hasExclusionBox) {
+                    val rawExL = (excludeLeftPx.finiteOr(0f) * scaleToDetX).roundToInt() - 4
+                    val rawExT = (excludeTopPx.finiteOr(0f) * scaleToDetY).roundToInt() - 4
+                    val rawExR = (excludeRightPx.finiteOr(0f) * scaleToDetX).roundToInt() + 4
+                    val rawExB = (excludeBottomPx.finiteOr(0f) * scaleToDetY).roundToInt() + 4
+                    val clampedL = rawExL.coerceIn(0, (detW - 2).coerceAtLeast(0))
+                    val clampedT = rawExT.coerceIn(0, (detH - 2).coerceAtLeast(0))
+                    val clampedR = rawExR.coerceIn(clampedL, detW)
+                    val clampedB = rawExB.coerceIn(clampedT, detH)
+                    if (clampedR - clampedL >= 2 && clampedB - clampedT >= 2) {
+                        val safeRect = computeSafeSubmatRect(
+                            cols = detW,
+                            rows = detH,
+                            rawX = clampedL,
+                            rawY = clampedT,
+                            rawW = clampedR - clampedL,
+                            rawH = clampedB - clampedT
+                        )
+                        if (safeRect != null) {
+                            val sub = mask.submat(safeRect)
+                            sub.setTo(Scalar(0.0))
+                            sub.release()
+                        }
+                    }
+                }
+
+                Imgproc.goodFeaturesToTrack(
+                    detPrev,
+                    corners,
+                    MAX_VO_GRAVEL_CORNERS,
+                    0.02,
+                    6.0,
+                    mask,
+                    3
+                )
+                val rawCornerArr = corners.toArray()
+                if (rawCornerArr.size < MIN_VO_INLIERS) {
+                    currVo.copyTo(prevVo)
+                    cachedVoCorners = emptyArray()
+                    return null
+                }
+                val detToVoX = voW.toDouble() / detW.toDouble()
+                val detToVoY = voH.toDouble() / detH.toDouble()
+                Array(rawCornerArr.size) { idx ->
+                    val c = rawCornerArr[idx]
+                    Point(c.x * detToVoX, c.y * detToVoY)
+                }
             }
+
             prevPts2f.fromArray(*cornerArr)
             Video.calcOpticalFlowPyrLK(
                 prevVo,
@@ -287,7 +360,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
                 nextPts2f,
                 status,
                 err,
-                Size(17.0, 17.0),
+                Size(11.0, 11.0),
                 2
             )
 
@@ -301,7 +374,9 @@ open class OpenCvConstellationTracker : AutoCloseable {
                     (i >= errArr.size || errArr[i] < 22.0f)
                 ) {
                     val p = nextArr[i]
-                    if (p.x in 2.0..(voW - 3.0) && p.y in 2.0..(voH - 3.0)) {
+                    if (p.x in 2.0..(voW - 3.0) && p.y in 2.0..(voH - 3.0) &&
+                        !(hasExclusionBox && p.x in exVoL..exVoR && p.y in exVoT..exVoB)
+                    ) {
                         trackedPrev.add(cornerArr[i])
                         trackedCurr.add(p)
                     }
@@ -309,7 +384,10 @@ open class OpenCvConstellationTracker : AutoCloseable {
             }
             currVo.copyTo(prevVo)
 
-            if (trackedPrev.size < MIN_VO_INLIERS) return null
+            if (trackedPrev.size < MIN_VO_INLIERS) {
+                cachedVoCorners = emptyArray()
+                return null
+            }
 
             val srcMat = MatOfPoint2f(*trackedPrev.toTypedArray())
             val dstMat = MatOfPoint2f(*trackedCurr.toTypedArray())
@@ -322,6 +400,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
                     inlierMask
                 )
                 if (homography == null || homography.empty() || inlierMask.empty()) {
+                    cachedVoCorners = emptyArray()
                     return null
                 }
                 val maskBytes = ByteArray(inlierMask.rows() * inlierMask.cols())
@@ -330,21 +409,28 @@ open class OpenCvConstellationTracker : AutoCloseable {
                 for (b in maskBytes) {
                     if (b.toInt() != 0) count++
                 }
-                if (count < MIN_VO_INLIERS) return null
+                if (count < MIN_VO_INLIERS) {
+                    cachedVoCorners = emptyArray()
+                    return null
+                }
 
                 val prevXY = FloatArray(count * 2)
                 val currXY = FloatArray(count * 2)
+                val survivingCurr = ArrayList<Point>(count)
                 var outIdx = 0
                 for (i in maskBytes.indices) {
                     if (maskBytes[i].toInt() != 0) {
+                        val currPt = trackedCurr[i]
+                        survivingCurr.add(currPt)
                         // Scale 3x from 640x360 back to canonical 1920x1080 pixel coordinates
                         prevXY[outIdx] = (trackedPrev[i].x * scaleFromVoX).toFloat()
                         prevXY[outIdx + 1] = (trackedPrev[i].y * scaleFromVoY).toFloat()
-                        currXY[outIdx] = (trackedCurr[i].x * scaleFromVoX).toFloat()
-                        currXY[outIdx + 1] = (trackedCurr[i].y * scaleFromVoY).toFloat()
+                        currXY[outIdx] = (currPt.x * scaleFromVoX).toFloat()
+                        currXY[outIdx + 1] = (currPt.y * scaleFromVoY).toFloat()
                         outIdx += 2
                     }
                 }
+                cachedVoCorners = survivingCurr.toTypedArray()
                 val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000f
                 return GravelFlowCorrespondences(
                     prevFramePointsXY = prevXY,
@@ -459,10 +545,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
     ): Boolean {
         if (!ensureOpenCvInitialized()) return false
         if (widthPx < 4 || heightPx < 4) return false
-        val fullMat = ensureFullGrayMat(widthPx, heightPx)
-        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
-            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
-        }
+        val fullMat = prepareFullGrayMat(lumaBytes, widthPx, heightPx)
 
         val sL = stoneLeftPx.finiteOr(widthPx * 0.5f - 24f)
         val sT = stoneTopPx.finiteOr(heightPx * 0.5f - 24f)
@@ -580,10 +663,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
         if (widthPx < 4 || heightPx < 4) {
             return ConstellationMatchResult(matched = false, inliers = 0)
         }
-        val fullMat = ensureFullGrayMat(widthPx, heightPx)
-        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
-            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
-        }
+        val fullMat = prepareFullGrayMat(lumaBytes, widthPx, heightPx)
 
         val maxSquare = min(widthPx, heightPx).coerceAtLeast(2)
         val searchSide = (refCollarWidthPx * latestRelativeScale.finiteOr(1f).coerceIn(0.75f, 1.95f) * 1.18f)
@@ -815,10 +895,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
     ): Boolean {
         if (!ensureOpenCvInitialized()) return false
         if (widthPx < 64 || heightPx < 36) return false
-        val fullMat = ensureFullGrayMat(widthPx, heightPx)
-        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
-            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
-        }
+        val fullMat = prepareFullGrayMat(lumaBytes, widthPx, heightPx)
 
         val relocW = max(64, widthPx / RELOC_DOWNSCALE_DIVISOR)
         val relocH = max(36, heightPx / RELOC_DOWNSCALE_DIVISOR)
@@ -907,10 +984,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
             return RelocalizationMatchResult(matched = false, inliers = 0)
         }
 
-        val fullMat = ensureFullGrayMat(widthPx, heightPx)
-        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
-            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
-        }
+        val fullMat = prepareFullGrayMat(lumaBytes, widthPx, heightPx)
 
         val relocW = max(64, widthPx / RELOC_DOWNSCALE_DIVISOR)
         val relocH = max(36, heightPx / RELOC_DOWNSCALE_DIVISOR)
@@ -1047,6 +1121,8 @@ open class OpenCvConstellationTracker : AutoCloseable {
         prevVoGrayMat = null
         currVoGrayMat?.release()
         currVoGrayMat = null
+        prevVoDetectMat?.release()
+        prevVoDetectMat = null
         voMaskMat?.release()
         voMaskMat = null
         relocGrayMat?.release()
@@ -1055,6 +1131,28 @@ open class OpenCvConstellationTracker : AutoCloseable {
         canonicalPatchMat = null
         emptyMaskMat?.release()
         emptyMaskMat = null
+    }
+
+    private fun prepareFullGrayMat(lumaBytes: ByteArray?, widthPx: Int, heightPx: Int): Mat {
+        val fullMat = ensureFullGrayMat(widthPx, heightPx)
+        if (lumaBytes != null && lumaBytes.size >= widthPx * heightPx) {
+            fullMat.put(0, 0, lumaBytes, 0, widthPx * heightPx)
+            latestFullLumaRef = lumaBytes
+            latestFullWidthPx = widthPx
+            latestFullHeightPx = heightPx
+            fullMatDirty = false
+        } else if (fullMatDirty) {
+            val cachedLuma = latestFullLumaRef
+            if (cachedLuma != null &&
+                latestFullWidthPx == widthPx &&
+                latestFullHeightPx == heightPx &&
+                cachedLuma.size >= widthPx * heightPx
+            ) {
+                fullMat.put(0, 0, cachedLuma, 0, widthPx * heightPx)
+            }
+            fullMatDirty = false
+        }
+        return fullMat
     }
 
     private fun ensureFullGrayMat(widthPx: Int, heightPx: Int): Mat {
@@ -1151,7 +1249,8 @@ open class OpenCvConstellationTracker : AutoCloseable {
         private const val MAX_RELATIVE_SCALE = 3.50f
 
         private const val VO_DOWNSCALE_DIVISOR = 3 // 1920x1080 -> 640x360 (< 2 ms CPU)
-        private const val MAX_VO_GRAVEL_CORNERS = 108 // 80..120 corner target budget
+        private const val MAX_VO_GRAVEL_CORNERS = 96 // 80..120 corner target budget
+        private const val MIN_CACHED_VO_CORNERS = 60
         private const val MIN_VO_INLIERS = 10
 
         private const val RELOC_DOWNSCALE_DIVISOR = 4 // 1920x1080 -> 480x270 (~5 Hz relocalization)

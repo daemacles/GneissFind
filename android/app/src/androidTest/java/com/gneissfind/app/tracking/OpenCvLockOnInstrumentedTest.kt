@@ -20,13 +20,23 @@ import androidx.activity.ComponentActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.gneissfind.app.camera.PushBroomCameraController
+import com.gneissfind.app.camera.ReplayCameraSource
+import com.gneissfind.app.camera.ReplayRunSummary
 import com.gneissfind.app.inference.LiveModelProfile
 import com.gneissfind.app.inference.RfDetrTwoGraphGpuDetector
+import com.gneissfind.app.logging.FieldDataLogger
+import com.gneissfind.app.logging.FieldFrameTelemetry
+import com.gneissfind.app.vision.PushBroomCropper
+import com.gneissfind.app.vision.Yuv420Frame
 import com.google.common.truth.Truth.assertThat
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.Random
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.opencv.android.OpenCVLoader
@@ -87,7 +97,7 @@ class OpenCvLockOnInstrumentedTest {
     }
 
     @Test
-    fun akazeConstellationCollarTracksScaleAndTranslationUnder5MsCpu() {
+    fun akazeConstellationCollarTracksScaleAndTranslationUnder5MsCpu() = withTopAppActivity {
         assertThat(OpenCVLoader.initLocal()).isTrue()
 
         val width = 1920
@@ -372,7 +382,7 @@ class OpenCvLockOnInstrumentedTest {
     }
 
     @Test
-    fun fullFrame640x360KltVoUnder2MsAnd480x270RelocalizationRecoversLargeDrift() {
+    fun fullFrame640x360KltVoUnder2MsAnd480x270RelocalizationRecoversLargeDrift() = withTopAppActivity {
         assertThat(OpenCvConstellationTracker.ensureOpenCvInitialized()).isTrue()
         val width = 1920
         val height = 1080
@@ -481,6 +491,133 @@ class OpenCvLockOnInstrumentedTest {
         }
     }
 
+    @Test
+    fun fieldDataLoggerHardwareMp4EncodeAndReplayCameraSourceDecodeRoundTrip() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val testSessionDir = File(context.cacheDir, "m2d_hw_codec_roundtrip").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val cropper = PushBroomCropper()
+        val logger = FieldDataLogger(appContext = context)
+        val raycaster = GroundPlaneRaycaster(context)
+
+        try {
+            logger.startSession(sessionDirOverride = testSessionDir)
+            val width = 1920
+            val height = 1080
+            val yBytes = ByteArray(width * height) { idx -> ((idx * 17) and 0xFF).toByte() }
+            val uvSize = width * (height / 2)
+            val uBytes = ByteArray(uvSize) { 128.toByte() }
+            val vBytes = ByteArray(uvSize) { 132.toByte() }
+
+            var monoNs = 1_000_000_000L
+            for (fIdx in 0 until 30) {
+                repeat(4) { sub ->
+                    val imuTs = monoNs + sub * 8_333_333L
+                    val pitch = 44.0f + fIdx * 0.1f
+                    val rot = GroundPlaneRaycaster.buildLandscapeRotationMatrix(
+                        pitchDeg = pitch,
+                        rollDeg = 0f,
+                        yawDeg = fIdx * 0.4f
+                    )
+                    logger.recordImuSample(imuTs, rot, pitch)
+                }
+                val frame = object : Yuv420Frame {
+                    override val width: Int = width
+                    override val height: Int = height
+                    override val rotationDegrees: Int = 0
+                    override val timestampNs: Long = monoNs
+                    override val yBuffer: ByteBuffer = ByteBuffer.wrap(yBytes)
+                    override val yRowStride: Int = width
+                    override val yPixelStride: Int = 1
+                    override val uBuffer: ByteBuffer = ByteBuffer.wrap(uBytes)
+                    override val uRowStride: Int = width
+                    override val uPixelStride: Int = 2
+                    override val vBuffer: ByteBuffer = ByteBuffer.wrap(vBytes)
+                    override val vRowStride: Int = width
+                    override val vPixelStride: Int = 2
+                }
+                logger.recordCameraFrame(
+                    frame = frame,
+                    cropper = cropper,
+                    telemetry = FieldFrameTelemetry(
+                        timestampMonoNs = monoNs,
+                        exposureTimeNs = 4_000_000L,
+                        sensorIso = 200
+                    )
+                )
+                Thread.sleep(20L)
+                monoNs += 33_333_333L
+            }
+
+            logger.stopSessionBlocking(timeoutMs = 6_000L)
+
+            val clipFile = File(testSessionDir, FieldDataLogger.CLIP_FILE_NAME)
+            val traceFile = File(testSessionDir, FieldDataLogger.TRACE_FILE_NAME)
+            assertThat(clipFile.exists()).isTrue()
+            assertThat(clipFile.length()).isGreaterThan(4_096L)
+            assertThat(traceFile.exists()).isTrue()
+
+            val parsedTrace = FieldDataLogger.parseReplayTraceFile(traceFile)
+            assertThat(parsedTrace.imuRecords.size).isAtLeast(60)
+            assertThat(parsedTrace.frameRecords.size).isAtLeast(15)
+
+            // Decode the recorded clip.mp4 + trace.jsonl back through ReplayCameraSource
+            val decodedFrames = AtomicInteger(0)
+            val doneLatch = CountDownLatch(1)
+            val summaryRef = AtomicReference<ReplayRunSummary?>(null)
+            val replaySource = ReplayCameraSource(
+                appContext = context,
+                raycaster = raycaster,
+                onSessionHeaderLoaded = {},
+                onReplayFrameAvailable = { yuv, _, _, _, releaseCallback ->
+                    try {
+                        assertThat(yuv.width).isEqualTo(1920)
+                        assertThat(yuv.height).isEqualTo(1080)
+                        decodedFrames.incrementAndGet()
+                    } finally {
+                        releaseCallback()
+                    }
+                },
+                onTryAutoLockAtFrame = { true },
+                onBuildRunSummary = { name, total, errs ->
+                    ReplayRunSummary(
+                        sessionName = name,
+                        frames = total,
+                        locks = 1,
+                        handovers = 0,
+                        lostLocks = 0,
+                        distractorJumps = 0,
+                        exceptions = errs
+                    )
+                },
+                onSinglePassCompleted = { summary ->
+                    summaryRef.set(summary)
+                    doneLatch.countDown()
+                }
+            )
+            try {
+                val started = replaySource.startSession(
+                    sessionDir = testSessionDir,
+                    loopReplay = false,
+                    autoLockFrameIdx = 5
+                )
+                assertThat(started).isTrue()
+                assertThat(doneLatch.await(12, TimeUnit.SECONDS)).isTrue()
+                val summary = summaryRef.get()
+                assertThat(summary).isNotNull()
+                assertThat(summary!!.exceptions).isEqualTo(0)
+                assertThat(decodedFrames.get()).isAtLeast(15)
+            } finally {
+                replaySource.close()
+            }
+        } finally {
+            logger.close()
+            testSessionDir.deleteRecursively()
+        }
+    }
+
     private fun synthesizeGravelBedWithSmoothAgate(width: Int, height: Int): Mat {
         val mat = Mat(height, width, CvType.CV_8UC1, Scalar(96.0))
         val rng = Random(424242L)
@@ -530,6 +667,23 @@ class OpenCvLockOnInstrumentedTest {
         val yCv = rCvFromWorld[3] * dx + rCvFromWorld[4] * dy + rCvFromWorld[5] * dz
         val zCv = rCvFromWorld[6] * dx + rCvFromWorld[7] * dy + rCvFromWorld[8] * dz
         return Pair(960f + focalPx * (xCv / zCv), 540f + focalPx * (yCv / zCv))
+    }
+
+    private fun withTopAppActivity(block: () -> Unit) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val hostActivity = instrumentation.startActivitySync(
+            Intent(context, ComponentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ) as ComponentActivity
+        instrumentation.runOnMainSync {
+            hostActivity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            block()
+        } finally {
+            instrumentation.runOnMainSync { hostActivity.finish() }
+        }
     }
 
     companion object {
