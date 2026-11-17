@@ -12,7 +12,7 @@ OUT_FILE="${1:-/tmp/gneissfind-sync.md}"
   echo '```text'
   git -C "$REPO_ROOT" status -sb
   echo "---"
-  git -C "$REPO_ROOT" log -n 15 --oneline
+  git -C "$REPO_ROOT" log -n 18 --oneline
   echo '```'
   echo ""
   for meta in \

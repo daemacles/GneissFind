@@ -1,38 +1,29 @@
 ---
 trigger: glob
 globs: "android/**"
-description: Standing Classic 2360s TNG LCARS design language, semantic color roles, tabular stability, ambidextrous ergonomics, and outdoor AR overlay principles.
+description: Classic 2360s TNG LCARS 6-role color taxonomy, GneissFind + git/date shoulders, Replay SRC entries, and right-edge-safe full-screen Lock-On HUD rules.
 ---
 
-# Classic 2360s TNG LCARS UI & Field UX Principles
+# GneissFind Classic 2360s TNG LCARS UI Rules (Milestone 2D)
 
-## 1. Framing, Geometry & OLED Discipline
-- **Pure `#000000` Canvas & Crisp Gutters:** Anchor all layouts on true `#000000` black with uniform `4.dp` black gutters between bars, elbows, and pills. Never use drop shadows, gradients, blurs, translucent cards, or modal dialogs over the camera viewport.
-- **Architectural Framing:** Frame viewports and control decks with swept LCARS elbows, slim telemetry rails, and capsule/flat-ended pills. Reserve outer shoulders for permanent app identity and compile-time build provenance.
-- **OLED Longevity:** Support low-luminance viewport dimming during prolonged idle Eyes-Up operation, waking immediately on touch or target activity.
+## 1. Preserved Visual, Semantic & Lock-Mode Invariants (`8707282`, `5d13646`)
+1. **Pure `#000000` OLED Canvas & `4.dp` Gutters:** Zero translucent cards, drop shadows, or modal popups over the camera viewport.
+2. **Silent UI Chrome:** `isSoundEffectsEnabled = false` on all LCARS controls (`80 ms` `#FFFFFF` tap flash only).
+3. **Preserved Shoulders & Central Actuator (`e8dc825`):**
+   - `TopLeft` shoulder: **`GNEISSFIND`**.
+   - `BottomLeft` shoulder: **`BuildConfig.GIT_COMMIT_HASH_6 • BuildConfig.BUILD_DATE_ISO`**.
+   - Central ambidextrous button adjacent to deck divider: **`LOCK NEAREST`** (`#596480` Slate when 0 targets, `#FFCC66` TNG Gold when `>= 1` target) <-> **`BREAK LOCK`** (`#CC4444` Mars Red while locked).
+   - Full-screen `16:9` Lock Mode (`5d13646`): collapses lower 2-pane Patrol deck so `ClippingCameraViewportContainer` fills the inner crook alongside `LockOnSideConsole` (`MODEL CONF`, `3D ANGLES`, `TEXTURE PTS` / `HOLD TIMER`, and `88.dp` Mars Red `BREAK LOCK`).
 
-## 2. Semantic Color Roles
-Color communicates **control behavior and system state**, never arbitrary decoration (use subtle value steps to separate adjacent blocks of the same role):
-- **Binary Toggles:** `#FF9900` Golden Amber when active; `#596480` Slate Blue when inactive/disabled.
-- **Multi-State Selectors:** `#9999FF` Periwinkle for cycling between discrete operating modes.
-- **Actions & Drawers:** `#FFCC66` TNG Gold for one-shot triggers, steppers, and expandable selectors.
-- **Live Telemetry:** `#99CCFF` Ice Blue for continuously updating sensor and timing readouts.
-- **Configuration & Identity:** `#FFCC99` Peach for static state, optics configuration, and provenance Chrome.
-- **Alerts & Release Actions:** `#CC4444` Mars Red for critical limits, active data capture, and immediate lock-release / abort controls.
-- **1:1 Gauge Correlation:** Any bar or meter must share the exact semantic color of its label and numeric value so the relationship is unmistakable at a glance.
+## 2. `SRC` Drawer & `MOD: LOG` Telemetry Updates (Milestone 2D)
+- **`LcarsSourceDrawerOverlay` (`SRC` Drawer) Organization:**
+  1. **Live Camera Hardware Profiles (`S-01` .. `S-05`):** Default `S-01: RF-DETR 256 B=3 W8-DYN` through `S-05: RF-DETR 384 B=5 BASE`.
+  2. **Recorded Sensor-Trace Replays (`REPLAY: <session>`):** Dynamically list all valid `<session>/clip.mp4` + `trace.jsonl` bundles discovered in `Android/media/com.gneissfind.app/replays/` (newest first, showing duration, e.g., `REPLAY: 20261117_0930 [28S]`). While a replay is active, show a `Periwinkle` `REPLAY` badge in the header rail so the operator always knows live camera is paused.
+  3. **Single Synthetic Reference (`SIM: MIXED GRAVEL WALK`):** Retain **only** `MIXED_GRAVEL_WALK` as the 1 built-in synthetic demo at the bottom of `SRC` (remove `AGATE_PEBBLE_20MM` and `JASPER_COBBLE_55MM` from the UI drawer while keeping them in `SyntheticStoneDetector` for unit tests).
+- **`MOD: LOG` (`30 FPS MP4 + 120 Hz IMU`) Readout:**
+  - When `MOD` is toggled to `LOG`, display elapsed recording duration and encoded frame count in the `REC` readout (`e.g., REC 00:14 • 420F`) with `MarsRed` active recording indicator.
 
-## 3. Typography, Layout Stability & Non-Redundancy
-- **Tabular Uppercase Display:** Use condensed uppercase `Antonio` typography with tabular numerals (`tnum`) on all counters, timers, angles, and rates.
-- **Zero-Jitter Readouts:** Live numbers and HUD badges must never resize their containers or shift neighboring elements as digit counts change (use fixed-width slots or monotonic high-water-mark widths).
-- **Single Source of Truth:** Display each metric in one canonical location. Avoid repeating the same range, accuracy, or size readout across headers, side panels, and viewport overlays.
-
-## 4. Ambidextrous Ergonomics & Silent Chrome
-- **Two-Handed Landscape Reach:** Place high-frequency field actions near the horizontal center of landscape layouts so they are equally reachable by either left or right thumb.
-- **Field Touch Targets:** Maintain `>= 48.dp` effective hit bounds on interactive controls and tap-selectable viewport reticles for outdoor, walking, or gloved use.
-- **Acoustic Exclusivity:** Keep all UI touches silent (`isSoundEffectsEnabled = false`, using brief `#FFFFFF` tap-flash feedback instead) so interface chrome never competes with audio sonification.
-
-## 5. Viewport Continuity & Anti-Camouflage Symbology
-- **Persistent Camera Surface:** Transitions between scanning and target-inspection modes must re-frame the existing camera view in place without tearing down or rebinding the underlying preview surface.
-- **Task-Focused Chrome:** Collapse non-essential configuration controls during focused inspection/homing modes to maximize live video area while retaining LCARS structural framing and an unmistakable exit action.
-- **High-Contrast Keylined Overlays:** Every reticle, bracket, crosshair, directional indicator, and ROI boundary drawn over live video must carry a `#000000` outer keyline halo for legibility against bright or wet gravel.
-- **Honest Visual Lock & Uncluttered Targets:** Reticle geometry (e.g., solid vs. dashed crosshair) must reflect actual live tracking lock rather than nominal mode. Keep tracked subjects free of floating text labels that flicker or occlude the target, and keep background work (such as shader compilation) non-blocking via compact inline status banners.
+## 3. Right-Edge & Off-Screen `DrawScope` Crash Immunity (`ScannerScreen.kt`)
+- In `LockOnOverlay` / `OffScreenChevron` rendering:
+  - Clamp every canvas coordinate (`x`, `y`) to `[0f, canvasSize.width]` and `[0f, canvasSize.height]` after guarding `!value.isNaN() && value.isFinite()`.
+  - When rendering the off-screen directional chevron and angular badge near the **right** (`edgeXNorm -> 1.0f`) or **bottom** (`edgeYNorm -> 1.0f`) viewport border, shift the badge box inward (`left = (anchorX - badgeW - pad).coerceIn(0f, (canvasW - badgeW).coerceAtLeast(0f))`) and coerce `Size(w.coerceAtLeast(0f), h.coerceAtLeast(0f))` so `DrawScope.drawRoundRect` / `drawPath` can NEVER receive negative width/height or throw `IllegalArgumentException` when panning off-screen right!
