@@ -676,7 +676,7 @@ class FieldDataLogger(
         const val DEFAULT_VIDEO_FPS = 30
         const val DEFAULT_VIDEO_BITRATE_BPS = 14_000_000
         private const val I_FRAME_INTERVAL_SEC = 1
-        private const val FRAME_POOL_SLOTS = 4
+        private const val FRAME_POOL_SLOTS = 8
         private const val IMU_POOL_CAPACITY = 256
         private const val CODEC_TIMEOUT_US = 12_000L
         private const val CODEC_EOS_TIMEOUT_US = 25_000L
@@ -823,6 +823,103 @@ class FieldDataLogger(
             val vLimit = vBuf.limit()
 
             var srcUv = lumaSize
+            if (uPixStride == 1 && vPixStride == 1 && uvCols > 0) {
+                val uRowBytes = ByteArray(uvCols)
+                val vRowBytes = ByteArray(uvCols)
+                for (uvY in 0 until uvRows) {
+                    for (uvX in 0 until uvCols) {
+                        uRowBytes[uvX] = nv12Bytes[srcUv++]
+                        vRowBytes[uvX] = nv12Bytes[srcUv++]
+                    }
+                    val uRowBase = uvY * uRowStride
+                    val vRowBase = uvY * vRowStride
+                    val uCopy = min(uvCols, (uLimit - uRowBase).coerceAtLeast(0))
+                    val vCopy = min(uvCols, (vLimit - vRowBase).coerceAtLeast(0))
+                    if (uCopy > 0) {
+                        uBuf.position(uRowBase)
+                        uBuf.put(uRowBytes, 0, uCopy)
+                    }
+                    if (vCopy > 0) {
+                        vBuf.position(vRowBase)
+                        vBuf.put(vRowBytes, 0, vCopy)
+                    }
+                }
+                return nv12Bytes.size
+            }
+
+            // Detect hardware semi-planar NV12 vs NV21 buffer aliasing once per frame in O(1)
+            // so 540 chroma rows copy via bulk ByteBuffer.put(byte[], offset, len) (< 0.5 ms).
+            var semiPlanarOrder = 0 // 1 = NV12 (U,V in uBuf), 2 = NV21 (V,U in vBuf)
+            if (uPixStride == 2 && vPixStride == 2 && uvCols >= 2 && uLimit >= 2 && vLimit >= 2) {
+                runCatching {
+                    vBuf.put(0, 0x5A.toByte())
+                    val probe1 = uBuf.get(1)
+                    vBuf.put(0, 0x23.toByte())
+                    val probe2 = uBuf.get(1)
+                    if (probe1 == 0x5A.toByte() && probe2 == 0x23.toByte()) {
+                        semiPlanarOrder = 1
+                    } else {
+                        uBuf.put(0, 0x5A.toByte())
+                        val p1 = vBuf.get(1)
+                        uBuf.put(0, 0x23.toByte())
+                        val p2 = vBuf.get(1)
+                        if (p1 == 0x5A.toByte() && p2 == 0x23.toByte()) {
+                            semiPlanarOrder = 2
+                        }
+                    }
+                }
+            }
+
+            if (semiPlanarOrder == 1) {
+                // Direct NV12 bulk row copy: uPlane holds [U0, V0, ..., U_{n-1}] (width - 1 bytes)
+                // and vPlane's final byte at (uvCols - 1) * 2 holds V_{n-1}.
+                val rowSpan = width - 1
+                val lastVOffset = (uvCols - 1) * 2
+                for (uvY in 0 until uvRows) {
+                    val uRowBase = uvY * uRowStride
+                    val vRowBase = uvY * vRowStride
+                    val uCopy = min(rowSpan, (uLimit - uRowBase).coerceAtLeast(0))
+                    if (uCopy > 0) {
+                        uBuf.position(uRowBase)
+                        uBuf.put(nv12Bytes, srcUv, uCopy)
+                    }
+                    val lastVIdx = vRowBase + lastVOffset
+                    if (lastVIdx in 0 until vLimit) {
+                        vBuf.put(lastVIdx, nv12Bytes[srcUv + width - 1])
+                    }
+                    srcUv += width
+                }
+                return nv12Bytes.size
+            } else if (semiPlanarOrder == 2) {
+                // NV21 bulk row copy: swap (U,V) -> (V,U) in a 1-row byte array then bulk put
+                val vuRow = ByteArray(width)
+                val rowSpan = width - 1
+                val lastUOffset = (uvCols - 1) * 2
+                for (uvY in 0 until uvRows) {
+                    var p = 0
+                    while (p < width) {
+                        val uByte = nv12Bytes[srcUv + p]
+                        val vByte = nv12Bytes[srcUv + p + 1]
+                        vuRow[p] = vByte
+                        vuRow[p + 1] = uByte
+                        p += 2
+                    }
+                    val vRowBase = uvY * vRowStride
+                    val uRowBase = uvY * uRowStride
+                    val vCopy = min(rowSpan, (vLimit - vRowBase).coerceAtLeast(0))
+                    if (vCopy > 0) {
+                        vBuf.position(vRowBase)
+                        vBuf.put(vuRow, 0, vCopy)
+                    }
+                    val lastUIdx = uRowBase + lastUOffset
+                    if (lastUIdx in 0 until uLimit) {
+                        uBuf.put(lastUIdx, vuRow[width - 1])
+                    }
+                    srcUv += width
+                }
+                return nv12Bytes.size
+            }
+
             for (uvY in 0 until uvRows) {
                 val uRowBase = uvY * uRowStride
                 val vRowBase = uvY * vRowStride

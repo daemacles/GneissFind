@@ -1455,6 +1455,241 @@ class LockOnPinpointControllerTest {
         controller.close()
     }
 
+    @Test
+    fun `walk-past 180-deg turn recovers via off-screen full-frame relocalization or sole-candidate center probe`() {
+        var relocCalledWhileOffScreen = false
+        var allowRelocHit = true
+        val relocTracker = object : OpenCvConstellationTracker() {
+            override fun seedConstellationCollar(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int,
+                stoneLeftPx: Float,
+                stoneTopPx: Float,
+                stoneRightPx: Float,
+                stoneBottomPx: Float,
+                baseScale: Float
+            ): Boolean {
+                hasSeededConstellation = true
+                return true
+            }
+
+            override fun seedFullFrameRelocalizationSnapshot(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int,
+                stoneCenterXPx: Float,
+                stoneCenterYPx: Float
+            ): Boolean {
+                hasRelocalizationSnapshot = true
+                return true
+            }
+
+            override fun trackGravelFlowCorrespondences(
+                lumaBytes: ByteArray,
+                widthPx: Int,
+                heightPx: Int,
+                excludeLeftPx: Float,
+                excludeTopPx: Float,
+                excludeRightPx: Float,
+                excludeBottomPx: Float,
+                excludeTargetRegion: Boolean
+            ): GravelFlowCorrespondences? = null
+
+            override fun matchConstellationFrame(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int,
+                predictedCenterXPx: Float,
+                predictedCenterYPx: Float
+            ): ConstellationMatchResult = ConstellationMatchResult(matched = false, inliers = 0)
+
+            override fun matchFullFrameRelocalization(
+                lumaBytes: ByteArray?,
+                widthPx: Int,
+                heightPx: Int
+            ): RelocalizationMatchResult {
+                relocCalledWhileOffScreen = true
+                return if (allowRelocHit) {
+                    RelocalizationMatchResult(
+                        matched = true,
+                        inliers = 18,
+                        stoneCenterXPx = 960f,
+                        stoneCenterYPx = 540f,
+                        latencyMs = 2.5f
+                    )
+                } else {
+                    RelocalizationMatchResult(matched = false, inliers = 0, latencyMs = 2.0f)
+                }
+            }
+        }
+
+        val controller = LockOnPinpointController(openCvTracker = relocTracker)
+        val geom = StripRoiGeometry()
+        val focalPx = 1378f // 1.0x wide FOV matching 20261117_105848 trace
+        val rotNorth = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 55f, rollDeg = 0f, yawDeg = 0f)
+        val rotSouth180 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 55f, rollDeg = 0f, yawDeg = 180f)
+        val trueStoneEnu = floatArrayOf(0f, 0.75f, 0f)
+        val initCamEnu = floatArrayOf(0f, 0f, 1.06f)
+        val (u0, v0) = projectGroundPoint(trueStoneEnu, initCamEnu, rotNorth, focalPx)
+        val initRay = GroundPlaneRaycaster.pixelToWorldRay(u0, v0, focalPx, rotNorth)
+        val initRange = distance3d(initCamEnu, trueStoneEnu)
+
+        val target = ConfirmedTarget(
+            trackId = 401L,
+            stoneClass = StoneClass.CHALCEDONY_AGATE,
+            worldPosition = WorldPoint3D(0f, 0f, 0.75f),
+            stripLeftPx = u0 - geom.stripLeftPx - 45f,
+            stripTopPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX - 45f,
+            stripRightPx = u0 - geom.stripLeftPx + 45f,
+            stripBottomPx = v0 - StripRoiGeometry.NOMINAL_CROP_Y_PX + 45f,
+            smoothedConfidence = 0.90f,
+            estimatedDiameterMm = 116f,
+            slantRangeMeters = initRange,
+            hitCountInWindow = 4,
+            windowSize = 4,
+            lastUpdatedTimestampNs = 70_000_000_000L,
+            worldRay = initRay,
+            isVisibleInStrip = true
+        )
+
+        var tNs = 70_000_000_000L
+        val luma = ByteArray(1920 * 1080)
+        controller.lockOntoTarget(
+            target = target,
+            stripGeometry = geom,
+            currentCropYFloat = StripRoiGeometry.NOMINAL_CROP_Y_PX.toFloat(),
+            currentFocalLengthPx = focalPx,
+            currentRotationMatrix = rotNorth,
+            timestampNs = tNs
+        )
+
+        // Converge into Stage 3 PINPOINT_CONSTELLATION
+        for (step in 1..4) {
+            tNs += 80_000_000L
+            val cam = floatArrayOf(step * 0.08f, step * 0.08f, 1.00f - step * 0.04f)
+            val (u, v) = projectGroundPoint(trueStoneEnu, cam, rotNorth, focalPx)
+            val (cL, cT) = PushBroomCropper.computeClampedSquareCropOrigin(u, v)
+            val pose = MotionPoseSnapshot(
+                cameraWorldPosition = WorldPoint3D(cam[0], cam[2], cam[1]),
+                forwardPitchDeg = 55f,
+                rawPitchDeg = 55f,
+                rollDeg = 0f,
+                referencePitchDeg = 55f,
+                cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+                isPitchClamped = false,
+                centerSlantRangeMeters = distance3d(cam, trueStoneEnu),
+                horizontalSpeedMps = 0.3f,
+                arPlaneLocked = false,
+                timestampNs = tNs,
+                verticalFocalLengthPx = focalPx,
+                rotationMatrix = rotNorth
+            )
+            controller.onCameraLumaFrame(luma, 1920, 1080, pose, tNs)
+            controller.onNeuralB1Detections(
+                cropDetections = listOf(
+                    TileDetection(
+                        tileIndex = 0,
+                        classId = StoneClass.CHALCEDONY_AGATE.id,
+                        confidence = 0.92f,
+                        leftPx = (u - cL) - 42f,
+                        topPx = (v - cT) - 42f,
+                        rightPx = (u - cL) + 42f,
+                        bottomPx = (v - cT) + 42f
+                    )
+                ),
+                cropLeftPx = cL,
+                cropTopPx = cT,
+                poseSnapshot = pose,
+                zoomRatio = 1.0f,
+                timestampNs = tNs,
+                syntheticCameraStepEnu = cam
+            )
+        }
+        assertEquals(AcquisitionStage.PINPOINT_CONSTELLATION, controller.currentStage)
+
+        // Part A: Simulate frozen VO after walking past + turning 180 deg South (target appears >30 deg behind/off-screen,
+        // nearViewport == false!): 480x270 full-frame AKAZE relocalization MUST still execute and snap back to (960, 540)!
+        tNs += 300_000_000L
+        val southPose = MotionPoseSnapshot(
+            cameraWorldPosition = WorldPoint3D(0.32f, 0.84f, 0.32f),
+            forwardPitchDeg = 55f,
+            rawPitchDeg = 55f,
+            rollDeg = 0f,
+            referencePitchDeg = 55f,
+            cropY = StripRoiGeometry.NOMINAL_CROP_Y_PX,
+            isPitchClamped = false,
+            centerSlantRangeMeters = 0.85f,
+            horizontalSpeedMps = 0f,
+            arPlaneLocked = false,
+            timestampNs = tNs,
+            verticalFocalLengthPx = focalPx,
+            rotationMatrix = rotSouth180
+        )
+        val relocRecovered = controller.onCameraLumaFrame(luma, 1920, 1080, southPose, tNs)
+        assertTrue("Full-frame reloc MUST run even when nearViewport == false", relocCalledWhileOffScreen)
+        assertTrue("Reloc must snap target back into visible viewport", relocRecovered.hudState.isTargetInFrame)
+        assertNull(relocRecovered.hudState.offScreenChevron)
+
+        // Part B: Disable AKAZE reloc (3D mug opposite face on plain carpet), turn 180 deg back to North (>1.2s lost):
+        // verify ambiguous 2-candidate crop is REJECTED while sole matching-class/scale mug at center IS REACQUIRED!
+        allowRelocHit = false
+        tNs += 300_000_000L
+        val lostPose0 = southPose.copy(timestampNs = tNs, rotationMatrix = rotNorth)
+        val offDir = controller.onCameraLumaFrame(luma, 1920, 1080, lostPose0, tNs)
+        assertFalse(offDir.hudState.isTargetInFrame)
+
+        // Advance 1.3s into lost-track grace so center recovery probe arms on every 3rd frame
+        var probeDirective = offDir
+        repeat(3) {
+            tNs += 450_000_000L
+            probeDirective = controller.onCameraLumaFrame(
+                luma,
+                1920,
+                1080,
+                lostPose0.copy(timestampNs = tNs),
+                tNs
+            )
+        }
+        assertTrue("Center recovery probe must arm B=1 at viewport center", probeDirective.shouldRunNeuralB1)
+        assertEquals(960f, probeDirective.desiredCropCenterXPx, 1f)
+        assertEquals(540f, probeDirective.desiredCropCenterYPx, 1f)
+
+        val (centerCropL, centerCropT) = PushBroomCropper.computeClampedSquareCropOrigin(960f, 540f, 640)
+        // Two same-class candidates -> ambiguous, MUST NOT jump!
+        val ambiguousHud = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(0, StoneClass.CHALCEDONY_AGATE.id, 0.85f, 90f, 130f, 145f, 185f),
+                TileDetection(0, StoneClass.CHALCEDONY_AGATE.id, 0.82f, 190f, 130f, 245f, 185f)
+            ),
+            cropLeftPx = centerCropL,
+            cropTopPx = centerCropT,
+            poseSnapshot = lostPose0.copy(timestampNs = tNs),
+            zoomRatio = 1.0f,
+            timestampNs = tNs,
+            cropSizePx = 640
+        )
+        assertFalse("Ambiguous 2-candidate crop must not jump anchor", ambiguousHud.isTargetInFrame)
+
+        // Sole matching-class, matching-diameter coffee mug centered at (160, 160) in 640x640 -> REACQUIRED!
+        tNs += 100_000_000L
+        val soleRecoveredHud = controller.onNeuralB1Detections(
+            cropDetections = listOf(
+                TileDetection(0, StoneClass.CHALCEDONY_AGATE.id, 0.88f, 132f, 132f, 188f, 188f)
+            ),
+            cropLeftPx = centerCropL,
+            cropTopPx = centerCropT,
+            poseSnapshot = lostPose0.copy(timestampNs = tNs),
+            zoomRatio = 1.0f,
+            timestampNs = tNs,
+            cropSizePx = 640
+        )
+        assertTrue("Sole matching mug in viewport center must clear OFF-SCREEN HOLD", soleRecoveredHud.isTargetInFrame)
+        assertFalse(soleRecoveredHud.isLostTrackGraceActive)
+        assertNull(soleRecoveredHud.offScreenChevron)
+        controller.close()
+    }
+
     private fun buildConfirmedTarget(
         trackId: Long,
         stripCenterX: Float,

@@ -188,7 +188,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleDebugReplayIntent(intent: Intent?) {
-        val replaySession = intent?.getStringExtra(EXTRA_DEBUG_REPLAY_SESSION)
+        if (intent == null) return
+        val recordSeconds = intent.getIntExtra(EXTRA_DEBUG_RECORD_SECONDS, 0)
+        if (recordSeconds > 0) {
+            intent.removeExtra(EXTRA_DEBUG_RECORD_SECONDS)
+            viewModel.startDebugRecordSessionFromIntent(recordSeconds)
+            return
+        }
+        val replaySession = intent.getStringExtra(EXTRA_DEBUG_REPLAY_SESSION)
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
             ?: return
@@ -228,5 +235,6 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_DEBUG_REPLAY_SESSION = "debug_replay_session"
         const val EXTRA_DEBUG_AUTO_LOCK_FRAME = "debug_auto_lock_frame"
         const val EXTRA_DEBUG_LOOP_REPLAY = "debug_loop_replay"
+        const val EXTRA_DEBUG_RECORD_SECONDS = "debug_record_seconds"
     }
 }

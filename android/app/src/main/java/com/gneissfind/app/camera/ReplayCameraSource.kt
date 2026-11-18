@@ -181,6 +181,7 @@ class ReplayCameraSource(
     ) -> Unit,
     private val onTryAutoLockAtFrame: (frameIndex: Int) -> Boolean,
     private val onBuildRunSummary: (sessionName: String, totalFrames: Int, caughtExceptions: Int) -> ReplayRunSummary,
+    private val onLoopRestarted: () -> Unit = {},
     private val onSinglePassCompleted: (ReplayRunSummary) -> Unit = {}
 ) : AutoCloseable {
 
@@ -188,12 +189,15 @@ class ReplayCameraSource(
     @Volatile
     private var workerThread: Thread? = null
 
-    // Double-buffered 960x540 ARGB_8888 viewport bitmaps + scratch array (zero per-frame heap churn)
+    // Double-buffered 960x540 ARGB_8888 viewport bitmaps + bulk row scratch arrays (zero per-frame heap churn)
     private val previewBitmaps: Array<Bitmap> = arrayOf(
         Bitmap.createBitmap(PREVIEW_WIDTH_PX, PREVIEW_HEIGHT_PX, Bitmap.Config.ARGB_8888),
         Bitmap.createBitmap(PREVIEW_WIDTH_PX, PREVIEW_HEIGHT_PX, Bitmap.Config.ARGB_8888)
     )
     private val previewArgbScratch = IntArray(PREVIEW_WIDTH_PX * PREVIEW_HEIGHT_PX)
+    private var previewYRowScratch = ByteArray(4096)
+    private var previewURowScratch = ByteArray(4096)
+    private var previewVRowScratch = ByteArray(4096)
     private var previewToggleIdx = 0
     private var emittedFrameSeq = 0L
 
@@ -331,31 +335,33 @@ class ReplayCameraSource(
                 var inputEos = false
                 var outputEos = false
 
+                var prevDeliveredWallNs = 0L
+                var smoothedReplayFps = header.fps.coerceIn(1, 120).toFloat()
+
                 while (running.get() && !outputEos) {
-                    if (!inputEos) {
-                        val inIdx = codec.dequeueInputBuffer(CODEC_POLL_TIMEOUT_US)
-                        if (inIdx >= 0) {
-                            val inBuf = codec.getInputBuffer(inIdx)
-                            val sampleSize = if (inBuf != null) {
-                                inBuf.clear()
-                                mediaExtractor.readSampleData(inBuf, 0)
-                            } else {
-                                -1
-                            }
-                            if (sampleSize < 0) {
-                                codec.queueInputBuffer(
-                                    inIdx,
-                                    0,
-                                    0,
-                                    0L,
-                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                )
-                                inputEos = true
-                            } else {
-                                val ptsUs = mediaExtractor.sampleTime.coerceAtLeast(0L)
-                                codec.queueInputBuffer(inIdx, 0, sampleSize, ptsUs, 0)
-                                mediaExtractor.advance()
-                            }
+                    while (!inputEos && running.get()) {
+                        val inIdx = codec.dequeueInputBuffer(0L)
+                        if (inIdx < 0) break
+                        val inBuf = codec.getInputBuffer(inIdx)
+                        val sampleSize = if (inBuf != null) {
+                            inBuf.clear()
+                            mediaExtractor.readSampleData(inBuf, 0)
+                        } else {
+                            -1
+                        }
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(
+                                inIdx,
+                                0,
+                                0,
+                                0L,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            inputEos = true
+                        } else {
+                            val ptsUs = mediaExtractor.sampleTime.coerceAtLeast(0L)
+                            codec.queueInputBuffer(inIdx, 0, sampleSize, ptsUs, 0)
+                            mediaExtractor.advance()
                         }
                     }
 
@@ -372,10 +378,15 @@ class ReplayCameraSource(
                                 val frameMeta = resolveFrameRecord(frameRecords, passFrameIdx)
                                 val frameTraceNs = frameMeta?.timestampNs
                                     ?: (baseTraceNs + bufferInfo.presentationTimeUs.coerceAtLeast(0L) * 1_000L)
-                                val targetFrameMonoNs = passStartMonoNs +
-                                    (frameTraceNs - baseTraceNs).coerceAtLeast(passFrameIdx * nominalFrameIntervalNs)
+                                val relFrameNs = if (frameTraceNs >= baseTraceNs) {
+                                    frameTraceNs - baseTraceNs
+                                } else {
+                                    passFrameIdx * nominalFrameIntervalNs
+                                }
+                                val targetFrameMonoNs = passStartMonoNs + relFrameNs
 
-                                // Inject all 120 Hz IMU samples up to this video frame's capture timestamp
+                                // Inject all 120 Hz IMU samples up to this video frame's capture timestamp,
+                                // preserving exact relative trace timestamps in the ring buffer.
                                 while (imuCursor < imuRecords.size && running.get()) {
                                     val imu = imuRecords[imuCursor]
                                     if (imu.timestampNs > frameTraceNs) break
@@ -384,7 +395,7 @@ class ReplayCameraSource(
                                     sleepUntilMonotonicNs(targetImuMonoNs)
                                     if (!running.get()) break
                                     raycaster.injectReplayOrientationMatrix(
-                                        timestampNs = max(System.nanoTime(), targetImuMonoNs),
+                                        timestampNs = targetImuMonoNs,
                                         rotationMatrix9 = imu.rotationMatrix,
                                         rawPitchOverrideDeg = imu.pitchDeg
                                     )
@@ -392,7 +403,19 @@ class ReplayCameraSource(
                                 }
 
                                 sleepUntilMonotonicNs(targetFrameMonoNs)
-                                val deliverMonoNs = max(System.nanoTime(), targetFrameMonoNs)
+                                val nowWallNs = System.nanoTime()
+                                if (prevDeliveredWallNs != 0L && nowWallNs > prevDeliveredWallNs) {
+                                    val dtSec = (nowWallNs - prevDeliveredWallNs) * 1e-9f
+                                    if (dtSec in 0.008f..0.600f) {
+                                        val instFps = 1.0f / dtSec
+                                        smoothedReplayFps = if (passFrameIdx <= 2) {
+                                            instFps
+                                        } else {
+                                            smoothedReplayFps * 0.80f + instFps * 0.20f
+                                        }
+                                    }
+                                }
+                                prevDeliveredWallNs = nowWallNs
 
                                 var bufferReleased = false
                                 val outImg = runCatching { codec.getOutputImage(outIdx) }.getOrNull()
@@ -406,7 +429,7 @@ class ReplayCameraSource(
 
                                 try {
                                     val yuvFrame: Yuv420Frame? = if (outImg != null) {
-                                        MediaImageYuv420Frame(outImg, deliverMonoNs)
+                                        MediaImageYuv420Frame(outImg, targetFrameMonoNs)
                                     } else {
                                         val outBuf = codec.getOutputBuffer(outIdx)
                                         if (outBuf != null) {
@@ -417,7 +440,7 @@ class ReplayCameraSource(
                                             val h = fmt.getIntOrDefault(MediaFormat.KEY_HEIGHT, header.height)
                                             val stride = fmt.getIntOrDefault(MediaFormat.KEY_STRIDE, w)
                                             val sliceH = fmt.getIntOrDefault(MediaFormat.KEY_SLICE_HEIGHT, h)
-                                            Nv12BufferYuv420Frame(outBuf, w, h, stride, sliceH, deliverMonoNs)
+                                            Nv12BufferYuv420Frame(outBuf, w, h, stride, sliceH, targetFrameMonoNs)
                                         } else {
                                             null
                                         }
@@ -439,7 +462,7 @@ class ReplayCameraSource(
                                             verticalFocalLengthPx = fyPx,
                                             streamWidth = yuvFrame.width,
                                             streamHeight = yuvFrame.height,
-                                            measuredCameraFps = header.fps.toFloat()
+                                            measuredCameraFps = smoothedReplayFps
                                         )
                                         val seq = ++emittedFrameSeq
                                         onReplayFrameAvailable(
@@ -480,7 +503,8 @@ class ReplayCameraSource(
                     break
                 }
 
-                // Loop clip cleanly from frame 0
+                // Loop clip cleanly from frame 0 and clear stale spatial anchors from end-of-clip
+                onLoopRestarted()
                 mediaExtractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                 codec.flush()
             }
@@ -535,34 +559,74 @@ class ReplayCameraSource(
         val vRowStride = frame.vRowStride
         val vPixStride = frame.vPixelStride
 
+        val neededYSpan = (srcW - 1) * yPixStride + 1
+        val srcUvCols = (srcW + 1) shr 1
+        val neededUSpan = (srcUvCols - 1) * uPixStride + 1
+        val neededVSpan = (srcUvCols - 1) * vPixStride + 1
+        if (previewYRowScratch.size < neededYSpan) previewYRowScratch = ByteArray(neededYSpan)
+        if (previewURowScratch.size < neededUSpan) previewURowScratch = ByteArray(neededUSpan)
+        if (previewVRowScratch.size < neededVSpan) previewVRowScratch = ByteArray(neededVSpan)
+        val yRowBuf = previewYRowScratch
+        val uRowBuf = previewURowScratch
+        val vRowBuf = previewVRowScratch
+
         val outPixels = previewArgbScratch
         var dstIdx = 0
+        var cachedUvRow = -1
+        var uCopy = 0
+        var vCopy = 0
         for (dy in 0 until dstH) {
             val sy = min(srcH - 1, (dy * srcH) / dstH)
             val yRowOffset = sy * yRowStride
+            val yCopy = min(neededYSpan, (yLimit - yRowOffset).coerceAtLeast(0))
+            if (yCopy > 0) {
+                yBuf.position(yRowOffset)
+                yBuf.get(yRowBuf, 0, yCopy)
+            }
+
             val uvRow = sy shr 1
             val uRowOffset = uvRow * uRowStride
             val vRowOffset = uvRow * vRowStride
+            if (uvRow != cachedUvRow) {
+                cachedUvRow = uvRow
+                uCopy = min(neededUSpan, (uLimit - uRowOffset).coerceAtLeast(0))
+                vCopy = min(neededVSpan, (vLimit - vRowOffset).coerceAtLeast(0))
+                if (uCopy > 0) {
+                    uBuf.position(uRowOffset)
+                    uBuf.get(uRowBuf, 0, uCopy)
+                }
+                if (vCopy > 0) {
+                    vBuf.position(vRowOffset)
+                    vBuf.get(vRowBuf, 0, vCopy)
+                }
+            }
 
             for (dx in 0 until dstW) {
                 val sx = min(srcW - 1, (dx * srcW) / dstW)
                 val uvCol = sx shr 1
 
-                val yIdx = (yRowOffset + sx * yPixStride).coerceIn(0, yLimit - 1)
-                val uIdx = PushBroomCropperSafeIdx.clampChromaIndex(
-                    uRowOffset + uvCol * uPixStride,
-                    uPixStride,
-                    uLimit
-                )
-                val vIdx = PushBroomCropperSafeIdx.clampChromaIndex(
-                    vRowOffset + uvCol * vPixStride,
-                    vPixStride,
-                    vLimit
-                )
+                val yLocal = sx * yPixStride
+                val yVal = if (yLocal < yCopy) {
+                    yRowBuf[yLocal].toInt() and 0xFF
+                } else {
+                    yBuf.get((yRowOffset + yLocal).coerceIn(0, yLimit - 1)).toInt() and 0xFF
+                }
 
-                val yVal = yBuf.get(yIdx).toInt() and 0xFF
-                val uVal = (uBuf.get(uIdx).toInt() and 0xFF) - 128
-                val vVal = (vBuf.get(vIdx).toInt() and 0xFF) - 128
+                val uLocal = uvCol * uPixStride
+                val uVal = (if (uLocal < uCopy) {
+                    uRowBuf[uLocal].toInt() and 0xFF
+                } else {
+                    val uIdx = PushBroomCropperSafeIdx.clampChromaIndex(uRowOffset + uLocal, uPixStride, uLimit)
+                    uBuf.get(uIdx).toInt() and 0xFF
+                }) - 128
+
+                val vLocal = uvCol * vPixStride
+                val vVal = (if (vLocal < vCopy) {
+                    vRowBuf[vLocal].toInt() and 0xFF
+                } else {
+                    val vIdx = PushBroomCropperSafeIdx.clampChromaIndex(vRowOffset + vLocal, vPixStride, vLimit)
+                    vBuf.get(vIdx).toInt() and 0xFF
+                }) - 128
 
                 val r = (yVal + ((1436 * vVal) shr 10)).coerceIn(0, 255)
                 val g = (yVal - ((352 * uVal + 731 * vVal) shr 10)).coerceIn(0, 255)

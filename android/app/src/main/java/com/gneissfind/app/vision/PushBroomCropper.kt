@@ -175,6 +175,11 @@ class PushBroomCropper(
     private val stripNormalizedG = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
     private val stripNormalizedB = FloatArray(StripRoiGeometry.MAX_STRIP_WIDTH_PX * StripRoiGeometry.STRIP_HEIGHT_PX)
 
+    // Reusable single-row byte caches for < 1.2 ms bulk DirectByteBuffer -> NV12 row extraction
+    private var nv12YRowScratch = ByteArray(4096)
+    private var nv12URowScratch = ByteArray(4096)
+    private var nv12VRowScratch = ByteArray(4096)
+
     /**
      * Resolves the upright landscape dimensions and clamped strip ROI bounds for a camera frame.
      *
@@ -834,7 +839,7 @@ class PushBroomCropper(
         val uprightW = if (rot == 90 || rot == 270) rawH else rawW
         val uprightH = if (rot == 90 || rot == 270) rawW else rawH
 
-        // Fast bulk path: canonical landscape (rot == 0), 1:1 dimensions, contiguous Y pixelStride == 1
+        // Fast bulk path 1: canonical landscape (rot == 0), 1:1 dimensions, contiguous Y pixelStride == 1
         if (rot == 0 && yPixStride == 1 && rawW == evenW && rawH == evenH) {
             if (yRowStride == evenW && yLimit >= lumaSize) {
                 yDup.position(0)
@@ -851,31 +856,116 @@ class PushBroomCropper(
             }
             val uvCols = evenW shr 1
             val uvRows = evenH shr 1
+            val neededUSpan = (uvCols - 1) * uPixStride + 1
+            val neededVSpan = (uvCols - 1) * vPixStride + 1
+            if (nv12URowScratch.size < neededUSpan) nv12URowScratch = ByteArray(neededUSpan)
+            if (nv12VRowScratch.size < neededVSpan) nv12VRowScratch = ByteArray(neededVSpan)
+            val uRowBuf = nv12URowScratch
+            val vRowBuf = nv12VRowScratch
+
             var uvDst = lumaSize
             for (uvY in 0 until uvRows) {
                 val uRowBase = uvY * uRowStride
                 val vRowBase = uvY * vRowStride
+                val uCopy = min(neededUSpan, (uLimit - uRowBase).coerceAtLeast(0))
+                val vCopy = min(neededVSpan, (vLimit - vRowBase).coerceAtLeast(0))
+                if (uCopy > 0) {
+                    uDup.position(uRowBase)
+                    uDup.get(uRowBuf, 0, uCopy)
+                }
+                if (vCopy > 0) {
+                    vDup.position(vRowBase)
+                    vDup.get(vRowBuf, 0, vCopy)
+                }
                 for (uvX in 0 until uvCols) {
-                    val uRaw = uRowBase + uvX * uPixStride
-                    val vRaw = vRowBase + uvX * vPixStride
-                    val uIdx = if (uRaw < uLimit && uRaw >= 0) {
-                        uRaw
+                    val uLocal = uvX * uPixStride
+                    val vLocal = uvX * vPixStride
+                    val uByte = if (uLocal < uCopy) {
+                        uRowBuf[uLocal]
                     } else {
-                        safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit)
+                        uDup.get(safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit))
                     }
-                    val vIdx = if (vRaw < vLimit && vRaw >= 0) {
-                        vRaw
+                    val vByte = if (vLocal < vCopy) {
+                        vRowBuf[vLocal]
                     } else {
-                        safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit)
+                        vDup.get(safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit))
                     }
-                    outNv12Bytes[uvDst++] = uDup.get(uIdx)
-                    outNv12Bytes[uvDst++] = vDup.get(vIdx)
+                    outNv12Bytes[uvDst++] = uByte
+                    outNv12Bytes[uvDst++] = vByte
                 }
             }
             return true
         }
 
-        // General reversible-landscape (180/90/270) or scaled fallback path
+        // Fast bulk path 2: reversible-landscape 180-deg flip (Surface.ROTATION_270), 1:1 dimensions, Y pixelStride == 1
+        if (rot == 180 && yPixStride == 1 && rawW == evenW && rawH == evenH) {
+            if (nv12YRowScratch.size < evenW) nv12YRowScratch = ByteArray(evenW)
+            val yRowBuf = nv12YRowScratch
+            for (dy in 0 until evenH) {
+                val by = rawH - 1 - dy
+                val srcStart = by * yRowStride
+                val copyLen = min(evenW, (yLimit - srcStart).coerceAtLeast(0))
+                if (copyLen > 0) {
+                    yDup.position(srcStart)
+                    yDup.get(yRowBuf, 0, copyLen)
+                }
+                val dstRowBase = dy * evenW
+                for (dx in 0 until evenW) {
+                    val bx = rawW - 1 - dx
+                    outNv12Bytes[dstRowBase + dx] = if (bx < copyLen) {
+                        yRowBuf[bx]
+                    } else {
+                        yDup.get(safeLumaByteIndex(bx, by, yRowStride, yPixStride, yLimit))
+                    }
+                }
+            }
+
+            val uvCols = evenW shr 1
+            val uvRows = evenH shr 1
+            val neededUSpan = (uvCols - 1) * uPixStride + 1
+            val neededVSpan = (uvCols - 1) * vPixStride + 1
+            if (nv12URowScratch.size < neededUSpan) nv12URowScratch = ByteArray(neededUSpan)
+            if (nv12VRowScratch.size < neededVSpan) nv12VRowScratch = ByteArray(neededVSpan)
+            val uRowBuf = nv12URowScratch
+            val vRowBuf = nv12VRowScratch
+
+            var uvDst = lumaSize
+            for (dy2 in 0 until uvRows) {
+                val uvY = uvRows - 1 - dy2
+                val uRowBase = uvY * uRowStride
+                val vRowBase = uvY * vRowStride
+                val uCopy = min(neededUSpan, (uLimit - uRowBase).coerceAtLeast(0))
+                val vCopy = min(neededVSpan, (vLimit - vRowBase).coerceAtLeast(0))
+                if (uCopy > 0) {
+                    uDup.position(uRowBase)
+                    uDup.get(uRowBuf, 0, uCopy)
+                }
+                if (vCopy > 0) {
+                    vDup.position(vRowBase)
+                    vDup.get(vRowBuf, 0, vCopy)
+                }
+                for (dx2 in 0 until uvCols) {
+                    val uvX = uvCols - 1 - dx2
+                    val uLocal = uvX * uPixStride
+                    val vLocal = uvX * vPixStride
+                    val uByte = if (uLocal < uCopy) {
+                        uRowBuf[uLocal]
+                    } else {
+                        uDup.get(safeChromaByteIndex(uvX, uvY, uRowStride, uPixStride, uLimit))
+                    }
+                    val vByte = if (vLocal < vCopy) {
+                        vRowBuf[vLocal]
+                    } else {
+                        vDup.get(safeChromaByteIndex(uvX, uvY, vRowStride, vPixStride, vLimit))
+                    }
+                    outNv12Bytes[uvDst++] = uByte
+                    outNv12Bytes[uvDst++] = vByte
+                }
+            }
+            return true
+        }
+
+        // General 90/270 or scaled fallback path
         var dstYIdx = 0
         for (dy in 0 until evenH) {
             val uy = if (uprightH == evenH) dy else (dy * uprightH) / evenH

@@ -208,6 +208,8 @@ class OpenCvLockOnInstrumentedTest {
             Intent(context, ComponentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         ) as ComponentActivity
         instrumentation.runOnMainSync {
+            hostActivity.setShowWhenLocked(true)
+            hostActivity.setTurnScreenOn(true)
             hostActivity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         val executor = Executors.newSingleThreadExecutor { runnable ->
@@ -676,6 +678,8 @@ class OpenCvLockOnInstrumentedTest {
             Intent(context, ComponentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         ) as ComponentActivity
         instrumentation.runOnMainSync {
+            hostActivity.setShowWhenLocked(true)
+            hostActivity.setTurnScreenOn(true)
             hostActivity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         try {

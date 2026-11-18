@@ -361,7 +361,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
                 status,
                 err,
                 Size(11.0, 11.0),
-                2
+                3
             )
 
             val nextArr = nextPts2f.toArray()
@@ -371,7 +371,7 @@ open class OpenCvConstellationTracker : AutoCloseable {
             val trackedCurr = ArrayList<Point>(cornerArr.size)
             for (i in cornerArr.indices) {
                 if (i < statusArr.size && statusArr[i].toInt() == 1 &&
-                    (i >= errArr.size || errArr[i] < 22.0f)
+                    (i >= errArr.size || errArr[i] < 28.0f)
                 ) {
                     val p = nextArr[i]
                     if (p.x in 2.0..(voW - 3.0) && p.y in 2.0..(voH - 3.0) &&

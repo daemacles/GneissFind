@@ -22,6 +22,7 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.viewModelScope
 import com.gneissfind.app.audio.MetalDetectorSonifier
 import com.gneissfind.app.camera.CameraExposureTelemetry
 import com.gneissfind.app.camera.PushBroomCameraController
@@ -60,10 +61,12 @@ import com.gneissfind.app.vision.LockOnFrameExtraction
 import com.gneissfind.app.vision.PushBroomCropper
 import com.gneissfind.app.vision.PushBroomSweepBuffers
 import com.gneissfind.app.vision.Yuv420Frame
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -253,6 +256,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val inferenceRunning = AtomicBoolean(false)
     private val isShuttingDown = AtomicBoolean(false)
     private var lastProducerExtractWallMs: Long = 0L
+    private var lastLogTelemetryUiWallMs: Long = 0L
 
     private val inferenceExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "GneissFind-Inference").apply {
@@ -335,6 +339,25 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 distractorsRejected = lockOnController.rejectedDistractorCount,
                 exceptions = caughtExceptions
             )
+        },
+        onLoopRestarted = {
+            val unlockedHud = lockOnController.breakLock()
+            tracker.reset()
+            latestReadySlot.set(null)
+            lastCompletedSweepWallNs = 0L
+            smoothedSweepHz = 0f
+            sonifier.updateTargets(emptyList(), ScanSpeedState.Normal(0f))
+            val audioTel = sonifier.latestTelemetry
+            _uiState.update { prev ->
+                prev.copy(
+                    acquisitionStage = AcquisitionStage.PATROL,
+                    lockOnHudState = unlockedHud,
+                    rawStripDetections = emptyList(),
+                    confirmedTargets = emptyList(),
+                    audioPitchHz = audioTel.currentPitchHz,
+                    audioCadenceHz = audioTel.currentPingCadenceHz
+                )
+            }
         }
     )
 
@@ -738,12 +761,24 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
         val nextPower = patrolDutyController.onContextChanged(
             operatingMode = mode,
-            acquisitionStage = _uiState.value.acquisitionStage,
+            acquisitionStage = if (mode == OperatingMode.LOG_DATA) {
+                AcquisitionStage.PATROL
+            } else {
+                _uiState.value.acquisitionStage
+            },
             nowNs = System.nanoTime()
         )
-        cameraController.setTargetCameraFps(nextPower.targetCameraFps)
         if (mode == OperatingMode.LOG_DATA) {
-            cameraController.setShutterClamp(true)
+            // Pause all neural detection, temporal tracking, Lock-On, and homing audio during MOD:LOG
+            // so 100% of camera/CPU/memory headroom goes to clean 30.0 FPS 1080p H.264 + 120 Hz IMU capture.
+            val unlockedHud = lockOnController.breakLock()
+            tracker.reset()
+            latestReadySlot.set(null)
+            lastCompletedSweepWallNs = 0L
+            smoothedSweepHz = 0f
+            sonifier.updateTargets(emptyList(), ScanSpeedState.Normal(0f))
+            val audioTel = sonifier.latestTelemetry
+            cameraController.setTargetCameraFps(PushBroomCameraController.ACTIVE_PATROL_FPS)
             val snap = _uiState.value
             val dir = fieldLogger.startSession(
                 initialZoomRatio = snap.activeZoomRatio,
@@ -754,14 +789,22 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update {
                 it.copy(
                     operatingMode = mode,
+                    acquisitionStage = AcquisitionStage.PATROL,
+                    lockOnHudState = unlockedHud,
                     patrolPowerState = nextPower,
-                    shutterClampEnabled = true,
+                    detectorStatus = "LOG 1080P30 (DETECTOR PAUSED)",
+                    rawStripDetections = emptyList(),
+                    confirmedTargets = emptyList(),
+                    sweepHz = 0f,
+                    audioPitchHz = audioTel.currentPitchHz,
+                    audioCadenceHz = audioTel.currentPingCadenceHz,
                     loggedFrameCount = 0,
                     loggedDurationSec = 0,
                     fieldLogDirectory = dir.absolutePath
                 )
             }
         } else {
+            cameraController.setTargetCameraFps(nextPower.targetCameraFps)
             fieldLogger.stopSession()
             val discovered = ReplayCameraSource.discoverReplaySessionItems(appContext)
             _uiState.update {
@@ -884,6 +927,38 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             loopReplay = loopReplay,
             autoLockFrameIdx = autoLockFrameIdx
         )
+    }
+
+    /**
+     * Headless `adb shell am start --ei debug_record_seconds <N>` entrypoint that waits for live
+     * CameraX frames to arrive, records a detector-free `1080p30` `MOD: LOG` session for
+     * [durationSec] seconds, returns to `SCAN`, and logs `GNEISSFIND_RECORD_SUMMARY`.
+     */
+    fun startDebugRecordSessionFromIntent(durationSec: Int) {
+        val clampedSec = durationSec.coerceIn(1, 300)
+        viewModelScope.launch {
+            if (_uiState.value.isReplayActive) {
+                stopReplayAndRestoreLiveCamera()
+            }
+            // Wait up to 4s for live CameraX ImageAnalysis frames to begin flowing
+            val deadlineMs = SystemClock.elapsedRealtime() + 4_000L
+            while (_uiState.value.cameraStreamFps <= 0f && SystemClock.elapsedRealtime() < deadlineMs) {
+                delay(50L)
+            }
+            delay(250L)
+            val startWallMs = SystemClock.elapsedRealtime()
+            setOperatingMode(OperatingMode.LOG_DATA)
+            val sessionPath = _uiState.value.fieldLogDirectory
+            delay(clampedSec * 1_000L)
+            val elapsedSec = ((SystemClock.elapsedRealtime() - startWallMs) / 1000.0).coerceAtLeast(0.001)
+            setOperatingMode(OperatingMode.SCAN)
+            val frames = fieldLogger.savedFrameCount
+            val avgFps = frames / elapsedSec
+            Log.i(
+                ReplayCameraSource.SUMMARY_LOG_TAG,
+                "GNEISSFIND_RECORD_SUMMARY session=$sessionPath frames=$frames elapsed_s=${"%.2f".format(elapsedSec)} avg_fps=${"%.2f".format(avgFps)}"
+            )
+        }
     }
 
     private fun startReplayDirectory(
@@ -1136,7 +1211,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             frameTs = yuvFrame.timestampNs
 
             // Feed 30 FPS 1080p hardware MediaCodec + trace.jsonl on every frame while MOD == LOG_DATA,
-            // strictly decoupled from inference sweep throttling and without binding a 3rd CameraX surface!
+            // returning immediately without running YUV float tile extraction or GPU neural inference!
             if (isLoggingMode && isFromLiveCamera && !raycaster.isReplayModeActive) {
                 fieldLogger.recordCameraFrame(
                     frame = yuvFrame,
@@ -1153,6 +1228,23 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                         exposureBiasEv = stateSnapshot.exposureBiasEv
                     )
                 )
+                val nowLogWallMs = SystemClock.elapsedRealtime()
+                if (nowLogWallMs - lastLogTelemetryUiWallMs >= 100L) {
+                    lastLogTelemetryUiWallMs = nowLogWallMs
+                    _uiState.update { prev ->
+                        prev.copy(
+                            cameraStreamFps = exposureTelemetry.measuredCameraFps,
+                            exposureTimeNs = exposureTelemetry.exposureTimeNs,
+                            sensorIso = exposureTelemetry.sensorIso,
+                            activeZoomRatio = exposureTelemetry.activeZoomRatio,
+                            verticalFocalLengthPx = exposureTelemetry.verticalFocalLengthPx,
+                            loggedFrameCount = fieldLogger.savedFrameCount,
+                            loggedDurationSec = fieldLogger.recordedDurationSec,
+                            fieldLogDirectory = fieldLogger.currentSessionPath
+                        )
+                    }
+                }
+                return
             }
 
             val nowWallMs = SystemClock.elapsedRealtime()
@@ -1270,7 +1362,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             releaseSourceBuffer()
         }
 
-        val nowMonoNs = if (isFromLiveCamera) System.nanoTime() else frameTs
+        val nowMonoNs = System.nanoTime()
         val directive = lockOnController.onCameraLumaFrame(
             lumaBytes = analyzerLumaScratch,
             widthPx = extraction.uprightWidthPx,
@@ -1312,9 +1404,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
 
         // Publish 30 FPS AKAZE / Lock-On HUD + homing audio telemetry immediately
+        val voOrImuSpeedMps = kotlin.math.max(
+            poseSnapshot.horizontalSpeedMps,
+            lockOnController.estimatedHorizontalSpeedMps
+        )
+        val lockSpeedState = ScanSpeedState.Normal(voOrImuSpeedMps)
         sonifier.updateTargets(
             confirmedTargets = buildLockOnAudioTargets(directive.hudState),
-            speedState = ScanSpeedState.Normal(0f)
+            speedState = lockSpeedState
         )
         val audioTel = sonifier.latestTelemetry
         val useAkazeTelemetry = directive.hudState.stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
@@ -1333,6 +1430,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             prev.copy(
                 acquisitionStage = directive.hudState.stage,
                 lockOnHudState = directive.hudState,
+                speedState = lockSpeedState,
                 cameraStreamFps = exposureTelemetry.measuredCameraFps,
                 exposureTimeNs = exposureTelemetry.exposureTimeNs,
                 sensorIso = exposureTelemetry.sensorIso,
