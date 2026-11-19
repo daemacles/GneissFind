@@ -118,6 +118,10 @@ class PushBroomCameraController(
     /** Full active pixel array rectangle queried from `SENSOR_INFO_ACTIVE_ARRAY_SIZE`. */
     private var activeArraySize: Rect? = null
 
+    /** Last zoom ratio bucket logged in `CAM2_INTRINSICS` telemetry so logcat isn't spammed at 30 Hz. */
+    @Volatile
+    private var lastLoggedIntrinsicsZoomBucket: Int = -1
+
     /** Maximum hardware digital zoom ratio queried from `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`. */
     private var hardwareMaxZoomRatio: Float = 8.0f
 
@@ -305,19 +309,37 @@ class PushBroomCameraController(
                     val iso = result.get(TotalCaptureResult.SENSOR_SENSITIVITY) ?: clampedFloatingIso
                     val intrinsics = result.get(TotalCaptureResult.LENS_INTRINSIC_CALIBRATION)
                     val cropRegion = result.get(TotalCaptureResult.SCALER_CROP_REGION)
+                    val captureZoomRatio = result.get(TotalCaptureResult.CONTROL_ZOOM_RATIO)
 
-                    val zoom = latestTelemetry.activeZoomRatio
+                    val zoom = captureZoomRatio?.takeIf { it.isFinite() && it >= 1.0f }
+                        ?: latestTelemetry.activeZoomRatio
                     val fyPx = computeStreamVerticalFocalLengthPx(
                         intrinsics = intrinsics,
                         cropRegion = cropRegion,
                         activeArray = activeArraySize,
                         activeZoomRatio = zoom,
-                        outputStreamHeightPx = TARGET_HEIGHT_1080P
+                        outputStreamHeightPx = TARGET_HEIGHT_1080P,
+                        captureZoomRatio = captureZoomRatio
                     )
+
+                    val zoomBucket = (zoom * 10f).roundToInt()
+                    if (zoomBucket != lastLoggedIntrinsicsZoomBucket) {
+                        lastLoggedIntrinsicsZoomBucket = zoomBucket
+                        val oisMode = result.get(TotalCaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
+                        val videoStabMode = result.get(TotalCaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
+                        Log.i(
+                            TAG,
+                            "CAM2_INTRINSICS zoom=${"%.2f".format(zoom)} capZoom=${captureZoomRatio ?: -1f} " +
+                                "fySensor=${intrinsics?.getOrNull(1) ?: -1f} crop=${cropRegion?.width()}x${cropRegion?.height()} " +
+                                "active=${activeArraySize?.width()}x${activeArraySize?.height()} " +
+                                "computedFy=${"%.1f".format(fyPx)} ois=$oisMode videoStab=$videoStabMode"
+                        )
+                    }
 
                     latestTelemetry = latestTelemetry.copy(
                         exposureTimeNs = expNs,
                         sensorIso = iso,
+                        activeZoomRatio = zoom,
                         verticalFocalLengthPx = fyPx
                     )
                 }
@@ -490,6 +512,10 @@ class PushBroomCameraController(
                     CameraMetadata.CONTROL_AE_MODE_OFF
                 )
                 .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
+                .setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
                     fpsRange
                 )
@@ -508,18 +534,20 @@ class PushBroomCameraController(
                 .build()
             c2Control.setCaptureRequestOptions(options)
         } else {
+            val autoOptionsBuilder = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
             if (desiredFps <= IDLE_PATROL_FPS) {
-                val idleOptions = CaptureRequestOptions.Builder()
-                    .setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        fpsRange
-                    )
-                    .build()
-                c2Control.setCaptureRequestOptions(idleOptions)
-            } else {
-                // Clear manual AE/shutter/ISO/FPS overrides so CameraX restores native 30 FPS CONTROL_AE_MODE_ON.
-                c2Control.clearCaptureRequestOptions()
+                autoOptionsBuilder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    fpsRange
+                )
             }
+            // Keeps CONTROL_AE_MODE unset so CameraX restores native CONTROL_AE_MODE_ON while
+            // suppressing OEM EIS video smoothing lag (30-60 ms) that conflicts with our 120 Hz IMU.
+            c2Control.setCaptureRequestOptions(autoOptionsBuilder.build())
 
             if (evState.isExposureCompensationSupported) {
                 val step = evState.exposureCompensationStep.toFloat().coerceAtLeast(0.1f)
@@ -661,15 +689,18 @@ class PushBroomCameraController(
 
         /**
          * Scales the sensor-native vertical focal length (`LENS_INTRINSIC_CALIBRATION[1]`) into
-         * `1920x1080` (`16:9`) output stream pixels, accounting for both `SCALER_CROP_REGION` digital
-         * zoom and the vertical letterbox crop from a `4:3` active sensor array to `16:9`.
-         * Falls back to [fallbackVerticalFocalLengthPx] if calibration arrays are missing or out of bounds.
+         * `1920x1080` (`16:9`) output stream pixels, accounting for `CONTROL_ZOOM_RATIO` (Android
+         * 11+ / API 30+ where `SCALER_CROP_REGION` stays at full active array size), legacy
+         * `SCALER_CROP_REGION` digital zoom, and the vertical letterbox crop from a `4:3` active
+         * sensor array to `16:9`. Falls back to [fallbackVerticalFocalLengthPx] if calibration
+         * arrays are missing or out of bounds.
          *
          * @param intrinsics 5-element `[fx, fy, cx, cy, s]` array from `TotalCaptureResult.LENS_INTRINSIC_CALIBRATION`, or `null`.
          * @param cropRegion Active `SCALER_CROP_REGION` in sensor pixel coordinates, or `null`.
          * @param activeArray Full `SENSOR_INFO_ACTIVE_ARRAY_SIZE` rectangle, or `null`.
          * @param activeZoomRatio Current digital zoom ratio (`2.0f` or `1.0f`).
          * @param outputStreamHeightPx Height of the analyzed stream in pixels (defaults to [TARGET_HEIGHT_1080P]).
+         * @param captureZoomRatio Optional `TotalCaptureResult.CONTROL_ZOOM_RATIO` from API 30+ capture results.
          * @return Vertical focal length $f_y$ in output stream pixels.
          */
         fun computeStreamVerticalFocalLengthPx(
@@ -677,21 +708,63 @@ class PushBroomCameraController(
             cropRegion: Rect?,
             activeArray: Rect?,
             activeZoomRatio: Float,
-            outputStreamHeightPx: Int = TARGET_HEIGHT_1080P
+            outputStreamHeightPx: Int = TARGET_HEIGHT_1080P,
+            captureZoomRatio: Float? = null
         ): Float {
             if (intrinsics != null && intrinsics.size >= 2) {
-                val fySensorPx = intrinsics[1]
-                val cropHeightPx = cropRegion?.height()?.takeIf { it > 0 }
-                    ?: activeArray?.height()?.let { (it / activeZoomRatio.coerceAtLeast(1f)).roundToInt() }
-                    ?: 0
-                if (fySensorPx > 100f && cropHeightPx > 100) {
-                    // Account for 16:9 vertical letterbox crop from 4:3 sensor active array
-                    val cropWidthPx = cropRegion?.width()?.takeIf { it > 0 } ?: (cropHeightPx * 4 / 3)
-                    val effective16x9CropHeight = (cropWidthPx * 9f / 16f).coerceAtMost(cropHeightPx.toFloat())
-                    val scaledFy = fySensorPx * (outputStreamHeightPx.toFloat() / effective16x9CropHeight)
-                    if (scaledFy in 800f..6000f) {
-                        return scaledFy
-                    }
+                return computeStreamVerticalFocalLengthPxFromDims(
+                    fySensorPx = intrinsics[1],
+                    cropWidthPx = cropRegion?.width() ?: 0,
+                    cropHeightPx = cropRegion?.height() ?: 0,
+                    activeWidthPx = activeArray?.width() ?: 0,
+                    activeHeightPx = activeArray?.height() ?: 0,
+                    activeZoomRatio = activeZoomRatio,
+                    outputStreamHeightPx = outputStreamHeightPx,
+                    captureZoomRatio = captureZoomRatio
+                )
+            }
+            return fallbackVerticalFocalLengthPx(activeZoomRatio)
+        }
+
+        /**
+         * Pure-Kotlin geometry core for [computeStreamVerticalFocalLengthPx] taking raw integer
+         * crop/active-array dimensions so API 30+ `CONTROL_ZOOM_RATIO` scaling is directly
+         * unit-testable on the JVM without `android.graphics.Rect` mocks.
+         */
+        fun computeStreamVerticalFocalLengthPxFromDims(
+            fySensorPx: Float,
+            cropWidthPx: Int,
+            cropHeightPx: Int,
+            activeWidthPx: Int,
+            activeHeightPx: Int,
+            activeZoomRatio: Float,
+            outputStreamHeightPx: Int = TARGET_HEIGHT_1080P,
+            captureZoomRatio: Float? = null
+        ): Float {
+            val resolvedCropH = cropHeightPx.takeIf { it > 0 }
+                ?: activeHeightPx.takeIf { it > 0 }?.let { (it / activeZoomRatio.coerceAtLeast(1f)).roundToInt() }
+                ?: 0
+            if (fySensorPx > 100f && resolvedCropH > 100) {
+                val resolvedCropW = cropWidthPx.takeIf { it > 0 } ?: (resolvedCropH * 4 / 3)
+                val effective16x9CropHeight = (resolvedCropW * 9f / 16f).coerceAtMost(resolvedCropH.toFloat())
+                // On API 30+ (Android 11+), CameraX setZoomRatio() uses CONTROL_ZOOM_RATIO while
+                // leaving SCALER_CROP_REGION equal to SENSOR_INFO_ACTIVE_ARRAY_SIZE. Apply the
+                // zoom ratio multiplier whenever cropRegion has not already been cropped down.
+                val cropMatchesFullActiveArray = cropWidthPx > 0 &&
+                    cropHeightPx > 0 &&
+                    activeWidthPx > 0 &&
+                    activeHeightPx > 0 &&
+                    cropWidthPx >= (activeWidthPx * 0.98f) &&
+                    cropHeightPx >= (activeHeightPx * 0.98f)
+                val zoomMultiplier = if (cropMatchesFullActiveArray) {
+                    (captureZoomRatio?.takeIf { it.isFinite() && it >= 1.0f } ?: activeZoomRatio)
+                        .coerceIn(1.0f, 8.0f)
+                } else {
+                    1.0f
+                }
+                val scaledFy = fySensorPx * (outputStreamHeightPx.toFloat() / effective16x9CropHeight) * zoomMultiplier
+                if (scaledFy in 800f..6000f) {
+                    return scaledFy
                 }
             }
             return fallbackVerticalFocalLengthPx(activeZoomRatio)

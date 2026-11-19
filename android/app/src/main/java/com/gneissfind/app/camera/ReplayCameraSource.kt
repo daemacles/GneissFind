@@ -449,11 +449,12 @@ class ReplayCameraSource(
                                     if (yuvFrame != null && running.get()) {
                                         val previewBmp = renderHalfResPreviewBitmap(yuvFrame)
                                         val zoom = frameMeta?.zoomRatio ?: header.zoomRatio
-                                        val fyPx = if (kotlin.math.abs(zoom - header.zoomRatio) < 0.05f) {
+                                        val rawFyPx = if (kotlin.math.abs(zoom - header.zoomRatio) < 0.05f) {
                                             header.focalLengthPx
                                         } else {
                                             PushBroomCameraController.fallbackVerticalFocalLengthPx(zoom)
                                         }
+                                        val fyPx = resolveReplayVerticalFocalLengthPx(rawFyPx, zoom)
                                         val telemetry = CameraExposureTelemetry(
                                             exposureTimeNs = frameMeta?.exposureNs
                                                 ?: PushBroomCameraController.MAX_SHUTTER_EXPOSURE_NS,
@@ -748,6 +749,22 @@ class ReplayCameraSource(
 
         private fun MediaFormat.getIntOrDefault(key: String, defaultVal: Int): Int =
             if (containsKey(key)) runCatching { getInteger(key) }.getOrDefault(defaultVal) else defaultVal
+
+        /**
+         * Repairs pre-M2D-2 `trace.jsonl` files recorded at `>= 1.5x` zoom on API 30+ devices where
+         * `SCALER_CROP_REGION == activeArraySize` caused `focalLengthPx` to be logged at `1.0x`
+         * (`900..1750 px` at `1080p`) instead of zoomed `fy * zoomRatio` (`~2737 px` at `2.0x`).
+         * Leaves `1.0x` clips and already-calibrated `2.0x` clips (`> 1750 px`) untouched.
+         */
+        fun resolveReplayVerticalFocalLengthPx(recordedFyPx: Float, zoomRatio: Float): Float {
+            if (!recordedFyPx.isFinite() || recordedFyPx <= 0f) {
+                return PushBroomCameraController.fallbackVerticalFocalLengthPx(zoomRatio)
+            }
+            if (zoomRatio >= 1.5f && recordedFyPx in 900f..1750f) {
+                return (recordedFyPx * zoomRatio).coerceIn(1800f, 6000f)
+            }
+            return recordedFyPx
+        }
 
         private fun sleepUntilMonotonicNs(targetMonoNs: Long) {
             while (true) {

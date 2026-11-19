@@ -620,6 +620,255 @@ class OpenCvLockOnInstrumentedTest {
         }
     }
 
+    @Test
+    fun unifiedThreeTierTracker_rejectsAdversarialBlankWallAndDoorframeWithZeroFalseLocks() {
+        assertThat(OpenCVLoader.initLocal()).isTrue()
+
+        val width = 1920
+        val height = 1080
+        val sceneMat = synthesizeGravelBedWithSmoothAgate(width, height)
+        // Add distinct high-contrast rim detail to the central target so Gate 4 NCC has real texture
+        Imgproc.circle(sceneMat, Point(960.0, 540.0), 34, Scalar(50.0), 3)
+        Imgproc.circle(sceneMat, Point(948.0, 530.0), 8, Scalar(235.0), -1)
+        val sceneBytes = ByteArray(width * height)
+        sceneMat.get(0, 0, sceneBytes)
+
+        val shiftedMat = Mat(height, width, CvType.CV_8UC1)
+        val warpMat = Mat(2, 3, CvType.CV_64FC1).apply {
+            put(0, 0, 1.0, 0.0, 26.0, 0.0, 1.0, -14.0)
+        }
+        Imgproc.warpAffine(sceneMat, shiftedMat, warpMat, Size(width.toDouble(), height.toDouble()))
+        val shiftedBytes = ByteArray(width * height)
+        shiftedMat.get(0, 0, shiftedBytes)
+
+        val wallMat = Mat(height, width, CvType.CV_8UC1)
+        val wallBytes = ByteArray(width * height)
+
+        val tracker = OpenCvConstellationTracker()
+        val r0 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        try {
+            tracker.setCurrentImuRotationMatrix(r0)
+            // Frame 0 initializes prev/curr VO pyramid (returns false until 2 frames exist)
+            assertThat(tracker.beginTrackingFrame(sceneBytes, width, height)).isFalse()
+            val seededCollar = tracker.seedConstellationCollar(
+                lumaBytes = null,
+                widthPx = width,
+                heightPx = height,
+                stoneLeftPx = 918f,
+                stoneTopPx = 498f,
+                stoneRightPx = 1002f,
+                stoneBottomPx = 582f,
+                baseScale = 1.0f
+            )
+            assertThat(seededCollar).isTrue()
+            val seededReloc = tracker.seedFullFrameRelocalizationSnapshotWithBox(
+                lumaBytes = null,
+                widthPx = width,
+                heightPx = height,
+                stoneCenterXPx = 960f,
+                stoneCenterYPx = 540f,
+                stoneWidthPx = 84f,
+                stoneHeightPx = 84f
+            )
+            assertThat(seededReloc).isTrue()
+
+            // Feed 30 adversarial frames of a blank beige wall + sharp vertical doorframe + glare
+            var falseLocks = 0
+            for (i in 0 until 30) {
+                val baseVal = 170.0 + (i % 6) * 4.0
+                wallMat.setTo(Scalar(baseVal))
+                val frameX = 480.0 + i * 24.0
+                Imgproc.rectangle(
+                    wallMat,
+                    Point(frameX, 0.0),
+                    Point((frameX + 42.0).coerceAtMost(width - 1.0), height - 1.0),
+                    Scalar(baseVal - 75.0),
+                    -1
+                )
+                Imgproc.line(
+                    wallMat,
+                    Point((frameX + 44.0).coerceAtMost(width - 1.0), 0.0),
+                    Point((frameX + 44.0).coerceAtMost(width - 1.0), height - 1.0),
+                    Scalar(240.0),
+                    3
+                )
+                wallMat.get(0, 0, wallBytes)
+
+                tracker.beginTrackingFrame(wallBytes, width, height)
+                val klt = tracker.trackLocalTargetSimilarity30Hz(
+                    prevBoxLeftPx = 918f,
+                    prevBoxTopPx = 498f,
+                    prevBoxRightPx = 1002f,
+                    prevBoxBottomPx = 582f,
+                    prevRotationScr = r0,
+                    currRotationScr = r0,
+                    focalLengthPx = 2200f,
+                    fullWidthPx = width,
+                    fullHeightPx = height
+                )
+                val collar = tracker.matchConstellationFrame(
+                    lumaBytes = null,
+                    widthPx = width,
+                    heightPx = height,
+                    predictedCenterXPx = 960f,
+                    predictedCenterYPx = 540f
+                )
+                val reloc = tracker.matchFullFrameRelocalization(
+                    lumaBytes = null,
+                    widthPx = width,
+                    heightPx = height
+                )
+                if ((klt?.matched == true) || collar.matched || reloc.matched) {
+                    falseLocks++
+                }
+            }
+            Log.i(TAG, "M2D2_BLANK_WALL_ADVERSARIAL falseLocks=$falseLocks/30")
+            assertThat(falseLocks).isEqualTo(0)
+
+            // Return to real target shifted by (+26, -14) px -> must re-acquire cleanly via Tier 3!
+            tracker.beginTrackingFrame(shiftedBytes, width, height)
+            val reacquired = tracker.matchFullFrameRelocalization(
+                lumaBytes = null,
+                widthPx = width,
+                heightPx = height
+            )
+            assertThat(reacquired.matched).isTrue()
+            val errPx = kotlin.math.hypot(
+                (reacquired.stoneCenterXPx - 986f).toDouble(),
+                (reacquired.stoneCenterYPx - 526f).toDouble()
+            )
+            Log.i(TAG, "M2D2_REACQUIRE_AFTER_WALL inliers=${reacquired.inliers} ncc=${reacquired.nccScore} errPx=$errPx")
+            assertThat(errPx).isLessThan(15.0)
+        } finally {
+            tracker.close()
+            sceneMat.release()
+            shiftedMat.release()
+            warpMat.release()
+            wallMat.release()
+        }
+    }
+
+    @Test
+    fun unifiedThreeTierTracker_meetsRealtimeArm64LatencyBudgetOnPixel10ProXl() {
+        assertThat(OpenCVLoader.initLocal()).isTrue()
+
+        val width = 1920
+        val height = 1080
+        val baseMat = synthesizeGravelBedWithSmoothAgate(width, height)
+        Imgproc.circle(baseMat, Point(960.0, 540.0), 34, Scalar(50.0), 3)
+        Imgproc.circle(baseMat, Point(948.0, 530.0), 8, Scalar(235.0), -1)
+
+        val tracker = OpenCvConstellationTracker()
+        val r0 = GroundPlaneRaycaster.buildLandscapeRotationMatrix(pitchDeg = 45f, rollDeg = 0f, yawDeg = 0f)
+        val warpedMat = Mat(height, width, CvType.CV_8UC1)
+        val frameBytes = ByteArray(width * height)
+        val latenciesMs = ArrayList<Double>(25)
+
+        try {
+            tracker.setCurrentImuRotationMatrix(r0)
+            var boxL = 918f
+            var boxT = 498f
+            var boxR = 1002f
+            var boxB = 582f
+            var camPos = floatArrayOf(0f, 0f, 1.10f)
+
+            baseMat.get(0, 0, frameBytes)
+            tracker.beginTrackingFrame(frameBytes, width, height)
+            assertThat(
+                tracker.seedConstellationCollar(
+                    lumaBytes = null,
+                    widthPx = width,
+                    heightPx = height,
+                    stoneLeftPx = boxL,
+                    stoneTopPx = boxT,
+                    stoneRightPx = boxR,
+                    stoneBottomPx = boxB,
+                    baseScale = 1.0f
+                )
+            ).isTrue()
+            tracker.stepRotationKnownMiniVio30Hz(
+                prevCamPosEnu = camPos,
+                prevRotationScr = r0,
+                currRotationScr = r0,
+                focalLengthPx = 2200f,
+                nominalSceneDepthM = 1.25f,
+                fullWidthPx = width,
+                fullHeightPx = height
+            )
+
+            var trackedCount = 0
+            for (step in 1..25) {
+                val tx = step * 4.5
+                val ty = step * -2.0
+                val warp = Mat(2, 3, CvType.CV_64FC1).apply {
+                    put(0, 0, 1.0, 0.0, tx, 0.0, 1.0, ty)
+                }
+                Imgproc.warpAffine(baseMat, warpedMat, warp, Size(width.toDouble(), height.toDouble()))
+                warp.release()
+                warpedMat.get(0, 0, frameBytes)
+
+                val t0 = SystemClock.elapsedRealtimeNanos()
+                tracker.beginTrackingFrame(frameBytes, width, height)
+                val vio = tracker.stepRotationKnownMiniVio30Hz(
+                    prevCamPosEnu = camPos,
+                    prevRotationScr = r0,
+                    currRotationScr = r0,
+                    focalLengthPx = 2200f,
+                    nominalSceneDepthM = 1.25f,
+                    fullWidthPx = width,
+                    fullHeightPx = height,
+                    excludeLeftPx = boxL,
+                    excludeTopPx = boxT,
+                    excludeRightPx = boxR,
+                    excludeBottomPx = boxB,
+                    excludeTargetRegion = true
+                )
+                if (vio != null && vio.updated) {
+                    camPos = vio.camPosEnu
+                }
+                val klt = tracker.trackLocalTargetSimilarity30Hz(
+                    prevBoxLeftPx = boxL,
+                    prevBoxTopPx = boxT,
+                    prevBoxRightPx = boxR,
+                    prevBoxBottomPx = boxB,
+                    prevRotationScr = r0,
+                    currRotationScr = r0,
+                    focalLengthPx = 2200f,
+                    fullWidthPx = width,
+                    fullHeightPx = height
+                )
+                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000.0
+                latenciesMs.add(elapsedMs)
+
+                if (klt != null && klt.matched) {
+                    trackedCount++
+                    boxL = klt.frameLeftPx
+                    boxT = klt.frameTopPx
+                    boxR = klt.frameRightPx
+                    boxB = klt.frameBottomPx
+                }
+            }
+
+            latenciesMs.sort()
+            val medianMs = latenciesMs[latenciesMs.size / 2]
+            val p95Ms = latenciesMs[(latenciesMs.size * 95) / 100]
+            val finalCx = (boxL + boxR) * 0.5f
+            val finalCy = (boxT + boxB) * 0.5f
+            val finalErrPx = kotlin.math.hypot((finalCx - (960f + 25f * 4.5f)).toDouble(), (finalCy - (540f - 25f * 2.0f)).toDouble())
+            Log.i(
+                TAG,
+                "M2D2_ARM64_3TIER_BENCH tracked=$trackedCount/25 medianMs=$medianMs p95Ms=$p95Ms finalErrPx=$finalErrPx"
+            )
+            assertThat(trackedCount).isAtLeast(22)
+            assertThat(finalErrPx).isLessThan(12.0)
+            assertThat(medianMs).isLessThan(10.0)
+        } finally {
+            tracker.close()
+            baseMat.release()
+            warpedMat.release()
+        }
+    }
+
     private fun synthesizeGravelBedWithSmoothAgate(width: Int, height: Int): Mat {
         val mat = Mat(height, width, CvType.CV_8UC1, Scalar(96.0))
         val rng = Random(424242L)

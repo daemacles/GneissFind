@@ -154,6 +154,10 @@ class LockOnPinpointController(
     private var latestFrameBottomPx: Float = 600f
     private var isTargetInFrame: Boolean = true
     private var wasTargetOffScreen: Boolean = false
+    private var isVisuallyLocked: Boolean = false
+    private var hasMetric3dDepth: Boolean = false
+    private var activeVisualAnchorLabel: String = "RF-DETR B=1"
+    private var tier1FramesSinceAudit: Int = 0
 
     private var lostTrackStartNs: Long = 0L
     private var latestLumaSnapshot: ByteArray? = null
@@ -271,6 +275,10 @@ class LockOnPinpointController(
         lostTrackProbeCounter = 0
         armViewportCenterProbe = false
         wasTargetOffScreen = false
+        isVisuallyLocked = true
+        hasMetric3dDepth = false
+        activeVisualAnchorLabel = "RF-DETR B=1"
+        tier1FramesSinceAudit = 0
         lostTrackStartNs = 0L
 
         // Record initial Lock-On viewpoint t=0 as the first baseline ray
@@ -419,25 +427,8 @@ class LockOnPinpointController(
 
         val focalPx = poseSnapshot.verticalFocalLengthPx.coerceAtLeast(100f)
         val rotScr = poseSnapshot.rotationMatrix
+        openCvTracker.setCurrentImuRotationMatrix(rotScr)
 
-        // 1. Update metric 3D camera center C_enu continuously via full-frame 640x360 KLT + IMU-derotated
-        //    ground-plane solver (< 2 ms CPU), including while the target is occluded or off-screen so
-        //    camPosEnu and the 3D triangulated stone anchor P_3d remain world-fixed during user motion.
-        val maskTargetInVo = isTargetInFrame &&
-            lostTrackStartNs == 0L &&
-            (stage == AcquisitionStage.LOCK_ON_NEURAL ||
-                akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS)
-        val gravelFlow = openCvTracker.trackGravelFlowCorrespondences(
-            lumaBytes = snapshotBuf,
-            widthPx = widthPx,
-            heightPx = heightPx,
-            excludeLeftPx = latestFrameLeftPx,
-            excludeTopPx = latestFrameTopPx,
-            excludeRightPx = latestFrameRightPx,
-            excludeBottomPx = latestFrameBottomPx,
-            excludeTargetRegion = maskTargetInVo
-        )
-        var openCvMs = gravelFlow?.latencyMs ?: 0f
         val rawPoseDtNs = if (prevVoPoseTimestampNs != 0L && poseSnapshot.timestampNs > prevVoPoseTimestampNs) {
             poseSnapshot.timestampNs - prevVoPoseTimestampNs
         } else {
@@ -449,36 +440,128 @@ class LockOnPinpointController(
         val maxVoHorizStepM = max(MAX_VO_HORIZONTAL_STEP_M, MAX_VO_HORIZONTAL_SPEED_MPS * voDtSec)
             .coerceAtMost(0.28f)
 
-        var updatedVoStep = false
-        if (hasPrevAnalyzerPose && gravelFlow != null && gravelFlow.inlierCount >= 10) {
-            val rotStepDeg = rotationAngleBetweenMatricesDeg(prevFrameRotationScr, rotScr)
-            if (rotStepDeg <= maxVoRotStepDeg) {
-                val solvedCam = solveCameraPositionFromGravelFlow(
-                    prevCamPosEnu = prevFrameCamPosEnu,
-                    prevRotationScr = prevFrameRotationScr,
-                    currRotationScr = rotScr,
-                    prevPointsXY = gravelFlow.prevFramePointsXY,
-                    currPointsXY = gravelFlow.currFramePointsXY,
-                    count = gravelFlow.inlierCount,
-                    focalLengthPx = focalPx,
-                    frameWidthPx = widthPx,
-                    frameHeightPx = heightPx,
-                    rotStepDeg = rotStepDeg
+        val maskTargetInVo = isTargetInFrame &&
+            lostTrackStartNs == 0L &&
+            (isVisuallyLocked ||
+                stage == AcquisitionStage.LOCK_ON_NEURAL ||
+                akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS)
+
+        // 0. Ingest current frame into 640x360 pyramid ONCE per frame for Tier 1 + Tier 2 sharing.
+        val hasFramePair = openCvTracker.beginTrackingFrame(snapshotBuf, widthPx, heightPx)
+
+        // Immediate Frame-0 keyframe seeding on real OpenCV runtime so Tier 1 + Tier 3 have the
+        // target's 32x32 NCC template & ORB collar from millisecond 0 (eliminating Stage 2 drift).
+        if (!openCvTracker.hasSeededConstellation &&
+            OpenCvConstellationTracker.ensureOpenCvInitialized() &&
+            isTargetInFrame &&
+            lostTrackStartNs == 0L
+        ) {
+            val initCx = (latestFrameLeftPx + latestFrameRightPx) * 0.5f
+            val initCy = (latestFrameTopPx + latestFrameBottomPx) * 0.5f
+            if (initCx in 32f..(widthPx - 32f) && initCy in 32f..(heightPx - 32f)) {
+                val seeded0 = openCvTracker.seedConstellationCollar(
+                    lumaBytes = snapshotBuf,
+                    widthPx = widthPx,
+                    heightPx = heightPx,
+                    stoneLeftPx = latestFrameLeftPx,
+                    stoneTopPx = latestFrameTopPx,
+                    stoneRightPx = latestFrameRightPx,
+                    stoneBottomPx = latestFrameBottomPx,
+                    baseScale = 1.0f
                 )
-                if (solvedCam != null) {
-                    val rotDamp = (1.0f - (rotStepDeg / (maxVoRotStepDeg * 1.25f))).coerceIn(0.25f, 1.0f)
-                    val stepEast = ((solvedCam[0] - camPosEnu[0]) * rotDamp)
-                        .coerceIn(-maxVoHorizStepM, maxVoHorizStepM)
-                    val stepNorth = ((solvedCam[1] - camPosEnu[1]) * rotDamp)
-                        .coerceIn(-maxVoHorizStepM, maxVoHorizStepM)
-                    val stepUp = ((solvedCam[2] - camPosEnu[2]) * rotDamp * 0.45f)
-                        .coerceIn(-MAX_VO_VERTICAL_STEP_M, MAX_VO_VERTICAL_STEP_M)
-                    camPosEnu[0] += stepEast
-                    camPosEnu[1] += stepNorth
-                    camPosEnu[2] = (camPosEnu[2] + stepUp).coerceIn(0.18f, 1.90f)
-                    val instSpeed = hypot(stepEast, stepNorth) / voDtSec
-                    smoothedVoSpeedMps = smoothedVoSpeedMps * 0.80f + instSpeed * 0.20f
-                    updatedVoStep = true
+                if (seeded0) {
+                    openCvTracker.seedFullFrameRelocalizationSnapshotWithBox(
+                        lumaBytes = null,
+                        widthPx = widthPx,
+                        heightPx = heightPx,
+                        stoneCenterXPx = initCx,
+                        stoneCenterYPx = initCy,
+                        stoneWidthPx = (latestFrameRightPx - latestFrameLeftPx).coerceAtLeast(24f),
+                        stoneHeightPx = (latestFrameBottomPx - latestFrameTopPx).coerceAtLeast(24f)
+                    )
+                }
+            }
+        }
+
+        // 1. Tier 2 (30 FPS): Rotation-Known Sparse 3D Mini-VIO (no z=0 floor assumption!),
+        //    falling back seamlessly to legacy trackGravelFlowCorrespondences on pure-JVM test fakes.
+        var openCvMs = 0f
+        var updatedVoStep = false
+        val nominalDepthM = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.45f, 2.80f)
+        val miniVio = if (hasPrevAnalyzerPose && hasFramePair) {
+            openCvTracker.stepRotationKnownMiniVio30Hz(
+                prevCamPosEnu = prevFrameCamPosEnu,
+                prevRotationScr = prevFrameRotationScr,
+                currRotationScr = rotScr,
+                focalLengthPx = focalPx,
+                nominalSceneDepthM = nominalDepthM,
+                fullWidthPx = widthPx,
+                fullHeightPx = heightPx,
+                excludeLeftPx = latestFrameLeftPx,
+                excludeTopPx = latestFrameTopPx,
+                excludeRightPx = latestFrameRightPx,
+                excludeBottomPx = latestFrameBottomPx,
+                excludeTargetRegion = maskTargetInVo
+            )
+        } else {
+            null
+        }
+
+        if (miniVio != null) {
+            openCvMs += miniVio.latencyMs
+            if (miniVio.updated) {
+                val stepEast = (miniVio.camPosEnu[0] - camPosEnu[0]).coerceIn(-maxVoHorizStepM, maxVoHorizStepM)
+                val stepNorth = (miniVio.camPosEnu[1] - camPosEnu[1]).coerceIn(-maxVoHorizStepM, maxVoHorizStepM)
+                val stepUp = (miniVio.camPosEnu[2] - camPosEnu[2]).coerceIn(-0.06f, 0.06f)
+                camPosEnu[0] += stepEast
+                camPosEnu[1] += stepNorth
+                camPosEnu[2] = (camPosEnu[2] + stepUp).coerceIn(0.05f, 2.50f)
+                val instSpeed = hypot(stepEast, stepNorth) / voDtSec
+                smoothedVoSpeedMps = smoothedVoSpeedMps * 0.80f + instSpeed * 0.20f
+                updatedVoStep = true
+            }
+        } else if (!hasFramePair) {
+            val gravelFlow = openCvTracker.trackGravelFlowCorrespondences(
+                lumaBytes = snapshotBuf,
+                widthPx = widthPx,
+                heightPx = heightPx,
+                excludeLeftPx = latestFrameLeftPx,
+                excludeTopPx = latestFrameTopPx,
+                excludeRightPx = latestFrameRightPx,
+                excludeBottomPx = latestFrameBottomPx,
+                excludeTargetRegion = maskTargetInVo
+            )
+            openCvMs += gravelFlow?.latencyMs ?: 0f
+            if (hasPrevAnalyzerPose && gravelFlow != null && gravelFlow.inlierCount >= 10) {
+                val rotStepDeg = rotationAngleBetweenMatricesDeg(prevFrameRotationScr, rotScr)
+                if (rotStepDeg <= maxVoRotStepDeg) {
+                    val solvedCam = solveCameraPositionFromGravelFlow(
+                        prevCamPosEnu = prevFrameCamPosEnu,
+                        prevRotationScr = prevFrameRotationScr,
+                        currRotationScr = rotScr,
+                        prevPointsXY = gravelFlow.prevFramePointsXY,
+                        currPointsXY = gravelFlow.currFramePointsXY,
+                        count = gravelFlow.inlierCount,
+                        focalLengthPx = focalPx,
+                        frameWidthPx = widthPx,
+                        frameHeightPx = heightPx,
+                        rotStepDeg = rotStepDeg
+                    )
+                    if (solvedCam != null) {
+                        val rotDamp = (1.0f - (rotStepDeg / (maxVoRotStepDeg * 1.25f))).coerceIn(0.25f, 1.0f)
+                        val stepEast = ((solvedCam[0] - camPosEnu[0]) * rotDamp)
+                            .coerceIn(-maxVoHorizStepM, maxVoHorizStepM)
+                        val stepNorth = ((solvedCam[1] - camPosEnu[1]) * rotDamp)
+                            .coerceIn(-maxVoHorizStepM, maxVoHorizStepM)
+                        val stepUp = ((solvedCam[2] - camPosEnu[2]) * rotDamp * 0.45f)
+                            .coerceIn(-MAX_VO_VERTICAL_STEP_M, MAX_VO_VERTICAL_STEP_M)
+                        camPosEnu[0] += stepEast
+                        camPosEnu[1] += stepNorth
+                        camPosEnu[2] = (camPosEnu[2] + stepUp).coerceIn(0.18f, 1.90f)
+                        val instSpeed = hypot(stepEast, stepNorth) / voDtSec
+                        smoothedVoSpeedMps = smoothedVoSpeedMps * 0.80f + instSpeed * 0.20f
+                        updatedVoStep = true
+                    }
                 }
             }
         }
@@ -486,13 +569,143 @@ class LockOnPinpointController(
             smoothedVoSpeedMps *= 0.88f
         }
         prevVoPoseTimestampNs = poseSnapshot.timestampNs
+        val prevRotSnapshot = prevFrameRotationScr.copyOf(9)
+        val hadPrevPose = hasPrevAnalyzerPose
         System.arraycopy(camPosEnu, 0, prevFrameCamPosEnu, 0, 3)
         System.arraycopy(rotScr, 0, prevFrameRotationScr, 0, 9)
         hasPrevAnalyzerPose = true
 
-        // 2. Stage 3: 30 FPS OpenCV AKAZE gravel-constellation similarity guidance (< 5 ms CPU)
-        //    backed by ~5 Hz 480x270 full-frame relocalization (running EVEN when nearViewport == false
-        //    so walk-past + 180-deg turn VO drift snaps right back onto the stone!) and 300 ms hysteresis.
+        // 1B. Tier 1 (30 FPS): IMU-predicted local PyrLK + FB < 1.5 px + 4-DOF Similarity + NCC.
+        //     Active in BOTH Stage 2 and Stage 3 so the visual anchor holds < 10 px from Frame 1!
+        var tier1LockedThisFrame = false
+        if (hadPrevPose && hasFramePair && isTargetInFrame && (isVisuallyLocked || stage == AcquisitionStage.LOCK_ON_NEURAL)) {
+            val tier1 = openCvTracker.trackLocalTargetSimilarity30Hz(
+                prevBoxLeftPx = latestFrameLeftPx,
+                prevBoxTopPx = latestFrameTopPx,
+                prevBoxRightPx = latestFrameRightPx,
+                prevBoxBottomPx = latestFrameBottomPx,
+                prevRotationScr = prevRotSnapshot,
+                currRotationScr = rotScr,
+                focalLengthPx = focalPx,
+                fullWidthPx = widthPx,
+                fullHeightPx = heightPx
+            )
+            if (tier1 != null) {
+                openCvMs += tier1.latencyMs
+                val tCx = (tier1.frameLeftPx + tier1.frameRightPx) * 0.5f
+                val tCy = (tier1.frameTopPx + tier1.frameBottomPx) * 0.5f
+                val tInFrame = tCx in 0f..widthPx.toFloat() && tCy in 0f..heightPx.toFloat()
+                if (tier1.matched && tInFrame) {
+                    tier1LockedThisFrame = true
+                    tier1FramesSinceAudit++
+                    isVisuallyLocked = true
+                    wasTargetOffScreen = false
+                    lostTrackStartNs = 0L
+                    missedNeuralCropCount = 0
+                    consecutiveLowAkazeFrames = 0
+                    akazeCoastStartNs = 0L
+                    armViewportCenterProbe = false
+
+                    val tRay = GroundPlaneRaycaster.pixelToWorldRay(
+                        frameXPx = tCx,
+                        frameYPx = tCy,
+                        focalLengthPx = focalPx,
+                        rotationMatrix = rotScr,
+                        frameWidthPx = widthPx,
+                        frameHeightPx = heightPx
+                    )
+                    val curRange = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.18f, 3.80f)
+                    val scaledRange = (curRange / tier1.scaleRatio.coerceIn(0.85f, 1.18f)).coerceIn(0.18f, 3.80f)
+                    val blendedRange = curRange * 0.70f + scaledRange * 0.30f
+                    if (stage == AcquisitionStage.PINPOINT_CONSTELLATION) {
+                        smoothedPinpointRangeM = smoothedPinpointRangeM * 0.75f + blendedRange * 0.25f
+                    }
+                    val targetRange = if (stage == AcquisitionStage.PINPOINT_CONSTELLATION) {
+                        smoothedPinpointRangeM
+                    } else {
+                        blendedRange
+                    }
+                    targetPosEnu[0] = camPosEnu[0] + targetRange * tRay.eastX
+                    targetPosEnu[1] = camPosEnu[1] + targetRange * tRay.northY
+                    targetPosEnu[2] = camPosEnu[2] + targetRange * tRay.upZ
+
+                    val tAngW = ((tier1.frameRightPx - tier1.frameLeftPx).coerceAtLeast(12f)) / focalPx
+                    val tAngH = ((tier1.frameBottomPx - tier1.frameTopPx).coerceAtLeast(12f)) / focalPx
+                    angularWidthRad = angularWidthRad * 0.72f + tAngW * 0.28f
+                    angularHeightRad = angularHeightRad * 0.72f + tAngH * 0.28f
+
+                    // Periodic (~5 Hz) Tier 3 4-Gate ORB collar drift-audit eliminates slow KLT drift
+                    if (openCvTracker.hasSeededConstellation &&
+                        (tier1FramesSinceAudit >= TIER1_DRIFT_AUDIT_STRIDE || tier1.nccScore < 0.50f)
+                    ) {
+                        val audit = openCvTracker.matchConstellationFrame(
+                            lumaBytes = null,
+                            widthPx = widthPx,
+                            heightPx = heightPx,
+                            predictedCenterXPx = tCx,
+                            predictedCenterYPx = tCy
+                        )
+                        openCvMs += audit.latencyMs
+                        tier1FramesSinceAudit = 0
+                        if (audit.matched && audit.inliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS) {
+                            val aCx = (audit.frameLeftPx + audit.frameRightPx) * 0.5f
+                            val aCy = (audit.frameTopPx + audit.frameBottomPx) * 0.5f
+                            val aRay = GroundPlaneRaycaster.pixelToWorldRay(
+                                frameXPx = aCx,
+                                frameYPx = aCy,
+                                focalLengthPx = focalPx,
+                                rotationMatrix = rotScr,
+                                frameWidthPx = widthPx,
+                                frameHeightPx = heightPx
+                            )
+                            val auditedRay = blendWorldRays(tRay, aRay, 0.65f)
+                            targetPosEnu[0] = camPosEnu[0] + targetRange * auditedRay.eastX
+                            targetPosEnu[1] = camPosEnu[1] + targetRange * auditedRay.northY
+                            targetPosEnu[2] = camPosEnu[2] + targetRange * auditedRay.upZ
+                            akazeInliers = audit.inliers
+                            lastLockedAkazeInliers = audit.inliers
+                        }
+                    }
+
+                    if (stage == AcquisitionStage.PINPOINT_CONSTELLATION) {
+                        akazeInliers = max(akazeInliers, max(tier1.inliers, OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS))
+                        lastLockedAkazeInliers = akazeInliers
+                        activeVisualAnchorLabel = "KLT+ORB 30HZ"
+                        val needs1HzRefresh = lastPinpointNeuralRefreshNs == 0L ||
+                            (timestampNs - lastPinpointNeuralRefreshNs) >= PINPOINT_NEURAL_REFRESH_INTERVAL_NS
+                        if (needs1HzRefresh) {
+                            lastPinpointNeuralRefreshNs = timestampNs
+                        }
+                        val hud = buildProjectedHudStateLocked(
+                            rWorldFromScr = rotScr,
+                            focalLengthPx = focalPx,
+                            nowNs = timestampNs,
+                            sourceBadge = "AKAZE"
+                        )
+                        val cropCx = ((hud.frameLeftPx + hud.frameRightPx) * 0.5f)
+                            .finiteOr(widthPx * 0.5f)
+                            .coerceIn(0f, widthPx.coerceAtLeast(1).toFloat())
+                        val cropCy = ((hud.frameTopPx + hud.frameBottomPx) * 0.5f)
+                            .finiteOr(heightPx * 0.5f)
+                            .coerceIn(0f, heightPx.coerceAtLeast(1).toFloat())
+                        return LockOnFrameDirective(
+                            hudState = hud,
+                            shouldRunNeuralB1 = needs1HzRefresh,
+                            desiredCropCenterXPx = cropCx,
+                            desiredCropCenterYPx = cropCy,
+                            desiredCropSizePx = hud.cropSizePx,
+                            openCvLatencyMs = openCvMs
+                        )
+                    } else {
+                        // Stage 2: visually locked at 30 Hz via Tier 1 while continuing B=1 parallax updates
+                        activeVisualAnchorLabel = "KLT 30HZ + B=1"
+                    }
+                }
+            }
+        }
+
+        // 2. Tier 3: 4-Gate Multi-Keyframe ORB collar + 480x270 full-frame relocalization
+        //    (runs on Stage 3 frames when Tier 1 missed or isn't active, AND on Stage 2 recovery!)
         if (stage == AcquisitionStage.PINPOINT_CONSTELLATION) {
             val predProjection = projectEnuToFrame(
                 targetEnu = targetPosEnu,
@@ -513,7 +726,7 @@ class LockOnPinpointController(
                 val predX = predProjection.uPx.coerceIn(0f, widthPx.toFloat())
                 val predY = predProjection.vPx.coerceIn(0f, heightPx.toFloat())
                 openCvTracker.matchConstellationFrame(
-                    lumaBytes = null, // Already uploaded into fullGrayMat above
+                    lumaBytes = null,
                     widthPx = widthPx,
                     heightPx = heightPx,
                     predictedCenterXPx = predX,
@@ -523,8 +736,13 @@ class LockOnPinpointController(
                 ConstellationMatchResult(matched = false, inliers = 0)
             }
 
-            // Query 480x270 full-frame AKAZE relocalization at ~5 Hz (>= 200 ms) whenever collar AKAZE
-            // misses—including when predProjection drifted completely off-screen (nearViewport == false)!
+            // Poll 480x270 4-Gate ORB relocalization at ~10 Hz during occlusion/off-screen re-entry
+            // (or ~5 Hz during minor collar dips) for 1-3 frame snap-back!
+            val relocIntervalNs = if (wasTargetOffScreen || lostTrackStartNs != 0L) {
+                RELOCALIZATION_REENTRY_INTERVAL_NS
+            } else {
+                RELOCALIZATION_MIN_INTERVAL_NS
+            }
             val shouldAttemptReloc = !match.matched &&
                 openCvTracker.hasRelocalizationSnapshot &&
                 (!nearViewport ||
@@ -533,7 +751,7 @@ class LockOnPinpointController(
                     wasTargetOffScreen ||
                     lostTrackStartNs != 0L) &&
                 (lastRelocAttemptNs == 0L ||
-                    (timestampNs - lastRelocAttemptNs) >= RELOCALIZATION_MIN_INTERVAL_NS)
+                    (timestampNs - lastRelocAttemptNs) >= relocIntervalNs)
             if (shouldAttemptReloc) {
                 lastRelocAttemptNs = timestampNs
                 val reloc = openCvTracker.matchFullFrameRelocalization(
@@ -630,6 +848,8 @@ class LockOnPinpointController(
                 lastLockedAkazeInliers = match.inliers
                 consecutiveLowAkazeFrames = 0
                 akazeCoastStartNs = 0L
+                isVisuallyLocked = true
+                activeVisualAnchorLabel = "ORB 4G-KF"
                 wasTargetOffScreen = false
                 lostTrackStartNs = 0L
                 missedNeuralCropCount = 0
@@ -743,6 +963,8 @@ class LockOnPinpointController(
                         0
                     }
                     lastLockedAkazeInliers = 0
+                    isVisuallyLocked = false
+                    activeVisualAnchorLabel = "COAST 3D/IMU"
                 }
             } else {
                 akazeInliers = if (matchInFrame) {
@@ -753,39 +975,101 @@ class LockOnPinpointController(
                 lastLockedAkazeInliers = 0
                 consecutiveLowAkazeFrames = 0
                 akazeCoastStartNs = 0L
+                isVisuallyLocked = false
+                activeVisualAnchorLabel = "COAST 3D/IMU"
             }
-        } else if ((wasTargetOffScreen || lostTrackStartNs != 0L) &&
-            openCvTracker.hasRelocalizationSnapshot &&
-            (lastRelocAttemptNs == 0L ||
-                (timestampNs - lastRelocAttemptNs) >= RELOCALIZATION_MIN_INTERVAL_NS)
-        ) {
-            // Stage 2 (LOCK_ON_NEURAL) 5 Hz full-frame AKAZE relocalization when VO drifts off-screen
-            lastRelocAttemptNs = timestampNs
-            val reloc = openCvTracker.matchFullFrameRelocalization(
-                lumaBytes = null,
-                widthPx = widthPx,
-                heightPx = heightPx
-            )
-            openCvMs += reloc.latencyMs
-            if (reloc.matched &&
-                reloc.stoneCenterXPx in 0f..widthPx.toFloat() &&
-                reloc.stoneCenterYPx in 0f..heightPx.toFloat()
-            ) {
-                val relocRay = GroundPlaneRaycaster.pixelToWorldRay(
-                    frameXPx = reloc.stoneCenterXPx,
-                    frameYPx = reloc.stoneCenterYPx,
+        } else if (!tier1LockedThisFrame) {
+            // Stage 2 (LOCK_ON_NEURAL): when Tier 1 KLT misses (e.g., fast pan or post-occlusion),
+            // attempt Tier 3 4-Gate ORB collar & 10 Hz full-frame relocalization so Stage 2 snaps
+            // back immediately without waiting for B=1 GPU search!
+            var stage2RecoveredByTier3 = false
+            if (openCvTracker.hasSeededConstellation && isTargetInFrame) {
+                val predP = projectEnuToFrame(
+                    targetEnu = targetPosEnu,
+                    camPosEnu = camPosEnu,
+                    rWorldFromScr = rotScr,
                     focalLengthPx = focalPx,
-                    rotationMatrix = rotScr,
                     frameWidthPx = widthPx,
                     frameHeightPx = heightPx
                 )
-                val curRange = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.25f, 3.80f)
-                targetPosEnu[0] = camPosEnu[0] + curRange * relocRay.eastX
-                targetPosEnu[1] = camPosEnu[1] + curRange * relocRay.northY
-                targetPosEnu[2] = camPosEnu[2] + curRange * relocRay.upZ
-                wasTargetOffScreen = false
-                lostTrackStartNs = 0L
-                armViewportCenterProbe = false
+                if (predP.inFront && predP.uPx in -160f..(widthPx + 160f) && predP.vPx in -160f..(heightPx + 160f)) {
+                    val m2 = openCvTracker.matchConstellationFrame(
+                        lumaBytes = null,
+                        widthPx = widthPx,
+                        heightPx = heightPx,
+                        predictedCenterXPx = predP.uPx.coerceIn(0f, widthPx.toFloat()),
+                        predictedCenterYPx = predP.vPx.coerceIn(0f, heightPx.toFloat())
+                    )
+                    openCvMs += m2.latencyMs
+                    val mCx = (m2.frameLeftPx + m2.frameRightPx) * 0.5f
+                    val mCy = (m2.frameTopPx + m2.frameBottomPx) * 0.5f
+                    if (m2.matched && mCx in 0f..widthPx.toFloat() && mCy in 0f..heightPx.toFloat()) {
+                        val mRay = GroundPlaneRaycaster.pixelToWorldRay(
+                            frameXPx = mCx,
+                            frameYPx = mCy,
+                            focalLengthPx = focalPx,
+                            rotationMatrix = rotScr,
+                            frameWidthPx = widthPx,
+                            frameHeightPx = heightPx
+                        )
+                        val curRange = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.20f, 3.80f)
+                        targetPosEnu[0] = camPosEnu[0] + curRange * mRay.eastX
+                        targetPosEnu[1] = camPosEnu[1] + curRange * mRay.northY
+                        targetPosEnu[2] = camPosEnu[2] + curRange * mRay.upZ
+                        isVisuallyLocked = true
+                        activeVisualAnchorLabel = "ORB 4G-KF"
+                        wasTargetOffScreen = false
+                        lostTrackStartNs = 0L
+                        armViewportCenterProbe = false
+                        stage2RecoveredByTier3 = true
+                    }
+                }
+            }
+            val relocIntervalNs = if (wasTargetOffScreen || lostTrackStartNs != 0L) {
+                RELOCALIZATION_REENTRY_INTERVAL_NS
+            } else {
+                RELOCALIZATION_MIN_INTERVAL_NS
+            }
+            if (!stage2RecoveredByTier3 &&
+                (wasTargetOffScreen || lostTrackStartNs != 0L || !isVisuallyLocked) &&
+                openCvTracker.hasRelocalizationSnapshot &&
+                (lastRelocAttemptNs == 0L ||
+                    (timestampNs - lastRelocAttemptNs) >= relocIntervalNs)
+            ) {
+                lastRelocAttemptNs = timestampNs
+                val reloc = openCvTracker.matchFullFrameRelocalization(
+                    lumaBytes = null,
+                    widthPx = widthPx,
+                    heightPx = heightPx
+                )
+                openCvMs += reloc.latencyMs
+                if (reloc.matched &&
+                    reloc.stoneCenterXPx in 0f..widthPx.toFloat() &&
+                    reloc.stoneCenterYPx in 0f..heightPx.toFloat()
+                ) {
+                    val relocRay = GroundPlaneRaycaster.pixelToWorldRay(
+                        frameXPx = reloc.stoneCenterXPx,
+                        frameYPx = reloc.stoneCenterYPx,
+                        focalLengthPx = focalPx,
+                        rotationMatrix = rotScr,
+                        frameWidthPx = widthPx,
+                        frameHeightPx = heightPx
+                    )
+                    val curRange = computeDistanceEnu(camPosEnu, targetPosEnu).coerceIn(0.25f, 3.80f)
+                    targetPosEnu[0] = camPosEnu[0] + curRange * relocRay.eastX
+                    targetPosEnu[1] = camPosEnu[1] + curRange * relocRay.northY
+                    targetPosEnu[2] = camPosEnu[2] + curRange * relocRay.upZ
+                    isVisuallyLocked = true
+                    activeVisualAnchorLabel = "ORB 4G-KF"
+                    wasTargetOffScreen = false
+                    lostTrackStartNs = 0L
+                    armViewportCenterProbe = false
+                    stage2RecoveredByTier3 = true
+                }
+            }
+            if (!stage2RecoveredByTier3 && hasFramePair) {
+                isVisuallyLocked = false
+                activeVisualAnchorLabel = "COAST 3D/IMU"
             }
         }
 
@@ -1224,6 +1508,9 @@ class LockOnPinpointController(
                         baseScale = 1.0f
                     )
                     stage = AcquisitionStage.PINPOINT_CONSTELLATION
+                    hasMetric3dDepth = true
+                    isVisuallyLocked = true
+                    activeVisualAnchorLabel = if (seeded) "KLT+ORB 30HZ" else "RF-DETR B=1"
                     pinpointAnchorRangeM = currentRangeM
                     smoothedPinpointRangeM = currentRangeM
                     lastPinpointNeuralRefreshNs = timestampNs
@@ -1243,7 +1530,7 @@ class LockOnPinpointController(
                 } else if (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
                     akazeInliers < OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS
                 ) {
-                    // Neural B=1 re-acquired stone after temporary occlusion / off-screen pan -> re-seed AKAZE!
+                    // Neural B=1 re-acquired stone after temporary occlusion / off-screen pan -> re-seed keyframe bank!
                     val reseeded = openCvTracker.seedConstellationCollar(
                         lumaBytes = latestLumaSnapshot,
                         widthPx = latestLumaWidth,
@@ -1254,6 +1541,8 @@ class LockOnPinpointController(
                         stoneBottomPx = sBottom,
                         baseScale = 1.0f
                     )
+                    isVisuallyLocked = true
+                    activeVisualAnchorLabel = if (reseeded) "KLT+ORB 30HZ" else "RF-DETR B=1"
                     pinpointAnchorRangeM = currentRangeM
                     smoothedPinpointRangeM = currentRangeM
                     lastPinpointNeuralRefreshNs = timestampNs
@@ -1270,6 +1559,8 @@ class LockOnPinpointController(
                             stoneCenterYPx = (sTop + sBottom) * 0.5f
                         )
                     }
+                } else {
+                    isVisuallyLocked = true
                 }
             }
 
@@ -1318,6 +1609,10 @@ class LockOnPinpointController(
         hasNeuralDetBox = false
         missedNeuralCropCount = 0
         wasTargetOffScreen = false
+        isVisuallyLocked = false
+        hasMetric3dDepth = false
+        activeVisualAnchorLabel = "RF-DETR B=1"
+        tier1FramesSinceAudit = 0
         lostTrackStartNs = 0L
         akazeInliers = 0
         lastLockedAkazeInliers = 0
@@ -1491,6 +1786,16 @@ class LockOnPinpointController(
                 akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS -> "AKAZE"
             else -> sourceBadge
         }
+        val effectiveVisuallyLocked = inFrame && !graceActive && (
+            isVisuallyLocked ||
+                (stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
+                    akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS)
+            )
+        val effectiveAnchorLabel = when {
+            !inFrame -> "OFF-SCREEN 3D"
+            graceActive || !effectiveVisuallyLocked -> "COAST 3D/IMU"
+            else -> activeVisualAnchorLabel
+        }
 
         return LockOnHudState(
             stage = stage,
@@ -1520,7 +1825,10 @@ class LockOnPinpointController(
             isLostTrackGraceActive = graceActive,
             lostTrackRemainingSec = remSec,
             offScreenChevron = chevron,
-            trackingSourceBadge = effectiveBadge
+            trackingSourceBadge = effectiveBadge,
+            isVisuallyLocked = effectiveVisuallyLocked,
+            hasMetric3dDepth = hasMetric3dDepth,
+            visualAnchorLabel = effectiveAnchorLabel
         )
     }
 
@@ -1543,6 +1851,9 @@ class LockOnPinpointController(
         const val MIN_STEREO_BASELINE_M = 0.035f
         const val MAX_TRIANGULATION_VIEWS = 16
 
+        /** Periodic Tier 3 ORB collar drift-audit interval (`6 frames` = `~5 Hz` at `30 FPS`). */
+        const val TIER1_DRIFT_AUDIT_STRIDE = 6
+
         /** Base per-frame rotation threshold (`2.60 deg`), scaled dynamically by `dt` up to `135 deg/s`. */
         const val MAX_VO_ROTATION_STEP_DEG = 2.60f
         private const val MAX_VO_ANGULAR_RATE_DEG_PER_SEC = 135.0f
@@ -1556,8 +1867,9 @@ class LockOnPinpointController(
         const val AKAZE_COAST_HYSTERESIS_MAX_FRAMES = 9
         const val AKAZE_COAST_HYSTERESIS_MAX_NS = 300_000_000L
 
-        /** `~5.0 Hz` (`200 ms`) minimum interval between `480x270` full-frame `AKAZE` relocalization checks. */
+        /** `~5.0 Hz` (`200 ms`) steady-state and `~10.0 Hz` (`100 ms`) post-occlusion relocalization cadence. */
         const val RELOCALIZATION_MIN_INTERVAL_NS = 200_000_000L
+        const val RELOCALIZATION_REENTRY_INTERVAL_NS = 100_000_000L
         private const val MAX_RELOC_INNOVATION_DEG = 18.0f
         private const val MAX_OFF_SCREEN_RELOC_INNOVATION_DEG = 85.0f
         private const val LOST_TRACK_CENTER_PROBE_DELAY_NS = 900_000_000L

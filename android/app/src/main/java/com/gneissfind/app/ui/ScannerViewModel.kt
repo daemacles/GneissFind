@@ -52,7 +52,6 @@ import com.gneissfind.app.model.WorldPoint3D
 import com.gneissfind.app.tracking.GroundPlaneRaycaster
 import com.gneissfind.app.tracking.LockOnPinpointController
 import com.gneissfind.app.tracking.MotionPoseSnapshot
-import com.gneissfind.app.tracking.OpenCvConstellationTracker
 import com.gneissfind.app.tracking.PatrolDutyCycleController
 import com.gneissfind.app.tracking.ProjectedCandidate
 import com.gneissfind.app.tracking.TemporalTargetTracker
@@ -255,6 +254,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val latestReadySlot = AtomicReference<PreparedSweepSlot?>(null)
     private val inferenceRunning = AtomicBoolean(false)
     private val isShuttingDown = AtomicBoolean(false)
+    /**
+     * Lock-free guard set atomically at the top of `setOperatingMode(OperatingMode.LOG_DATA)` so
+     * in-flight GPU sweeps and `120 Hz` IMU reprojection callbacks can never repopulate
+     * `confirmedTargets` or fire `MetalDetectorSonifier` audio pings while recording.
+     */
+    private val isLoggingDataActive = AtomicBoolean(false)
+    private val loggingDiscardedSweepsCount = AtomicInteger(0)
+    private val loggingAudioPingsCount = AtomicInteger(0)
     private var lastProducerExtractWallMs: Long = 0L
     private var lastLogTelemetryUiWallMs: Long = 0L
 
@@ -395,14 +402,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             var updatedVisibleTargetsForAudio: List<ConfirmedTarget>? = null
             var currentSpeedForAudio: ScanSpeedState = ScanSpeedState.Normal(0f)
             val nowNs = System.nanoTime()
+            val loggingNow = isLoggingDataActive.get()
             _uiState.update { prev ->
                 val fy = prev.verticalFocalLengthPx
                 val liveMat = raycaster.copyLatestRotationMatrix(displayRotationMatrixScratch)
+                val isLoggingMode = loggingNow || prev.operatingMode == OperatingMode.LOG_DATA
                 val floatStab = GroundPlaneRaycaster.computeStabilizedCropYFloat(
                     currentPitchDeg = smoothedPitchDeg,
                     referencePitchDeg = refPitchDeg,
                     verticalFocalLengthPx = fy,
-                    eisEnabled = prev.eisPitchLockEnabled && prev.acquisitionStage == AcquisitionStage.PATROL
+                    eisEnabled = prev.eisPitchLockEnabled &&
+                        prev.acquisitionStage == AcquisitionStage.PATROL &&
+                        !isLoggingMode
                 )
                 val stripCenterOffsetPx = floatStab.clampedCropYFloat - StripRoiGeometry.NOMINAL_CROP_Y_PX
                 val lookPitchDeg = smoothedPitchDeg + Math.toDegrees(
@@ -413,7 +424,23 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 )
                 val gsd = PushBroomCropper.computeGsdMmPerPx(slantR, prev.activeZoomRatio)
 
-                if (prev.acquisitionStage != AcquisitionStage.PATROL) {
+                if (isLoggingMode) {
+                    prev.copy(
+                        imuPitchDeg = smoothedPitchDeg,
+                        rollDeg = rollDeg,
+                        referencePitchDeg = refPitchDeg,
+                        cropY = floatStab.clampedCropYFloat.roundToInt()
+                            .coerceIn(0, StripRoiGeometry.MAX_CROP_Y_PX),
+                        displayCropYFloat = floatStab.clampedCropYFloat,
+                        isPitchClamped = floatStab.isPitchClamped,
+                        slantRangeMeters = slantR,
+                        gsdMmPerPx = gsd,
+                        confirmedTargets = emptyList(),
+                        rawStripDetections = emptyList(),
+                        loggedFrameCount = fieldLogger.savedFrameCount,
+                        loggedDurationSec = fieldLogger.recordedDurationSec
+                    )
+                } else if (prev.acquisitionStage != AcquisitionStage.PATROL) {
                     val reprojectedLock = lockOnController.reprojectForDisplay120Hz(
                         currentRotationMatrix = liveMat,
                         currentFocalLengthPx = fy,
@@ -476,22 +503,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                         isPitchClamped = floatStab.isPitchClamped,
                         slantRangeMeters = slantR,
                         gsdMmPerPx = gsd,
-                        confirmedTargets = reprojectedTargets,
-                        loggedFrameCount = if (prev.operatingMode == OperatingMode.LOG_DATA) {
-                            fieldLogger.savedFrameCount
-                        } else {
-                            prev.loggedFrameCount
-                        },
-                        loggedDurationSec = if (prev.operatingMode == OperatingMode.LOG_DATA) {
-                            fieldLogger.recordedDurationSec
-                        } else {
-                            prev.loggedDurationSec
-                        }
+                        confirmedTargets = reprojectedTargets
                     )
                 }
             }
-            updatedVisibleTargetsForAudio?.let { visibleTargets ->
-                sonifier.updateTargets(visibleTargets, currentSpeedForAudio)
+            if (!isLoggingDataActive.get()) {
+                updatedVisibleTargetsForAudio?.let { visibleTargets ->
+                    sonifier.updateTargets(visibleTargets, currentSpeedForAudio)
+                }
             }
         }
         scheduleInferenceDrainIfNeeded()
@@ -769,8 +788,11 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             nowNs = System.nanoTime()
         )
         if (mode == OperatingMode.LOG_DATA) {
-            // Pause all neural detection, temporal tracking, Lock-On, and homing audio during MOD:LOG
-            // so 100% of camera/CPU/memory headroom goes to clean 30.0 FPS 1080p H.264 + 120 Hz IMU capture.
+            // Set atomic logging guard FIRST so any in-flight GPU sweep or 120 Hz IMU callback
+            // cannot repopulate confirmedTargets or fire MetalDetectorSonifier audio pings.
+            isLoggingDataActive.set(true)
+            loggingDiscardedSweepsCount.set(0)
+            loggingAudioPingsCount.set(0)
             val unlockedHud = lockOnController.breakLock()
             tracker.reset()
             latestReadySlot.set(null)
@@ -795,6 +817,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     detectorStatus = "LOG 1080P30 (DETECTOR PAUSED)",
                     rawStripDetections = emptyList(),
                     confirmedTargets = emptyList(),
+                    sweepLatencyMs = 0f,
+                    rollingLatencyMs = 0f,
                     sweepHz = 0f,
                     audioPitchHz = audioTel.currentPitchHz,
                     audioCadenceHz = audioTel.currentPingCadenceHz,
@@ -804,13 +828,15 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         } else {
-            cameraController.setTargetCameraFps(nextPower.targetCameraFps)
             fieldLogger.stopSession()
+            isLoggingDataActive.set(false)
+            cameraController.setTargetCameraFps(nextPower.targetCameraFps)
             val discovered = ReplayCameraSource.discoverReplaySessionItems(appContext)
-            _uiState.update {
-                it.copy(
+            _uiState.update { prev ->
+                prev.copy(
                     operatingMode = mode,
                     patrolPowerState = nextPower,
+                    detectorStatus = prev.liveModelProfile.statusBadge,
                     loggedFrameCount = fieldLogger.savedFrameCount,
                     loggedDurationSec = fieldLogger.recordedDurationSec,
                     availableReplaySessions = discovered
@@ -951,12 +977,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             val sessionPath = _uiState.value.fieldLogDirectory
             delay(clampedSec * 1_000L)
             val elapsedSec = ((SystemClock.elapsedRealtime() - startWallMs) / 1000.0).coerceAtLeast(0.001)
+            val discardedSweeps = loggingDiscardedSweepsCount.get()
+            val audioPingsDuringLog = loggingAudioPingsCount.get()
             setOperatingMode(OperatingMode.SCAN)
             val frames = fieldLogger.savedFrameCount
             val avgFps = frames / elapsedSec
             Log.i(
                 ReplayCameraSource.SUMMARY_LOG_TAG,
-                "GNEISSFIND_RECORD_SUMMARY session=$sessionPath frames=$frames elapsed_s=${"%.2f".format(elapsedSec)} avg_fps=${"%.2f".format(avgFps)}"
+                "GNEISSFIND_RECORD_SUMMARY session=$sessionPath frames=$frames elapsed_s=${"%.2f".format(elapsedSec)} avg_fps=${"%.2f".format(avgFps)} discarded_sweeps=$discardedSweeps audio_pings=$audioPingsDuringLog"
             )
         }
     }
@@ -1186,7 +1214,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             return
         }
 
-        if (lockOnController.currentStage != AcquisitionStage.PATROL) {
+        if (!isLoggingDataActive.get() && lockOnController.currentStage != AcquisitionStage.PATROL) {
             processLockOnYuvFrameFromSource(
                 yuvFrame = yuvFrame,
                 exposureTelemetry = exposureTelemetry,
@@ -1207,7 +1235,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
         try {
             stateSnapshot = _uiState.value
-            isLoggingMode = stateSnapshot.operatingMode == OperatingMode.LOG_DATA
+            isLoggingMode = isLoggingDataActive.get() || stateSnapshot.operatingMode == OperatingMode.LOG_DATA
             frameTs = yuvFrame.timestampNs
 
             // Feed 30 FPS 1080p hardware MediaCodec + trace.jsonl on every frame while MOD == LOG_DATA,
@@ -1414,11 +1442,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             speedState = lockSpeedState
         )
         val audioTel = sonifier.latestTelemetry
-        val useAkazeTelemetry = directive.hudState.stage == AcquisitionStage.PINPOINT_CONSTELLATION &&
-            directive.hudState.akazeInliers >= OpenCvConstellationTracker.MIN_HOMOGRAPHY_INLIERS &&
+        val useVisualTrackerTelemetry = directive.hudState.isVisuallyLocked &&
             directive.openCvLatencyMs > 0f
         _uiState.update { prev ->
-            val updatedRollingMs = if (useAkazeTelemetry) {
+            if (isLoggingDataActive.get() || prev.operatingMode == OperatingMode.LOG_DATA) {
+                return@update prev
+            }
+            val updatedRollingMs = if (useVisualTrackerTelemetry) {
                 if (prev.rollingLatencyMs <= 0f || prev.rollingLatencyMs > 25f) {
                     directive.openCvLatencyMs
                 } else {
@@ -1441,9 +1471,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     directive.hudState.slantRangeMeters,
                     exposureTelemetry.activeZoomRatio
                 ),
-                sweepLatencyMs = if (useAkazeTelemetry) directive.openCvLatencyMs else prev.sweepLatencyMs,
+                sweepLatencyMs = if (useVisualTrackerTelemetry) directive.openCvLatencyMs else prev.sweepLatencyMs,
                 rollingLatencyMs = updatedRollingMs,
-                sweepHz = if (useAkazeTelemetry) exposureTelemetry.measuredCameraFps else prev.sweepHz,
+                sweepHz = if (useVisualTrackerTelemetry) exposureTelemetry.measuredCameraFps else prev.sweepHz,
                 audioPitchHz = audioTel.currentPitchHz,
                 audioCadenceHz = audioTel.currentPingCadenceHz
             )
@@ -1494,18 +1524,27 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private fun drainLatestSweepOnInferenceThread() {
         try {
             if (!isShuttingDown.get() &&
+                !isLoggingDataActive.get() &&
                 _uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
                 (!rfDetrGpuDetector.isDesiredProfileCompiled || !rfDetrGpuDetector.isLockOnHardwareReady)
             ) {
                 rfDetrGpuDetector.ensureCompiledAndWarmOnInferenceThread()
             }
             while (!isShuttingDown.get()) {
+                if (isLoggingDataActive.get()) {
+                    latestReadySlot.set(null)
+                    break
+                }
                 if (_uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
                     !rfDetrGpuDetector.isDesiredProfileCompiled
                 ) {
                     rfDetrGpuDetector.ensureCompiledAndWarmOnInferenceThread()
                 }
                 val slot = latestReadySlot.getAndSet(null) ?: break
+                if (isLoggingDataActive.get()) {
+                    loggingDiscardedSweepsCount.incrementAndGet()
+                    break
+                }
                 slot.inUseByConsumer.set(true)
                 try {
                     runInferenceSweepForSlot(slot)
@@ -1515,9 +1554,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             }
         } finally {
             inferenceRunning.set(false)
-            val needsFollowUpCompile = _uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
+            val needsFollowUpCompile = !isLoggingDataActive.get() &&
+                _uiState.value.detectorBackend == DetectorBackend.RF_DETR_NANO_GPU &&
                 !rfDetrGpuDetector.isDesiredProfileCompiled
-            if (!isShuttingDown.get() && (latestReadySlot.get() != null || needsFollowUpCompile)) {
+            if (!isShuttingDown.get() && !isLoggingDataActive.get() && (latestReadySlot.get() != null || needsFollowUpCompile)) {
                 scheduleInferenceDrainIfNeeded()
             }
         }
@@ -1525,6 +1565,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     /** Executes inference, cross-tile stitch, 3D raycast, tracking, and UI update for [slot]. */
     private fun runInferenceSweepForSlot(slot: PreparedSweepSlot) {
+        if (isLoggingDataActive.get() || _uiState.value.operatingMode == OperatingMode.LOG_DATA) {
+            loggingDiscardedSweepsCount.incrementAndGet()
+            return
+        }
         if (slot.isLockOnSlot) {
             runLockOnNeuralInferenceForSlot(slot)
             return
@@ -1629,15 +1673,27 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             trackerOutput.confirmedTargets
         }
 
+        if (isLoggingDataActive.get() || _uiState.value.operatingMode == OperatingMode.LOG_DATA) {
+            loggingDiscardedSweepsCount.incrementAndGet()
+            return
+        }
         if (lockOnController.currentStage != AcquisitionStage.PATROL) return
 
+        val visibleTargets = reprojectedConfirmed.filter { it.isVisibleInStrip }
+        if (isLoggingDataActive.get()) {
+            loggingDiscardedSweepsCount.incrementAndGet()
+            return
+        }
         sonifier.updateTargets(
-            confirmedTargets = reprojectedConfirmed.filter { it.isVisibleInStrip },
+            confirmedTargets = visibleTargets,
             speedState = trackerOutput.speedState
         )
         val audioTel = sonifier.latestTelemetry
 
         _uiState.update { prev ->
+            if (isLoggingDataActive.get() || prev.operatingMode == OperatingMode.LOG_DATA) {
+                return@update prev
+            }
             prev.copy(
                 detectorStatus = activeDetector.statusSummary,
                 patrolPowerState = nextPowerState,
@@ -1686,6 +1742,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
      * crop and updates [LockOnPinpointController] triangulation / confidence state.
      */
     private fun runLockOnNeuralInferenceForSlot(slot: PreparedSweepSlot) {
+        if (isLoggingDataActive.get() || _uiState.value.operatingMode == OperatingMode.LOG_DATA) {
+            loggingDiscardedSweepsCount.incrementAndGet()
+            return
+        }
         if (lockOnController.currentStage == AcquisitionStage.PATROL) return
         val poseSnapshot = slot.poseSnapshot ?: return
         val exposureTelemetry = slot.exposureTelemetry
@@ -1791,19 +1851,30 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             }
         }
 
+        if (isLoggingDataActive.get() || _uiState.value.operatingMode == OperatingMode.LOG_DATA) {
+            loggingDiscardedSweepsCount.incrementAndGet()
+            return
+        }
         sonifier.updateTargets(
             confirmedTargets = buildLockOnAudioTargets(updatedHud),
             speedState = ScanSpeedState.Normal(0f)
         )
         val audioTel = sonifier.latestTelemetry
-        val showNeuralTiming = updatedHud.stage == AcquisitionStage.LOCK_ON_NEURAL ||
-            updatedHud.akazeInliers < 12
+        val showNeuralTiming = !updatedHud.isVisuallyLocked &&
+            (updatedHud.stage == AcquisitionStage.LOCK_ON_NEURAL || updatedHud.akazeInliers < 12)
 
         _uiState.update { prev ->
+            if (isLoggingDataActive.get() || prev.operatingMode == OperatingMode.LOG_DATA) {
+                return@update prev
+            }
             prev.copy(
                 acquisitionStage = updatedHud.stage,
                 lockOnHudState = updatedHud,
-                detectorStatus = if (showNeuralTiming) "RF-DETR 320 B=1 W8-DYN" else "PINPOINT AKAZE + 1HZ B=1",
+                detectorStatus = if (updatedHud.isVisuallyLocked) {
+                    updatedHud.visualAnchorLabel
+                } else {
+                    "RF-DETR 320 B=1 W8-DYN"
+                },
                 sweepLatencyMs = if (showNeuralTiming) lockResult.totalSweepLatencyMs else prev.sweepLatencyMs,
                 rollingLatencyMs = if (showNeuralTiming) lockResult.rollingAvgLatencyMs else prev.rollingLatencyMs,
                 sweepHz = if (showNeuralTiming) smoothedSweepHz else prev.sweepHz,

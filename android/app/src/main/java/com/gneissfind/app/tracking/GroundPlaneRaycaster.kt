@@ -268,6 +268,14 @@ class GroundPlaneRaycaster(
     @Volatile
     var isReplayModeActive: Boolean = false
 
+    /**
+     * Optional camera-to-IMU pipeline lag compensation subtracted from `targetTimestampNs` when
+     * querying historical IMU poses (`0L` by default; e.g. `35_000_000L` to offset `35 ms` OIS/EIS
+     * smoothing lag on older recordings).
+     */
+    @Volatile
+    var cameraImuLagCompensationNs: Long = 0L
+
     @Volatile
     var hasLiveImuStream: Boolean = false
         private set
@@ -594,29 +602,50 @@ class GroundPlaneRaycaster(
      */
     fun lookupPitchAtTimestampNs(targetTimestampNs: Long): Float {
         simulatedPitchOverrideDeg?.let { return it }
+        val queryTs = targetTimestampNs - cameraImuLagCompensationNs
         synchronized(imuRingLock) {
             if (ringCount == 0) return latestRawPitchDeg
-            var bestPitch = latestRawPitchDeg
+            var beforeIdx = -1
+            var beforeTs = Long.MIN_VALUE
+            var afterIdx = -1
+            var afterTs = Long.MAX_VALUE
+            var bestIdx = 0
             var bestDelta = Long.MAX_VALUE
             for (i in 0 until ringCount) {
-                val delta = abs(ringTimestampsNs[i] - targetTimestampNs)
+                val ts = ringTimestampsNs[i]
+                val delta = abs(ts - queryTs)
                 if (delta < bestDelta) {
                     bestDelta = delta
-                    bestPitch = ringPitchDeg[i]
+                    bestIdx = i
+                }
+                if (ts <= queryTs && ts > beforeTs) {
+                    beforeTs = ts
+                    beforeIdx = i
+                }
+                if (ts >= queryTs && ts < afterTs) {
+                    afterTs = ts
+                    afterIdx = i
                 }
             }
-            return bestPitch
+            if (beforeIdx >= 0 && afterIdx >= 0 && beforeIdx != afterIdx && afterTs > beforeTs) {
+                val span = afterTs - beforeTs
+                if (span <= 100_000_000L) {
+                    val alpha = ((queryTs - beforeTs).toDouble() / span.toDouble()).toFloat().coerceIn(0f, 1f)
+                    return ringPitchDeg[beforeIdx] * (1f - alpha) + ringPitchDeg[afterIdx] * alpha
+                }
+            }
+            return ringPitchDeg[bestIdx]
         }
     }
 
     /**
-     * Looks up the 3x3 landscape rotation matrix (`R_world_from_scr`) closest in timestamp to
-     * [targetTimestampNs] so a detection from a camera frame is back-projected using the exact
-     * orientation at frame exposure time.
+     * Looks up the 3x3 landscape rotation matrix (`R_world_from_scr`) at [targetTimestampNs]
+     * (with linear `SO(3)` interpolation + Gram-Schmidt orthonormalization between bracketing IMU
+     * samples when available, falling back to nearest-neighbor outside the ring span).
      *
      * @param targetTimestampNs Camera frame sensor timestamp (`ns`) to match against the IMU ring buffer.
      * @param outMatrix Destination 9-element row-major array (allocated if omitted).
-     * @return [outMatrix] populated with the nearest historical `R_world_from_scr` matrix.
+     * @return [outMatrix] populated with the interpolated or nearest historical `R_world_from_scr` matrix.
      */
     fun lookupRotationMatrixAtTimestampNs(
         targetTimestampNs: Long,
@@ -630,18 +659,46 @@ class GroundPlaneRaycaster(
                 outMatrix = outMatrix
             )
         }
+        val queryTs = targetTimestampNs - cameraImuLagCompensationNs
         synchronized(imuRingLock) {
             if (ringCount == 0) {
                 System.arraycopy(latestRemappedRotationMatrix, 0, outMatrix, 0, 9)
                 return outMatrix
             }
+            var beforeIdx = -1
+            var beforeTs = Long.MIN_VALUE
+            var afterIdx = -1
+            var afterTs = Long.MAX_VALUE
             var bestIdx = 0
             var bestDelta = Long.MAX_VALUE
             for (i in 0 until ringCount) {
-                val delta = abs(ringTimestampsNs[i] - targetTimestampNs)
+                val ts = ringTimestampsNs[i]
+                val delta = abs(ts - queryTs)
                 if (delta < bestDelta) {
                     bestDelta = delta
                     bestIdx = i
+                }
+                if (ts <= queryTs && ts > beforeTs) {
+                    beforeTs = ts
+                    beforeIdx = i
+                }
+                if (ts >= queryTs && ts < afterTs) {
+                    afterTs = ts
+                    afterIdx = i
+                }
+            }
+            if (beforeIdx >= 0 && afterIdx >= 0 && beforeIdx != afterIdx && afterTs > beforeTs) {
+                val span = afterTs - beforeTs
+                if (span <= 100_000_000L) {
+                    val alpha = ((queryTs - beforeTs).toDouble() / span.toDouble()).toFloat().coerceIn(0f, 1f)
+                    val bOff = beforeIdx * 9
+                    val aOff = afterIdx * 9
+                    for (k in 0 until 9) {
+                        outMatrix[k] = ringRotationMatrices[bOff + k] * (1f - alpha) +
+                            ringRotationMatrices[aOff + k] * alpha
+                    }
+                    orthonormalizeRotationMatrix3x3(outMatrix)
+                    return outMatrix
                 }
             }
             System.arraycopy(ringRotationMatrices, bestIdx * 9, outMatrix, 0, 9)
@@ -1118,6 +1175,42 @@ class GroundPlaneRaycaster(
                     isVisibleInStrip = box.isVisibleInStrip
                 )
             }
+        }
+
+        /**
+         * Orthonormalizes an interpolated `3x3` row-major rotation matrix in-place onto `SO(3)` via
+         * column Gram-Schmidt (`c0`, `c1`, and right-handed `c2 = c0 x c1`).
+         */
+        fun orthonormalizeRotationMatrix3x3(m: FloatArray) {
+            if (m.size < 9) return
+            var c0x = m[0]; var c0y = m[3]; var c0z = m[6]
+            val n0 = sqrt(c0x * c0x + c0y * c0y + c0z * c0z)
+            if (n0 > 1e-6f) {
+                val inv0 = 1f / n0
+                c0x *= inv0; c0y *= inv0; c0z *= inv0
+            } else {
+                c0x = 1f; c0y = 0f; c0z = 0f
+            }
+
+            var c1x = m[1]; var c1y = m[4]; var c1z = m[7]
+            val dot01 = c0x * c1x + c0y * c1y + c0z * c1z
+            c1x -= dot01 * c0x; c1y -= dot01 * c0y; c1z -= dot01 * c0z
+            val n1 = sqrt(c1x * c1x + c1y * c1y + c1z * c1z)
+            if (n1 > 1e-6f) {
+                val inv1 = 1f / n1
+                c1x *= inv1; c1y *= inv1; c1z *= inv1
+            } else {
+                c1x = 0f; c1y = 1f; c1z = 0f
+            }
+
+            // Right-handed third column c2 = c0 x c1
+            val c2x = c0y * c1z - c0z * c1y
+            val c2y = c0z * c1x - c0x * c1z
+            val c2z = c0x * c1y - c0y * c1x
+
+            m[0] = c0x; m[1] = c1x; m[2] = c2x
+            m[3] = c0y; m[4] = c1y; m[5] = c2y
+            m[6] = c0z; m[7] = c1z; m[8] = c2z
         }
 
         /**

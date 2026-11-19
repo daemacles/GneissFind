@@ -709,7 +709,10 @@ data class LockOnHudState(
     val isLostTrackGraceActive: Boolean = false,
     val lostTrackRemainingSec: Float = 15.0f,
     val offScreenChevron: OffScreenChevron? = null,
-    val trackingSourceBadge: String = "RF-DETR B=1"
+    val trackingSourceBadge: String = "RF-DETR B=1",
+    val isVisuallyLocked: Boolean = false,
+    val hasMetric3dDepth: Boolean = false,
+    val visualAnchorLabel: String = "RF-DETR B=1"
 ) {
     /** True when either Stage 2 (`LOCK_ON_NEURAL`) or Stage 3 (`PINPOINT_CONSTELLATION`) is active. */
     val isLocked: Boolean
