@@ -1,64 +1,56 @@
 # GneissFind — Workspace Architecture & Engineering Rules (`AGENTS.md`)
 
-## 1. Project Identity & Monorepo Layout
+## 1. Project Identity & Polyglot Monorepo Layout
 - **Project Name:** `GneissFind` ("Visual Metal Detector" for PNW rockhounding)
-- **Android Application ID / Namespace:** `com.gneissfind.app` (`gneissfind.com` primary; `gneissfind.net` reserved)
-- **Validated Target Hardware:** Google Pixel 10 Pro XL (`Tensor G5`, Android 17 / SDK 36, `16 KB` page size)
-- **Training Workstation:** Ubuntu 26.10 on Dell Precision T7920 (96 GB RAM, 2x 24-core Xeon Platinum, `GPU 0: RTX 4090 24GB`, `GPU 1 & 2: 2x RTX 4000 Ada 20GB`)
-- **Repository Structure:**
-  - `android/` — Native Kotlin + Jetpack Compose app (`minSdk = 34`, `targetSdk = 36`), CameraX + `Camera2CameraControl`, hardware `MediaCodec` `30 FPS` `1080p` logger & deterministic `ReplayCameraSource`, 120 Hz RenderNode IMU EIS, LiteRT `2.3.2` GPU `W8-Dyn` FP16 inference, OpenCV `4.13.0` (`AKAZE` + full-frame IMU-derotated KLT VO), Classic 2360s TNG LCARS UI.
-  - `ml-pipeline/` — Python (`uv`) pipeline for `RF-DETR-Nano` LiteRT `W8-Dyn` export (`B=3`, `B=5`, `B=1`), offline frame-decimated video replay (`simulate_patrol_fps.py`), `SAM 2` video auto-labeling, Copy-Paste augmentation, and PNW stone fine-tuning.
-  - `docs/ROADMAP.md` — Forward-looking milestones and acceptance criteria.
-  - `docs/ENGINEERING_LEDGER.md` — **Canonical append-only hardware & postmortem ledger.** Read before modifying camera/UI/inference/tracking code; append milestone findings, crash root causes, and commit hashes upon completion.
-  - `scripts/pack_context.sh` — Context sync bundler (`/tmp/gneissfind-sync.md`).
+- **Android Application ID / Namespace:** `com.gneissfind.app` (`gneissfind.com`)
+- **Target Mobile Hardware:** Google Pixel 10 Pro / Pixel 10 Pro XL (Android 16, Tensor G5, OpenCL `LITERT_CL` GPU)
+- **Workstation / V&V Rig:** Ubuntu 26.10 on Dell Precision T7920 (96 GB RAM, 2x 24-core Xeon Platinum, `GPU 0: RTX 4090 24GB`, `GPU 1 & 2: 2x RTX 4000 Ada 20GB`)
+- **Dual-Plane Architecture (Strangler-Fig Boundary):**
+  - **Kotlin Android Shell (`android/`):** Owns Android OS lifecycle, `CameraX` + `Camera2CameraControl` dynamic exposure/zoom (`fc80785`), `SensorManager` (`TYPE_GAME_ROTATION_VECTOR`), `120 Hz` `RenderNode` `previewView.translationY` pitch EIS, `AudioTrack` PCM waveform synthesis, and Classic 2360s TNG LCARS Jetpack Compose UI (`8707282`). **Never rewrite Android OS/Camera/UI lifecycles in Rust or Flutter.**
+  - **Rust "Non-ROS" Core (`crates/` + `cli_runner/`):** Owns 100% of deterministic heavy lift—phantom-typed coordinate geometry (`nalgebra`), stride-safe 5-tile YUV->RGB cropping (`kornia-rs`), `TopK` 2-graph query selection, cross-tile IoU/IoM NMS, homography & `WorldRay3D` factor-graph tracking (`faer`/`factrs`), N-of-M temporal voting, acoustic target parameter math, `.mcap` + `rkyv` high-rate bag recording, `iroh` P2P LAN sync, `rerun` 3D desktop visualization, and `ort` CUDA/TensorRT workstation batch V&V.
+  - **ML Pipeline (`ml-pipeline/`):** Python (`uv`) scripts for `SAM 2` auto-labeling (GPUs 1-2), Copy-Paste synthesis, `RF-DETR` training, and dual ONNX + 2-Graph `litert-torch` `W8-Dyn` export (GPU 0).
+  - **Lightweight QMS (`qms/` + `scripts/qms_verify.py`):** Git-native Trace-as-Code linking `UN-*`, `SYS-*`, `ALG-*`, and `INV-*` requirements to Rust `#[doc = " @req ..."]` / `#[trace_req(...)]` and Kotlin `@TracesReq(...)` symbols and automated V&V tests.
 
 ---
 
-## 2. Git, Build Provenance & Ledger Workflow Mandate
-- **Test-Gated Atomic Commits:** Every functional code change MUST compile cleanly and pass unit tests before committing:
-  - `android/`: `./gradlew -p android assembleDebug testDebugUnitTest`
-  - `ml-pipeline/`: `uv run pytest`
-  - Preserve `docs/COMMENTING.md` standards on Kotlin sources (`comment_diff_check.py` where applicable).
-- **Immediate Atomic Commit:** Stage relevant files and commit with a **single-sentence imperative summary**.
-- **Compile-Time Build Provenance:** `android/app/build.gradle.kts` injects `BuildConfig.GIT_COMMIT_HASH_6` (`git rev-parse --short=6 HEAD`) and `BuildConfig.BUILD_DATE_ISO` (`YYYY-MM-DD`), displayed in the bottom-left LCARS shoulder (`BottomLeft` elbow); top-left shoulder (`TopLeft` elbow) displays `GNEISSFIND`.
-- **Ledger Sync:** Append crash postmortems, benchmark tables, hardware discoveries, and commit hashes to `docs/ENGINEERING_LEDGER.md` and run `./scripts/pack_context.sh` at milestone completion.
-- **`N - 1` Ledger Compaction Rule:** Keep `docs/ENGINEERING_LEDGER.md` capped at `<= 16 KB` (`< 14 KB` target) with distilled invariants, dead-end tombstones, and full write-ups for only the rolling `N - 1` and `N` milestones.
-  - At milestone `N` close, move verbatim `M_{N-2}` write-ups into `docs/archive/` (excluded from `scripts/pack_context.sh`) and distill any new durable invariants or dead-ends into `§2–§3`.
-- **Never Commit:** `build/`, `.gradle/`, `.venv/`, `local.properties`, raw `.mp4` field captures (`> 10 MB`), or un-LFS'd large model binaries.
+## 2. Git, Ledger Compaction & QMS Gate Mandate
+1. **Branch Safety:** Execute major architectural spikes on a dedicated Git branch (e.g., `git checkout -b rust-core-m2.5`) so `main` stays a clean reference oracle until parity passes.
+2. **Test- & QMS-Gated Atomic Commits:** After completing each logical work item, verify:
+   - Rust workspace: `cargo test --workspace` (or `cargo nextest run --workspace` if installed)
+   - Android shell: `./gradlew -p android assembleDebug testDebugUnitTest`
+   - QMS traceability: `python3 scripts/qms_verify.py` (or `just qms-check`)
+   Once green, commit immediately with a **single-sentence imperative summary** referencing key requirement IDs when applicable.
+3. **N - 1 Ledger Compaction Rule:** Keep `docs/ENGINEERING_LEDGER.md` `<= 16 KB`. Retain active hardware invariants (`§2`), 1-line dead-end tombstones (`§3`), and full detail only for milestones `M_{N-1}` and `M_N` (`§4`), archiving older chronological write-ups to `docs/archive/` (excluded from `scripts/pack_context.sh`).
+4. **Never Commit:** `target/`, `build/`, `.gradle/`, `.mcap` field captures `> 15 MB`, or `.onnx`/`.tflite`/`.pt` weights `> 10 MB` (except tiny synthetic test fixtures under `qms/fixtures/`).
 
 ---
 
-## 3. Hardware-Validated Android & LiteRT Invariants (DO NOT REGRESS)
-1. **`PreviewView` / Replay Surface Unconditional Child Layout (`fc80785`):** `ClippingCameraViewportContainer` MUST run standard `onMeasure` and unconditional `onLayout` child sizing so `PreviewView`'s `TextureView` never stalls at `0x0`. Drive 120 Hz EIS in `PATROL` strictly via RenderNode `translationY`; set `translationY = 0f` in full-screen `16:9` `LOCK-ON` / `PINPOINT` modes.
-2. **Dynamic-Only `Camera2CameraControl` & Two-Surface CameraX Limit (`fc80785`):** Keep `Camera2Interop.Extender` strictly limited to `setSessionCaptureCallback`. Drive `<= 1/500 s` (`2,000,000 ns`) shutter clamp, EV-scaled auto-ISO, and `PATROL` `Range(15, 15)` / `Range(30, 30)` FPS throttling via `Camera2CameraControl`. **NEVER bind CameraX `VideoCapture` as a 3rd surface** alongside `Preview` + `ImageAnalysis (1920x1080)`—encode `MOD: LOG` `.mp4` video directly from the `ImageAnalysis` `1920x1080` `YUV_420_888` buffer via hardware `MediaCodec`.
-3. **Cold-Start `2.0x` Zoom Bound (`fc80785`):** Query `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` synchronously via `Camera2CameraInfo` right after `bindToLifecycle`.
-4. **3-Slot Lock-Free Ring Buffer & Zero-Copy `encMemory` (`1bfdda0`):** Hold `ImageProxy` `< 3 ms` and call `imageProxy.close()` in `finally`; keep `part1Outputs[0]` bound zero-copy to `part2Inputs[0]` (`allowSrcQuantizedFcConvOps = true` on `W8-Dyn` graphs) and maintain the 3-slot warm `SRC` LRU + disk shader cache (`8d8be41`, `c307819`).
-5. **6-Role LCARS Semantic Color Taxonomy (`8707282`, `5d13646`):** Preserve `LcarsSemanticColors`, full-screen `16:9` Lock-On side console (`LockOnSideConsole`), central `LOCK NEAREST` / `BREAK LOCK` button, and silent UI chrome (`isSoundEffectsEnabled = false`).
+## 3. Sacred Hardware, Camera2, LiteRT & LCARS Invariants (`INV-*`)
+Every rule below was earned empirically on physical Pixel 10 Pro hardware. Do NOT regress them:
+- **`INV-CAM-001` (`fc80785` Unconditional Viewport & Dynamic Camera2):**
+  - `ClippingCameraViewportContainer` must lay out its child unconditionally.
+  - Apply `<= 1/500 s` (`2,000,000 ns`) shutter clamp and floating ISO/EV luma servo ONLY via dynamic `Camera2CameraControl` capture request options—NEVER static `ALWAYS_OVERRIDE` on `Camera2Interop.Extender`.
+  - Read `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` synchronously on cold start and engage `2.0x` lossless sensor crop (`ZoomRatio = 2.0f`) by default.
+- **`INV-CAM-002` (`1bfdda0` Ring-Buffer Hold `< 2.0 ms` & `CLOCK_BOOTTIME`):**
+  - Hold CameraX `ImageProxy` for `< 2.0 ms` total: pass `DirectByteBuffer` plane addresses (`Y`, `U`, `V`), explicit `rowStride` / `pixelStride`, and hardware `imageInfo.timestamp` (`CLOCK_BOOTTIME` ns) into Rust JNI to extract only the stabilized `1792x384` strip, then close `ImageProxy` immediately in `finally`.
+- **`INV-UI-001` (`fc80785` + `8707282` Non-Occluding 120 Hz LCARS):**
+  - Preserve `120 Hz` `RenderNode` `previewView.translationY` pitch EIS view decoupling, pure `#000000` OLED canvas with `4.dp` gutters, 6-role `LcarsSemanticColors` (`0.05f` HSV value-stepping), inline `SRC` drawer, tabular numerals (`tnum`), and silent UI taps.
+- **`INV-GPU-001` (`1e813e2` + `1bfdda0` 2-Graph `W8-Dyn` `LITERT_CL` `Image2D`):**
+  - Do NOT replace Android on-device inference with `ort` NNAPI/CPU, static `W8A8` (collapses small-pebble recall to `12.5%`), or sideloaded `Accelerator.NPU` (`/dev/edgetpu` HAL contention).
+  - Keep `RF-DETR-Nano` on Pixel 10 Pro running as the **2-Graph `W8-Dyn` (`allowSrcQuantizedFcConvOps = true`) `LITERT_CL` `Image2D` GPU** pipeline (rank `<= 4` tensors, `BATCH_MATMUL` bilinear grid-sample, no `BROADCAST_TO`), invoked from Rust `hal_android` (or thin C-API/JNI bridge during Strangler-Fig transition) with zero JVM float-array copy between Part 1 and Part 2.
 
 ---
 
-## 4. 3-Stage Acquisition Funnel & Two-Tier Post-Occlusion Tracking
-1. **Stage 1 — `PATROL`:** Scans `1792 x 384 px` pitch-stabilized strip (`Default S-01: RF-DETR 256 B=3 W8-Dyn K=100` Interleaved), dropping to `15 FPS` / `30 Hz` (+ optional `90%` `"EYES-UP"` OLED veil) after `5.0 s` idle, waking in `< 50 ms`.
-2. **Stage 2 — `LOCK-ON` (`B=1` `320x320` + Innovation Gate):** Tapping a reticle or `LOCK NEAREST` opens full-screen `16:9` view, tracks via `RF-DETR 320 B=1 W8-Dyn` gated by a **3D Bearing Innovation Gate** (`<= 4.5 deg` max single-step jump + `[0.5x..2.0x]` diameter ratio gate so wide `640x640` search never hijacks onto adjacent objects!), and triangulates 3D `sigma3dMm`.
-3. **Stage 3 — `PINPOINT` (Two-Tier Local Collar + Full-Frame Ego-Motion & Relocalization):**
-   - **Local Coplanar Pinpoint (`3.0x` Collar `192x192` `AKAZE`):** Sub-centimeter target lock (`< 5 ms` CPU) immune to wide-FOV 3D depth relief skew, with **`300 ms` (`8-frame`) coasting hysteresis** so brief specular/refractive glints never thrash back to `B=1`.
-   - **Continuous Full-Frame IMU-Derotated KLT Odometry (`640x360` luma, `< 2 ms` CPU) + `480x270` Context Keyframe:** Runs across the entire `16:9` frame **even while the target is occluded or off-screen** so `camPosEnu` and the 3D triangulated stone anchor `P_3d` stay locked in world space across occlusions, paired with a `480x270` full-frame `AKAZE` context snapshot matched at `~5 Hz` during post-occlusion re-entry to eliminate cumulative drift.
+## 4. Target Taxonomy & M2/M2.5 COCO Parity Stand-In Mapping
+- **5-Class Output Schema (`0..3` active targets, `4` muted hard negative):**
+  - `0: ChalcedonyAgate` (`01 AGATE / CARNELIAN`) <- COCO Stand-In: **`cup`**
+  - `1: JasperRedYellow` (`02 RED / YELLOW JASPER`) <- COCO Stand-In: **`apple`**
+  - `2: GreenGemRock` (`03 DALLASITE / NEPHRITE`) <- COCO Stand-In: **`toothbrush`**
+  - `3: PetrifiedWood` (`04 PETRIFIED WOOD`) <- COCO Stand-In: **`remote`**
+  - `4: HardConfuser` *(Muted in UI & audio)* <- Non-target high-confidence COCO classes (`person`, `chair`, `tv`, `book`, `keyboard`, etc.)
 
 ---
 
-## 5. Field Recording (`MOD: LOG`) & Deterministic Sensor-Trace Replay (`SRC`)
-- **`MOD: LOG` (`30 FPS 1080p MP4` + `120 Hz IMU JSONL`):** Replaces the legacy `4 Hz` PNG strip logger. Encodes `1920x1080` `30 FPS` H.264 (`clip.mp4`, `~14 Mbps`) via hardware `MediaCodec` + `MediaMuxer` alongside `trace.jsonl` (`120 Hz` IMU rotation matrices + per-frame `timestamp_ns`, `pts_us`, `exposure_ns`, `iso`, `zoom_ratio`) under `Android/media/com.gneissfind.app/replays/<timestamp>/`.
-- **`ReplayCameraSource`:** `SRC` drawer retains **1** synthetic demo (`MIXED_GRAVEL_WALK`) plus all discovered `replays/<session>/` clips (and supports `adb shell am start` intent extras for automated agent replay & screenshot verification).
-
-<!-- dexiotites:begin (managed by dexiotites install.py: rerun it to update; edits inside this block are overwritten) -->
-## Code Comments (Purpose-First Documentation)
-Full standard with examples: **`docs/COMMENTING.md`**. Read it before writing or editing comments. Core rules:
-- **Reader:** an experienced engineer who can read any language but should not have to read function bodies to understand purpose. No explanations of language features; no analogies to other languages.
-- **Required:** a header on every file; a doc comment on every non-trivial type (purpose, state, lifecycle, threading); a doc comment on every non-trivial function (one-line purpose, each parameter with units/coordinate frame/valid range/meaning of `null`, return value, plus side effects, failure behavior, and calling contract where present/non-obvious). Omit `"None"` boilerplate on pure, infallible, unrestricted helpers. `override` and trait-impl methods inherit interface docs; add only implementation-specific behavior or constraints. Test files need a file header and scenario/invariant comments, not full function contracts on self-explanatory `@Test`s.
-- **Prohibited:** restating the code; copying constant values into prose (link the constant instead); change history; spec slogans.
-- **Voice:** the doc comment holds the contract (what it is for, how to use it correctly); how it works goes inline beside the code. First sentence in plain words, no code names; at most two code names per sentence; no parentheticals (`docs/COMMENTING.md` §10).
-- **Never invent rationale:** cite the source (`AGENTS.md §N`, `docs/…`), derive it from the code, or write `RATIONALE-UNKNOWN: <question>`.
-- **Keep comments true:** any code change updates the comments describing it in the same edit.
-- **Doc linter gate:** before finishing, run this project's doc linter (`docs/COMMENTING.md` §8) and fix every finding in the files you changed with real documentation, not placeholders or suppressions.
-- **Retrofitting existing code:** use the `annotate-code` skill (`.agents/skills/annotate-code/`). Change comments only, and verify with its `comment_diff_check.py`.
-<!-- dexiotites:end -->
+## 5. Dell T7920 Multi-GPU Split
+- **`GPU 0` (`CUDA_VISIBLE_DEVICES=0`, `RTX 4090 24GB`):** `cli_runner` `OrtCudaBackend` high-speed `.mcap` batch V&V (`>= 500 sweeps/s`), `RF-DETR` fine-tuning, and dual ONNX + `litert-torch` 2-graph export.
+- **`GPU 1 & 2` (`CUDA_VISIBLE_DEVICES=1,2`, `2x RTX 4000 Ada 20GB`):** `SAM 2` auto-labeling, Copy-Paste hard-negative compositing, and parallel hyperparameter sweeps over `cli_runner` (`ALG-TUNE-001..006`).
